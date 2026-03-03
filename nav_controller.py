@@ -494,7 +494,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("CAN Nav Controller"); self.configure(bg=C["bg"])
-        self.minsize(860, 520); self.resizable(True, True)
+        self.minsize(920, 580); self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self._ign = False; self._cards = []
         self._setup_bus(); self._build(); self._start_refresh()
@@ -535,10 +535,24 @@ class App(tk.Tk):
 
         tk.Frame(self, bg=C["border"], height=1).grid(row=1,column=0,columnspan=3,sticky="ew")
 
-        left = tk.Frame(self, bg=C["bg"], width=285)
-        left.grid(row=2,column=0,sticky="nsew",padx=(10,5),pady=10)
-        left.grid_propagate(False); left.columnconfigure(0,weight=1); left.rowconfigure(2,weight=1)
-        self._build_ign(left); self._build_mfl(left); self._build_log(left)
+        # Left panel as scrollable canvas — no clipping
+        left_outer = tk.Frame(self, bg=C["bg"])
+        left_outer.grid(row=2,column=0,sticky="nsew",padx=(10,5),pady=10)
+        left_outer.columnconfigure(0,weight=1); left_outer.rowconfigure(0,weight=1)
+        left_cvs = tk.Canvas(left_outer, bg=C["bg"], highlightthickness=0, width=300)
+        left_cvs.grid(row=0,column=0,sticky="nsew")
+        left_sb = tk.Scrollbar(left_outer, orient="vertical", command=left_cvs.yview,
+                               bg=C["panel"], troughcolor=C["bg"], width=8)
+        left_sb.grid(row=0,column=1,sticky="ns")
+        left_cvs.configure(yscrollcommand=left_sb.set)
+        left = tk.Frame(left_cvs, bg=C["bg"])
+        left_win = left_cvs.create_window((0,0), window=left, anchor="nw")
+        left_cvs.bind("<Configure>", lambda e: left_cvs.itemconfig(left_win, width=e.width))
+        left.bind("<Configure>", lambda e: left_cvs.configure(scrollregion=left_cvs.bbox("all")))
+        left.columnconfigure(0, weight=1)
+        left_cvs.bind("<Shift-MouseWheel>",
+                      lambda e: left_cvs.yview_scroll(int(-e.delta/120), "units"))
+        self._build_ign(left); self._build_mfl(left); self._build_stalk(left); self._build_log(left)
 
         tk.Frame(self, bg=C["border"], width=1).grid(row=2,column=1,sticky="ns")
 
@@ -564,7 +578,7 @@ class App(tk.Tk):
         self._build_ecu_cards()
 
     def _build_ign(self, parent):
-        pnl = _panel(parent, "IGNITION"); pnl.grid(row=0,column=0,sticky="ew",pady=(0,6))
+        pnl = _panel(parent, "IGNITION"); pnl.pack(fill="x", pady=(0,6))
         self._ign_btn = tk.Button(pnl, text="OFF",
             font=tkfont.Font(family="Segoe UI",size=14,weight="bold"),
             width=9, bg=C["btn"], fg=C["off"], activebackground=C["btn_hov"],
@@ -590,7 +604,7 @@ class App(tk.Tk):
 
     def _build_mfl(self, parent):
         pnl = _panel(parent, "MFL STEERING WHEEL  (0x5BF)")
-        pnl.grid(row=1,column=0,sticky="ew",pady=(0,6))
+        pnl.pack(fill="x", pady=(0,6))
         g = tk.Frame(pnl, bg=C["panel"]); g.pack(padx=12, pady=(4,12))
         for c in range(3): g.columnconfigure(c, weight=1, minsize=74)
         self._btns = {}
@@ -599,8 +613,92 @@ class App(tk.Tk):
             b.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
             self._btns[key] = b
 
+    def _build_stalk(self, parent):
+        pnl = _panel(parent, "STALK / BLINKERS  (16)")
+        pnl.pack(fill="x", pady=(0,6))
+        BTNS = [
+            ("tip_left",    "tip_left",    "<<", "TIP<"),
+            ("blink_left",  "blink_left",  "<",  "LEFT"),
+            ("blink_hazard","blink_hazard","!!", "HAZ"),
+            ("blink_right", "blink_right", ">",  "RIGHT"),
+            ("tip_right",   "tip_right",   ">>", "TIP>"),
+        ]
+        g = tk.Frame(pnl, bg=C["panel"]); g.pack(padx=10, pady=(4,4), fill="x")
+        for c in range(5): g.columnconfigure(c, weight=1, minsize=46)
+        self._stalk_btns = {}
+        fi = tkfont.Font(family="Segoe UI", size=11)
+        fl = tkfont.Font(family="Segoe UI", size=6)
+        for col, (key, cmd, icon, lbl) in enumerate(BTNS):
+            frm = tk.Frame(g, bg=C["btn"], cursor="hand2",
+                           highlightbackground=C["border"], highlightthickness=1)
+            frm.grid(row=0, column=col, padx=2, pady=2, sticky="nsew")
+            il = tk.Label(frm, text=icon, font=fi, bg=C["btn"], fg=C["accent"])
+            il.pack(padx=6, pady=(5,1))
+            nl = tk.Label(frm, text=lbl, font=fl, bg=C["btn"], fg=C["sub"])
+            nl.pack(pady=(0,5))
+            self._stalk_btns[key] = (frm, il, nl)
+            for w in (frm, il, nl):
+                w.bind("<ButtonPress-1>",   lambda e,b=(frm,il,nl):      self._stalk_press(b))
+                w.bind("<ButtonRelease-1>", lambda e,b=(frm,il,nl),c=cmd: self._stalk_release(b,c))
+                w.bind("<Enter>",  lambda e,b=(frm,il,nl): self._stalk_bg(b, C["btn_hov"]))
+                w.bind("<Leave>",  lambda e,b=(frm,il,nl): self._stalk_bg(b, C["btn"]))
+        off_row = tk.Frame(pnl, bg=C["panel"]); off_row.pack(fill="x", padx=10, pady=(0,8))
+        off_f = tk.Frame(off_row, bg=C["btn"], cursor="hand2",
+                         highlightbackground=C["border"], highlightthickness=1)
+        off_f.pack(fill="x")
+        off_l = tk.Label(off_f, text="X  OFF",
+                         font=tkfont.Font(family="Segoe UI", size=9),
+                         bg=C["btn"], fg=C["sub"])
+        off_l.pack(pady=4)
+        self._stalk_btns["blink_off"] = (off_f, off_l, None)
+        for w in (off_f, off_l):
+            w.bind("<ButtonPress-1>",   lambda e,b=(off_f,off_l,None): self._stalk_press(b))
+            w.bind("<ButtonRelease-1>", lambda e,b=(off_f,off_l,None): self._stalk_release(b,"blink_off"))
+            w.bind("<Enter>",  lambda e,b=(off_f,off_l,None): self._stalk_bg(b, C["btn_hov"]))
+            w.bind("<Leave>",  lambda e,b=(off_f,off_l,None): self._stalk_bg(b, C["btn"]))
+        self._stalk_enabled = False
+        self._update_stalk_buttons()
+
+    def _stalk_bg(self, trio, colour):
+        frm, il, nl = trio
+        frm.configure(bg=colour); il.configure(bg=colour)
+        if nl: nl.configure(bg=colour)
+
+    def _stalk_press(self, trio):
+        if self._stalk_enabled: self._stalk_bg(trio, C["btn_act"])
+
+    def _stalk_release(self, trio, cmd):
+        if not self._stalk_enabled: return
+        self._stalk_bg(trio, C["btn_hov"])
+        ecu = self._find_stalk_ecu()
+        if ecu:
+            ecu.send_command(cmd)
+            self._log("Stalk -> " + cmd)
+        else:
+            self._log("Stalk: module 16 not attached")
+
+    def _find_stalk_ecu(self):
+        for e in self._mgr.get_ecus():
+            if getattr(e, "ECU_ID", None) == "16": return e
+        return None
+
+    def _update_stalk_buttons(self):
+        ecu = self._find_stalk_ecu()
+        self._stalk_enabled = self._ign and (ecu is not None)
+        for key, trio in self._stalk_btns.items():
+            frm, il, nl = trio
+            if self._stalk_enabled:
+                frm.configure(cursor="hand2", highlightbackground=C["border"])
+                il.configure(fg=C["accent"] if key != "blink_off" else C["sub"])
+                if nl: nl.configure(fg=C["sub"])
+            else:
+                frm.configure(cursor="", highlightbackground=C["bg"])
+                il.configure(fg=C["border"])
+                if nl: nl.configure(fg=C["border"])
+                self._stalk_bg(trio, C["btn"])
+
     def _build_log(self, parent):
-        pnl = _panel(parent, "LOG"); pnl.grid(row=2,column=0,sticky="nsew")
+        pnl = _panel(parent, "LOG"); pnl.pack(fill="both", expand=True)
         self._log_w = tk.Text(pnl, bg=C["log_bg"], fg=C["log_fg"],
             font=tkfont.Font(family="Consolas",size=8),
             relief="flat", bd=0, state="disabled", wrap="none", height=8)
@@ -629,6 +727,7 @@ class App(tk.Tk):
             self._ign_hint.configure(text="Click to enable ignition")
             for d in self._inds.values(): d.configure(fg=C["border"])
             self._log("Ignition OFF")
+        self._update_stalk_buttons()
 
     def _mfl(self, key: str):
         self._btns[key].flash()                # always give visual feedback
