@@ -13,6 +13,40 @@ Needs:  pip install python-can
 """
 
 import can, threading, time, importlib.util, os, sys, queue
+
+# ── CAN CONNECTION CONFIG ─────────────────────────────────────────────────────
+# Set CAN_INTERFACE to one of the options below. Config is detected at startup.
+#
+# Option 1: Auto-detect (csscan_serial) — CS-Scan serial adapter
+CAN_INTERFACE = "csscan_serial"
+CAN_AVAILABLE_CONFIGS = can.detect_available_configs(CAN_INTERFACE)
+#
+# Option 2: SocketCAN (Linux) — native kernel CAN, vcan0 for virtual
+#   CAN_INTERFACE = "socketcan"
+#   CAN_AVAILABLE_CONFIGS = [{"interface": "socketcan", "channel": "vcan0"}]
+#   # or real device: channel="can0"
+#
+# Option 3: PCAN (Windows/Linux) — PEAK PCAN-USB, PCAN-PCI, etc.
+#   CAN_INTERFACE = "pcan"
+#   CAN_AVAILABLE_CONFIGS = can.detect_available_configs("pcan")
+#   # or manual: [{"interface": "pcan", "channel": "PCAN_USBBUS1"}]
+#
+# Option 4: Serial (generic) — CAN over serial, e.g. /dev/ttyUSB0 or COM3
+#   CAN_INTERFACE = "serial"
+#   CAN_AVAILABLE_CONFIGS = [{"interface": "serial", "channel": "COM3", "bitrate": 500000}]
+#
+# Option 5: SLCAN — SLCAN protocol over serial (many USB-CAN adapters)
+#   CAN_INTERFACE = "slcan"
+#   CAN_AVAILABLE_CONFIGS = can.detect_available_configs("slcan")
+#
+# Option 6: Virtual — no hardware, for testing
+#   CAN_INTERFACE = "virtual"
+#   CAN_AVAILABLE_CONFIGS = [{"interface": "virtual", "channel": None}]
+#
+# Option 7: gs_usb — candleLight, Geschwister Schneider USB-CAN
+#   CAN_INTERFACE = "gs_usb"
+#   CAN_AVAILABLE_CONFIGS = can.detect_available_configs("gs_usb")
+
 import tkinter as tk
 from tkinter import font as tkfont
 from datetime import datetime
@@ -172,14 +206,19 @@ class BusManager:
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def _run(self):
-        cfgs = can.detect_available_configs("csscan_serial")
+        cfgs = CAN_AVAILABLE_CONFIGS
         if not cfgs:
             self._status("error", "No adapter found")
             return
 
         cfg = cfgs[0]
         try:
-            self._bus = can.Bus(interface=cfg["interface"], channel=cfg["channel"])
+            bus_kw = {"interface": cfg["interface"]}
+            if "channel" in cfg:
+                bus_kw["channel"] = cfg["channel"]
+            if "bitrate" in cfg:
+                bus_kw["bitrate"] = cfg["bitrate"]
+            self._bus = can.Bus(**bus_kw)
             self.connected = True
             self._status("ok", cfg["channel"])
             self._log(f"Connected: {cfg['interface']} / {cfg['channel']}")

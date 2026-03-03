@@ -1,5 +1,5 @@
 """
-modules/a5_bcm.py — VZE (Traffic Sign Recognition / Audi Presence) module A5
+modules/a5_drvassist.py — A5 Driver Assistance (VZE / Traffic Sign Recognition)
 
 Sends:
   0x181  VZE_01 — Traffic sign display (speed limits etc), 100ms
@@ -18,7 +18,7 @@ from ecu_base import ECUModule
 
 class VzeECU(ECUModule):
     ECU_ID   = "A5"
-    ECU_NAME = "VZE"
+    ECU_NAME = "Driver Assistance"
 
     MESSAGES = [
         (0x181, "VZE_01", 100, [0x00, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),
