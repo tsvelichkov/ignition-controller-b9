@@ -80,7 +80,7 @@ class StalkECU(ECUModule):
 
     MESSAGES = [
         #(0x52B, "LSS_01",       50,  list(_LSS_BASE)),
-        (0x366, "Blinkmodi_02", 200, list(_BM_IDLE)),
+        (0x366, "Blinkmodi_02", 1000, list(_BM_IDLE)),  # log: 1000ms
         #(0x3D4, "Blink_Anf_01", 50,  list(_SEQ_3D4[0])),
     ]
 

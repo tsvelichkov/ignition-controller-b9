@@ -110,7 +110,11 @@ class ECUModule:
 
     def _run(self):
         now    = time.monotonic()
-        next_tx = {s.arb_id: now + s.interval_ms / 1000.0 for s in self._states}
+        # interval_ms=0 would flood (enqueue every loop); clamp to 10ms min
+        next_tx = {
+            s.arb_id: now + max(s.interval_ms, 10) / 1000.0
+            for s in self._states
+        }
 
         while not self._stop_evt.is_set():
             now     = time.monotonic()
@@ -123,7 +127,8 @@ class ECUModule:
                     with self._lock:
                         s.tx_count += 1
                         s.last_tx   = now
-                    next_tx[s.arb_id] = due + s.interval_ms / 1000.0
+                    interval = max(s.interval_ms, 10)  # avoid 0 → flood
+                    next_tx[s.arb_id] = due + interval / 1000.0
                 wait = next_tx[s.arb_id] - now
                 if wait < soonest:
                     soonest = wait

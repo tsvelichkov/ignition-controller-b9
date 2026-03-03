@@ -14,12 +14,22 @@ Needs:  pip install python-can
 
 import can, threading, time, importlib.util, os, sys, queue
 
+# ── Serial throughput (csscan_serial) ─────────────────────────────────────────
+# At 115200 baud a CAN frame takes ~2–3ms → ~300–400 fps max. Queue backs up.
+# Use baudrate=921600 (8×) for ~2400+ fps. IFG prevents adapter buffer overrun.
+IFG_SECS = 0.0005   # 0.5ms min gap between sends (2000 fps max at higher baud)
+SERIAL_BAUDRATE = 921600  # 115200 if adapter unstable; 921600 if supported
+
 # ── CAN CONNECTION CONFIG ─────────────────────────────────────────────────────
 # Set CAN_INTERFACE to one of the options below. Config is detected at startup.
 #
 # Option 1: Auto-detect (csscan_serial) — CS-Scan serial adapter
 CAN_INTERFACE = "csscan_serial"
 CAN_AVAILABLE_CONFIGS = can.detect_available_configs(CAN_INTERFACE)
+# Inject baudrate for csscan_serial (921600 = 8× throughput; use 115200 if unstable)
+for c in CAN_AVAILABLE_CONFIGS:
+    if c.get("interface") == "csscan_serial" and "baudrate" not in c:
+        c["baudrate"] = SERIAL_BAUDRATE
 #
 # Option 2: SocketCAN (Linux) — native kernel CAN, vcan0 for virtual
 #   CAN_INTERFACE = "socketcan"
@@ -102,11 +112,6 @@ C = {
 }
 
 MODULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules")
-
-# ── Inter-frame gap: csscan_serial is ~115200 baud serial.
-#    A standard CAN frame at 500kbit + serial overhead ≈ 0.5-1ms.
-#    Keep 1ms gap between successive sends to stay well within limits.
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BUS MANAGER
@@ -218,6 +223,9 @@ class BusManager:
                 bus_kw["channel"] = cfg["channel"]
             if "bitrate" in cfg:
                 bus_kw["bitrate"] = cfg["bitrate"]
+            # Higher serial baud = more fps; csscan_serial supports baudrate kw
+            if cfg.get("interface") == "csscan_serial":
+                bus_kw["baudrate"] = cfg.get("baudrate", SERIAL_BAUDRATE)
             self._bus = can.Bus(**bus_kw)
             self.connected = True
             self._status("ok", cfg["channel"])
@@ -255,8 +263,9 @@ class BusManager:
         Single thread that drains the TX queues and writes to the serial port.
         _prio_q is checked first so MFL button presses are never delayed by
         a backlog of periodic ECU frames.
-        Enforces IFG_SECS between consecutive sends to prevent overruns.
+        Enforces IFG_SECS between consecutive sends to prevent adapter overrun.
         """
+        last_send = 0.0
         while not self._stop.is_set():
             # Priority queue first (non-blocking)
             try:
@@ -269,6 +278,11 @@ class BusManager:
                     continue
 
             if self._bus:
+                # Enforce inter-frame gap so serial buffer doesn't overrun
+                now = time.monotonic()
+                elapsed = now - last_send
+                if elapsed < IFG_SECS:
+                    time.sleep(IFG_SECS - elapsed)
                 try:
                     self._bus.send(can.Message(
                         arbitration_id=arb_id,
@@ -277,6 +291,7 @@ class BusManager:
                     ))
                 except can.CanError as e:
                     self._log(f"TX err {hex(arb_id)}: {e}")
+                last_send = time.monotonic()
 
 
 

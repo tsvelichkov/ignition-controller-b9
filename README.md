@@ -74,6 +74,8 @@ The default interface is **csscan_serial** (CSS Electronics USB adapter). To use
 
 The [python-can-csscan-serial](https://canlogger.csselectronics.com/tools-docs/csscan_serial/python_csscan/index.html) package adds support for the CSS Electronics USB interface. It is installed via `pip install python-can-csscan-serial` (included in `requirements.txt`).
 
+**Queue / throughput**: At 115200 baud the serial link limits to ~300–400 frames/sec; the ECU emulators can produce more, so the queue backs up. The app uses `SERIAL_BAUDRATE = 921600` by default (edit near top of `nav_controller.py`). If the adapter does not support 921600, set it to `115200` and consider reducing ECU modules or message rates.
+
 The adapter appears as a USB virtual-serial-port:
 - **Windows**: Device Manager → Ports (COM & LPT) → "USB Serial Device" (e.g. COM19)
 - **Linux**: `/dev/ttyACM*` or `/dev/ttyUSB*` — check with `journalctl -f` when plugging in

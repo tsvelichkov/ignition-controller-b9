@@ -36,12 +36,11 @@ class GatewayECU(ECUModule):
         (0x6B2,       "Diagnose_01",  1000, _BASE + [0x00, 0x00]),
 
         # ── NVEM ──────────────────────────────────────────────────────────────
-        # NVEM_02: odometer counter, b5/b6 increment slowly. Most common
-        # running-state frame from log (was 0xCB which is slightly off).
-        (0x663,       "NVEM_02",        50, [0x60, 0x00, 0x20, 0x06, 0x00, 0xC6, 0x31, 0x00]),
-        # NVEM_06: 16-frame CRC+counter replay — byte0=CRC, byte1=counter 0x60-0x6F.
+        # NVEM_02: odometer counter, b5/b6 increment slowly. Log 0000058: 100ms.
+        (0x663,       "NVEM_02",       100, [0x60, 0x00, 0x20, 0x06, 0x00, 0xC6, 0x31, 0x00]),
+        # NVEM_06: 16-frame CRC+counter replay. Log 0000058: 100ms.
         # Cluster validates the counter; single static frame causes rejection.
-        (0x16A95414,  "NVEM_06",        50, [
+        (0x16A95414,  "NVEM_06",       100, [
             [0x37, 0x60, 0x52, 0x48, 0x0A, 0x00, 0x53, 0x00],
             [0x00, 0x61, 0x52, 0x48, 0x0A, 0x00, 0x53, 0x00],
             [0x18, 0x62, 0x52, 0x48, 0x0A, 0x00, 0x53, 0x00],
