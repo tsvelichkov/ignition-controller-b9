@@ -1,0 +1,636 @@
+"""
+modules/5f_infotainment.py — Infotainment / MIB3 ECU emulation
+HUD + Cluster BAP nav protocol ported from hud_nav.js v23.
+"""
+import time, threading
+from ecu_base import ECUModule
+import can
+import queue
+
+HUD_S=0x17333210; HUD_D=0x17333211; HUD_ASG=0x17333202; HUD_RX=0x17330410
+CLU_S=0x17333110; CLU_D=0x17333111; CLU_RX=0x17330110
+
+# NM keepalives removed — now owned by 19_gateway.py which sends all 5 nodes
+
+HUD_FL=[0x78,0x01,0xDC,0x00,0x06,0x00]
+CLU_FL=[0x78,0x01,0x98,0x0A,0x80,0x60,0x42,0x00]
+
+# ── BAP header helpers ────────────────────────────────────────────────────────
+# BAP 16-bit header encoding:
+#   byte0 = (op << 4) | (lsg >> 2)
+#   byte1 = ((lsg & 3) << 6) | fn
+#
+# For lsg=0x32 (Navigation_SD):  byte0 = (op<<4)|0x0C,  byte1 = 0x80|fn
+# For lsg=0x31 (Cluster nav):    byte0 = (op<<4)|0x0C,  byte1 = 0x40|fn
+#
+# Common op codes:
+#   1=Get, 2=SetGet, 3=HeartbeatStatus, 4=Status, 5=StatusAck, 6=Ack, 7=Error
+#
+# Short frame: byte0 bit7=0 (guaranteed when op<8 and lsg<64)
+# Long start:  byte0=0x80, byte1=payload_len, bytes[2:4]=BAP header, bytes[4+]=payload
+# Long cont:   byte0=0xCn (n=index), bytes[1+]=payload
+#
+HUD_LSG = 0x32   # Navigation_SD lsg used on HUD channels
+CLU_LSG = 0x31   # Navigation_SD lsg used on CLU channels
+
+def bap(op, lsg, fn):
+    """Return (byte0, byte1) for a BAP short-frame header."""
+    return ((op << 4) | (lsg >> 2)), (((lsg & 3) << 6) | fn)
+
+def bap_hb(fn, lsg=HUD_LSG):
+    """HeartbeatStatus (op=3) header for a nav function."""
+    return list(bap(3, lsg, fn))
+
+def bap_st(fn, lsg=HUD_LSG):
+    """Status (op=4) header for a nav function."""
+    return list(bap(4, lsg, fn))
+
+# ── Arrow definitions ────────────────────────────────────────────────────────
+# fn=0x17 ManeuverDescriptor MainElement codes (confirmed from MIB3 log):
+#   0x09 = Offroad compass (what displays when off-road — the "compass to road" arrow)
+#   0x0B = FollowStreet (straight)
+#   0x0D = Turn
+#   0x06 = OffRoad (different symbol?)
+#   0x03 = Arrived
+#
+# Direction byte (fn=0x17): raw angle 0-255 where 0=north/straight, clockwise
+#   0x00=0°(straight/N), 0x40=90°(right/E), 0x80=180°(back/S), 0xC0=270°(left/W)
+#
+# fn=0x21 bearing (HUD_D): actual degrees 0-255 (0x5f=95°=East-ish)
+# fn=0x10 CompassInfo (CLU_D): byte0=heading_deg_0-255 (0x13=19°=NNE)
+#
+# For offroad, MIB3 uses:
+#   HUD_S fn=0x17: main=0x09, dir=0x00, dist=0, validity=0xFF (offroad/invalid)
+#   HUD_D fn=0x21: [bearing, 0x02, 0x02, 0x03, 0x00]
+#   CLU_D fn=0x10: [heading, signal%, 0x00, 0x04, 0x10, 0x02]
+#   CLU_D fn=0x20: [bearing, 0x06, 0x02, 0x07, 0x00, 0x02]
+ARROWS=[
+    # Offroad compass arrow (MainElement=0x09, bearing=0x5f=95° East from log)
+    {"name":"Offroad",     "main":0x09, "dir":0x00, "dist_m":   0, "bearing":0x5F, "offroad":True},
+    # On-road maneuvers (dist_m>0, offroad=False)
+    {"name":"Turn Right",  "main":0x0D, "dir":0x40, "dist_m": 500, "bearing":0x40, "offroad":False},
+    {"name":"Turn Left",   "main":0x0D, "dir":0xC0, "dist_m": 500, "bearing":0xC0, "offroad":False},
+    {"name":"Straight",    "main":0x0B, "dir":0x00, "dist_m":1000, "bearing":0x00, "offroad":False},
+]
+
+class InfotainmentECU(ECUModule):
+    ECU_ID="5F"; ECU_NAME="Infotainment"
+    MESSAGES=[
+        (HUD_S,   "HUD Primary",   0, [0x3C,0x82,0x00]),
+        (HUD_D,   "HUD Secondary", 0, [0x3C,0x9D,0x00]),
+        (CLU_S,   "CLU Primary",   0, [0x3C,0x42,0x00]),
+        (CLU_D,   "CLU Secondary", 0, [0x3C,0x60,0x00]),
+        (0x331,   "MFL Heartbeat", 0, [0x20,0x00,0x00,0x00,0x01,0x00,0x00,0x00]),
+    ]
+
+    # Phase constants
+    PHASE_IDLE       = "IDLE"
+    PHASE_HB         = "HB_RUNNING"
+    PHASE_BAP_OK     = "BAP_OK"
+    PHASE_NAV_ACTIVE = "NAV_ACTIVE"
+
+    def __init__(self, log_cb=None):
+        super().__init__(log_cb)
+        self._rx_thread=None
+        self._tick=0; self._mfl_ctr=0
+        self._hud_inited=False; self._hud_activ=False
+        self._nav_conf=False; self._clu_conf=False
+        self._hud_poll_done=False   # True after HUD completes first GET poll cycle
+        self._hud_step=0            # current position in 23-step HUD heartbeat cycle
+        self._clu_cycle=0; self._clu_step=0; self._clu_ready=False
+        self.arrow_idx=0
+        # Phase tracking
+        self._phase      = self.PHASE_IDLE
+        self._hud_bap_ok = False   # got first frame from HUD_RX
+        self._clu_bap_ok = False   # got first frame from CLU_RX
+        self._status_t   = 0       # last time we printed a status line
+
+    def attach(self, bus, tx_queue):
+        self._bus=bus; self._tx_q=tx_queue; self._stop_evt.clear()
+        self._thread=threading.Thread(target=self._run,daemon=True,name="ECU-5F-tx")
+        self._rx_thread=threading.Thread(target=self._rx_run,daemon=True,name="ECU-5F-rx")
+        self._thread.start(); self._rx_thread.start()
+
+    def detach(self):
+        self._stop_evt.set()
+        for t in (self._thread, self._rx_thread):
+            if t: t.join(timeout=2)
+        self._bus=None; self._tx_q=None
+
+    # ── TX tick loop ──────────────────────────────────────────────────────────
+    def set_enabled(self, on: bool):
+        """Called by BusManager on ignition toggle."""
+        if self.enabled and not on:
+            # Ignition just turned OFF — send explicit deactivation to cluster
+            self._log("Ignition OFF — deactivating cluster/HUD nav")
+            self._tx(CLU_S, [0x3C, 0x69, 0x00])          # nav enable off
+            self._tx(CLU_S, [0x3C, 0x5E, 0x00])          # nav type off
+            self._tx(HUD_S, [0x3C, 0x91, 0x00])          # HUD deactivate
+            self._tx(HUD_S, [0x3C, 0x95, 0x00,0x00,0x00,0x00,0xFF,0x00])
+            # Reset confirmed state so re-activation works on next ignition ON
+            self._nav_conf   = False
+            self._clu_conf   = False
+            self._hud_inited = False
+            self._hud_activ  = False
+            self._clu_step   = 0
+            self._clu_cycle  = 0
+            self._clu_ready  = False
+            self._hud_bap_ok  = False
+            self._clu_bap_ok  = False
+            self._hud_poll_done = False
+            self._set_phase(self.PHASE_IDLE)
+        self.enabled = on
+        if on and self._hud_bap_ok and not self._hud_activ:
+            self._log("[BAP] Ignition ON with HUD already responding — activating navigation")
+            self._hud_activate()
+
+    def _set_phase(self, p):
+        if p == self._phase: return
+        self._log(f"[PHASE] {self._phase} -> {p}")
+        self._phase = p
+
+    def _check_bap_ready(self):
+        # Only activate if ignition is on — HUD_RX frames arrive before ignition
+        # and _hud_init hasn't run yet at that point.
+        if self._phase == self.PHASE_HB and self._hud_bap_ok:
+            self._set_phase(self.PHASE_BAP_OK)
+            if self.enabled:
+                self._log("[BAP] HUD responding — activating navigation")
+                self._hud_activate()
+            else:
+                self._log("[BAP] HUD responding — deferring activation until ignition ON")
+
+    def _on_nav_ready(self):
+        if self._nav_conf:
+            if self._phase != self.PHASE_NAV_ACTIVE:
+                self._set_phase(self.PHASE_NAV_ACTIVE)
+                self._log("[NAV] HUD confirmed — NAV_ACTIVE")
+                # Send MIB2.5-style activation push to trigger HUD ManeuverDescriptor fetch
+                self._hud_nav_push()
+            self._log(f"[NAV] Sending HUD arrows  clu_ready={self._clu_ready}")
+            self._send_hud_arrows()
+            if self._clu_ready:
+                self._log("[NAV] Cluster ready — sending cluster arrows too")
+                self._send_cluster_arrows()
+            else:
+                self._log("[NAV] Cluster cycle not complete yet — arrows will send when ready")
+
+    def _hud_nav_push(self):
+        """One-time Status push sequence that triggers HUD to display ManeuverDescriptor.
+        Copied exactly from MIB2.5 NAV log activation at ~15066ms:
+          Status fn=0x15 inactive → Status fn=0x25 bit22=1 → clear fn=0x11 → fn=0x15 → fn=0x25 clear
+        """
+        self._log("[NAV] HUD activation push: fn=0x15/0x25 FuncSync trigger")
+        # fn=0x15 DistToDestination = inactive (ff flag)
+        self._tx(HUD_S, bap_st(0x15) + [0x00,0x00,0x00,0x00,0xFF,0x00])
+        # fn=0x25 FunctionSynchronisation — bit22 set signals ManeuverDescriptor (fn=0x16) updated
+        # payload: 00 00 40 00 00 00 00 00  (8 bytes, bit22=1 LE)
+        self._tx(HUD_S, [0x80,0x08] + bap_st(0x25) + [0x00,0x00,0x40,0x00])
+        self._tx(HUD_S, [0xC0,0x00,0x00,0x00,0x00])
+        # Clear fn=0x11 RG_Status (MIB2.5 does this momentarily then relies on heartbeat)
+        self._tx(HUD_S, bap_st(0x11) + [0x00])
+        # fn=0x15 again
+        self._tx(HUD_S, bap_st(0x15) + [0x00,0x00,0x00,0x00,0xFF,0x00])
+        # fn=0x25 all-zeros (clear)
+        self._tx(HUD_S, [0x80,0x08] + bap_st(0x25) + [0x00,0x00,0x00,0x00])
+        self._tx(HUD_S, [0xC0,0x00,0x00,0x00,0x00])
+
+    def _run(self):
+        self._set_phase(self.PHASE_HB)
+        self._log("[INIT] Heartbeats started — waiting for BAP responses from HUD and cluster")
+        last=time.monotonic()
+        while not self._stop_evt.is_set():
+            now=time.monotonic()
+            if now-last>=0.100:
+                last=now
+                if self.enabled:
+                    self._tick_100ms()
+                else:
+                    # Ignition off — keep MFL heartbeat alive so bus
+                    # nodes stay awake and see the clean KL15=off state
+                    # (NM keepalives handled by 19_gateway)
+                    self._tick += 1
+                    t = self._tick
+                    if t % 4 == 1:
+                        self._mfl_ctr = (self._mfl_ctr + 1) & 0x0F
+                        self._tx(0x331, [0x20|self._mfl_ctr,0x00,0x00,0x00,0x01,0x00,0x00,0x00])
+            self._stop_evt.wait(timeout=0.005)
+
+    def _tick_100ms(self):
+        t=self._tick; self._tick+=1
+        now=time.monotonic()
+
+        # MFL_01 heartbeat every 320ms
+        if t%4==1:
+            self._mfl_ctr=(self._mfl_ctr+1)&0x0F
+            d=[0x20|self._mfl_ctr,0x00,0x00,0x00,0x01,0x00,0x00,0x00]
+            self._tx(0x331,d); self._mark_sent(0x331,d)
+
+        # ── HUD heartbeat cycle — one function per second ─────────────────────
+        # MIB3 cycles through ALL 23 nav functions, one per second.
+        # VCDS error "NAV_0x32 bap_error_timeout heartbeat" = HUD didn't receive
+        # a function's heartbeat within its timeout window.
+        if t%10==0:
+            if not self._hud_inited: self._hud_init()
+            self._hud_tick()
+            self._log(f"[HB] t={t*100}ms  hud_bap={'OK' if self._hud_bap_ok else 'wait'}"
+                      f"  clu_bap={'OK' if self._clu_bap_ok else 'wait'}"
+                      f"  phase={self._phase}"
+                      f"  hud_step={self._hud_step}")
+
+        # Cluster cycle — one step per second at offset tick 3
+        if t%10==3 and t>0:
+            self._clu_tick()
+
+        # Refresh arrows every 10s once nav active
+        if self._phase==self.PHASE_NAV_ACTIVE and t%100==5:
+            self._log(f"[ARROW] 10s refresh")
+            self._send_hud_arrows()
+            if self._clu_ready:
+                self._send_cluster_arrows()
+
+        # Status line every 5s
+        if now - self._status_t >= 5.0:
+            self._status_t = now
+            self._log(
+                f"[STATUS] phase={self._phase}"
+                f"  hud_bap={'OK' if self._hud_bap_ok else 'wait'}"
+                f"  clu_bap={'OK' if self._clu_bap_ok else 'wait'}"
+                f"  nav={'YES' if self._nav_conf else 'no'}"
+                f"  clu={'YES' if self._clu_conf else 'no'}"
+                f"  step={self._clu_step}/{self._clu_cycle}"
+            )
+
+    # ── HUD 23-step heartbeat cycle (one function per second) ─────────────────
+    # Mirrors MIB3 NAV log exactly. All frames use HBStatus (op=3, 0x3C prefix)
+    # with correct BAP headers for lsg=0x32 (byte1 = 0x80|fn).
+    # fn=0x11 and fn=0x39 use nav-active values so HUD always sees valid state.
+    def _hud_tick(self):
+        rg = 0x01 if self._nav_conf else 0x00
+        a  = ARROWS[self.arrow_idx]
+        steps=[
+            # fn=0x27  (unknown, val=0x04 constant in MIB3)
+            lambda: self._tx(HUD_S,[0x3C,0xA7,0x04]),
+            # fn=0x2B  (unknown, val=[0x02,0x00,0x00,0x00])
+            lambda: self._tx(HUD_S,[0x3C,0xAB,0x02,0x00,0x00,0x00]),
+            # fn=0x2C  long 7B [00,00,01,00, 01,02,00]
+            lambda: (self._tx(HUD_S,[0x80,0x07,0x3C,0xAC,0x00,0x00,0x01,0x00]),
+                     self._tx(HUD_S,[0xC0,0x01,0x02,0x00])),
+            # fn=0x2D  [00,11,E8,03,00,01]
+            lambda: self._tx(HUD_S,[0x3C,0xAD,0x00,0x11,0xE8,0x03,0x00,0x01]),
+            # fn=0x2F  [00,00,00]
+            lambda: self._tx(HUD_S,[0x3C,0xAF,0x00,0x00,0x00]),
+            # fn=0x31  [00,00,00]
+            lambda: self._tx(HUD_S,[0x3C,0xB1,0x00,0x00,0x00]),
+            # fn=0x35  [00,00,30,00,00,00]
+            lambda: self._tx(HUD_S,[0x3C,0xB5,0x00,0x00,0x30,0x00,0x00,0x00]),
+            # fn=0x36  [01]
+            lambda: self._tx(HUD_S,[0x3C,0xB6,0x01]),
+            # fn=0x37  [00,00,00,00]  (different from ManeuverState=fn=0x39)
+            lambda: self._tx(HUD_S,[0x3C,0xB7,0x00,0x00,0x00,0x00]),
+            # fn=0x39 ManeuverState [04,00,00,00,00,00]  (CallForAction even in HB)
+            lambda: self._tx(HUD_S,[0x3C,0xB9,0x04,0x00,0x00,0x00,0x00,0x00]),
+            # fn=0x3C  long 11B
+            lambda: (self._tx(HUD_S,[0x80,0x0B,0x3C,0xBC,0x00,0x00,0x00,0x00]),
+                     self._tx(HUD_S,[0xC0,0xFF,0xFF,0x00,0x00,0x00,0x00,0x00])),
+            # fn=0x02 BAP_Config
+            lambda: self._tx(HUD_S,[0x3C,0x82,0x03,0x00,0x32,0x00,0x04,0x0A]),
+            # fn=0x03 FunctionList  (MIB3 uses different FL bytes than MIB2.5)
+            lambda: (self._tx(HUD_S,[0x80,0x08,0x3C,0x83,0x78,0x01,0xFF,0x86]),
+                     self._tx(HUD_S,[0xC0,0x67,0x5F,0x67,0x48])),
+            # fn=0x04 HeartBeat interval
+            lambda: self._tx(HUD_S,[0x3C,0x84,0x0A]),
+            # fn=0x0F FSGOperationState=0x00 normal
+            lambda: self._tx(HUD_S,[0x3C,0x8F,0x00]),
+            # fn=0x10 CompassInfo [00,68,01]
+            lambda: self._tx(HUD_S,[0x3C,0x90,0x00,0x68,0x01]),
+            # fn=0x11 RG_Status — 0x01 when nav active, 0x00 otherwise
+            lambda: self._tx(HUD_S,[0x3C,0x91,rg]),
+            # fn=0x12 DistanceToNextManeuver  long 8B offroad=[0]*4+[FF,FF,0,0]
+            lambda: (self._tx(HUD_S,[0x90,0x08,0x3C,0x92,0x00,0x00,0x00,0x00]),
+                     self._tx(HUD_S,[0xD0,0xFF,0xFF,0x00,0x00])),
+            # fn=0x15 DistanceToDestination [00,00,00,00,FF,00]
+            lambda: self._tx(HUD_S,[0x3C,0x95,0x00,0x00,0x00,0x00,0xFF,0x00]),
+            # fn=0x16  long 7B [F0,00,00,00,00,00,00]
+            lambda: (self._tx(HUD_S,[0x80,0x07,0x3C,0x96,0xF0,0x00,0x00,0x00]),
+                     self._tx(HUD_S,[0xC0,0x00,0x00,0x00])),
+            # fn=0x17 ManeuverDescriptor  long 12B — compass arrow main=0x09 in HB too
+            lambda: (self._tx(HUD_S,[0x80,0x0C,0x3C,0x97,a["main"],a["dir"],0x00,0x00]),
+                     self._tx(HUD_S,[0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x00]),
+                     self._tx(HUD_S,[0xC1,0x00])),
+            # fn=0x25 FunctionSynchronisation  long 8B all-zeros
+            lambda: (self._tx(HUD_S,[0x80,0x08,0x3C,0xA5,0x00,0x00,0x00,0x00]),
+                     self._tx(HUD_S,[0xC0,0x00,0x00,0x00,0x00])),
+            # fn=0x26 InfoStates [00]
+            lambda: self._tx(HUD_S,[0x3C,0xA6,0x00]),
+        ]
+        self._tx(HUD_S, [0x3C,0xA7,0x04])  # fn=0x27 always first as sync marker
+        if self._hud_step < len(steps):
+            steps[self._hud_step]()
+            self._hud_step += 1
+        else:
+            self._hud_step = 0
+
+    # ── Cluster 12s cycle ─────────────────────────────────────────────────────
+    def _clu_tick(self):
+        steps=[
+            lambda: self._tx(CLU_S,[0x3C,0x4F,0x00,0x00]),
+            lambda: self._tx(CLU_S,[0x3C,0x53,0x00]),
+            lambda: self._tx(CLU_S,[0x3C,0x54,0x00,0x00]),
+            lambda: self._tx(CLU_S,[0x80,0x02,0x3C,0x5C,0x00,0x00]),
+            lambda: self._tx(CLU_S,[0x3C,0x5E,0x09 if self._clu_cycle==0 else 0x00]),
+            lambda: (self._tx(CLU_S,[0x3C,0x69,0x06]),
+                     self._mark_sent(CLU_S,[0x3C,0x69,0x06])),
+            lambda: (self._tx(CLU_S,[0x80,0x08,0x3C,0x6A,0x00,0x00,0x00,0x00]),
+                     self._tx(CLU_S,[0xC0,0x00,0x00,0x00,0x00])),
+            lambda: self._tx(CLU_S,[0x3C,0x71,0x00,0x00,0x00,0x00]),
+            lambda: (self._tx(CLU_S,[0x3C,0x42,0x03,0x00,0x31,0x00,0x04,0x08]),
+                     self._mark_sent(CLU_S,[0x3C,0x42,0x03,0x00,0x31,0x00,0x04,0x08])),
+            lambda: (self._tx(CLU_S,[0x80,0x08,0x3C,0x43]+CLU_FL[:4]),
+                     self._tx(CLU_S,[0xC0]+CLU_FL[4:])),
+            lambda: self._tx(CLU_S,[0x3C,0x44,0x0A]),
+        ]
+        if self._clu_step<len(steps):
+            steps[self._clu_step](); self._clu_step+=1
+        else:
+            self._clu_step=0; self._clu_cycle+=1
+            if not self._clu_ready:
+                self._clu_ready=True
+                self._log("[CLU] Cluster cycle 1 complete — cluster is ready")
+                # If nav already active, send arrows now that cluster is ready
+                if self._phase==self.PHASE_NAV_ACTIVE:
+                    self._log("[CLU] Sending arrows to cluster now")
+                    self._send_arrows()
+
+    # ── RX loop ───────────────────────────────────────────────────────────────
+    def _rx_run(self):
+        while not self._stop_evt.is_set():
+            if not self._bus:
+                time.sleep(0.1); continue
+            try:
+                msg=self._bus.recv(timeout=0.1)
+                if msg: self._handle_rx(msg)
+            except Exception: pass
+
+    def _handle_rx(self, msg):
+        a=msg.arbitration_id; d=list(msg.data)
+        if not d: return
+
+        if a==HUD_ASG:
+            if d[0]==0x1C and d[1]==0x82:
+                if not self._hud_inited: self._hud_init()
+                self._tx(HUD_S,[0x4C,0x82,0x03,0x00,0x32,0x00,0x04,0x08])
+                if self._nav_conf: self._tx(HUD_S,[0x4C,0x8F,0x01])
+            elif d[0]==0x1C and d[1]==0x81:
+                if not self._hud_inited: self._hud_init()
+                # Respond to node announce with our key Status frames
+                self._tx(HUD_S,[0x4C,0x82,0x03,0x00,0x32,0x00,0x04,0x0A])  # fn=0x02
+                self._tx(HUD_S,[0x4C,0x8F,0x00])                             # fn=0x0F
+                self._tx(HUD_S,[0x4C,0x84,0x0A])                             # fn=0x04
+            return
+
+        if a==HUD_RX:
+            raw = bytes(d).hex().upper()
+            if not self._hud_bap_ok:
+                self._hud_bap_ok=True
+                self._log(f"[BAP] First frame from HUD_RX  {raw}")
+                self._check_bap_ready()
+            op = d[0] if d else 0
+            if op == 0x80:
+                # Multi-frame first frame — payload starts at d[2]
+                # Format: 80 LL op fn data...
+                if len(d) >= 4:
+                    mf_op = d[2]; mf_fn = d[3]; mf_data = d[4:]
+                    self._log(f"[HUD_RX] MF_GET fn=0x{mf_fn:02X}  {raw}")
+                    if mf_op & 0xF0 == 0x30:
+                        self._handle_hud_get(mf_fn, [mf_op, mf_fn] + list(mf_data))
+            elif op == 0xC0 or op == 0xC1:
+                pass  # multi-frame continuation — ignore for now
+            elif op == 0x41:
+                fn = d[1] if len(d)>1 else 0
+                if fn == 0x0F:
+                    val = d[2] if len(d)>=3 else 0
+                    self._log(f"[HUD_RX] fn=0x0F val=0x{val:02X}  {raw}"
+                              + ("  (nav confirmed!)" if val==0x02 else "  (nav not yet confirmed)"))
+                    if val == 0x02 and not self._nav_conf:
+                        self._nav_conf=True
+                        self._log("[NAV] HUD confirmed nav session via 0x0F!")
+                        self._on_nav_ready()
+                else:
+                    self._log(f"[HUD_RX] SET_RESP fn=0x{fn:02X}  {raw}")
+            elif op & 0xF0 == 0x30:
+                fn = d[1] if len(d)>1 else 0
+                self._log(f"[HUD_RX] GET fn=0x{fn:02X}  {raw}")
+                self._handle_hud_get(fn, d)
+            else:
+                fn = d[1] if len(d)>1 else 0
+                self._log(f"[HUD_RX] op=0x{op:02X} fn=0x{fn:02X}  {raw}")
+            return
+
+        if a==CLU_RX:
+            if not self._clu_bap_ok:
+                self._clu_bap_ok=True
+                self._log(f"[BAP] First frame from CLU_RX  {bytes(d).hex().upper()}")
+                # Note: cluster replies after nav is active, not before
+            if len(d)>=2 and d[0]==0x30:
+                fct=d[1]
+                self._log(f"[CLU] GET fn=0x{fct:02X}")
+                self._handle_clu_get(fct)
+                return
+            if len(d)>=3 and d[0]==0x40 and d[1]==0x4F and d[2]==0x02:
+                if not self._clu_conf:
+                    self._clu_conf=True
+                    self._log(f"[NAV] Cluster confirmed nav session  {bytes(d).hex().upper()}")
+                    self._on_nav_ready()
+            return
+
+    def _handle_hud_get(self, fct, d):
+        """Handle status frames from the HUD on HUD_RX.
+        NOTE: All HUD_RX frames are the HUD's own HeartbeatStatus/Status on lsg=0x04
+        (not GET requests to us). We monitor them for handshake state, and also
+        respond with our own Status frames when the HUD's poll cycle progresses.
+        Our responses use correct BAP headers: bap_st(fn) = [0x4C, 0x80|fn] for lsg=0x32.
+        """
+        # ── Monitor HUD's own fn=0x0F state ───────────────────────────────────
+        # HUD fn=0x0F val=0x02 means HUD nav display is active/ready
+        # HUD fn=0x0F val=0x00 means nav display off
+        if fct == 0x0F and len(d) >= 3:
+            hud_nav_state = d[2]
+            self._log(f"[HUD_RX] HUD fn=0x{fct:02X} nav_state=0x{hud_nav_state:02X}  {bytes(d).hex().upper()}")
+
+        # ── Push our FSG status back to HUD after seeing its heartbeats ───────
+        # These use correct BAP headers: bap_st(fn) = [op=4/Status, lsg=0x32, fn]
+        if fct == 0x02:
+            self._tx(HUD_S, bap_st(0x02) + [0x03,0x00,0x32,0x00,0x04,0x08])
+        elif fct == 0x03:
+            payload = list(d[2:]) if len(d) > 2 else [0x38,0x07,0xE8,0x00,0x00,0x00]
+            self._tx_multi(HUD_S, bap_st(0x03) + payload)
+        elif fct == 0x04:
+            self._tx(HUD_S, bap_st(0x04) + [0x0A])
+        elif fct == 0x0D:
+            self._tx(HUD_S, bap_st(0x0D) + list(d[2:]))
+        elif fct == 0x0E:
+            self._tx(HUD_S, bap_st(0x0E) + list(d[2:]))
+        elif fct == 0x0F:
+            # FSGOperationState: 0x00=normal operation
+            self._tx(HUD_S, bap_st(0x0F) + [0x00])
+            self._log(f"[HUD_RX] Responded FSGOperationState=0x00 (normal)")
+        elif fct == 0x10:
+            self._tx(HUD_S, bap_st(0x10) + list(d[2:]))
+        elif fct == 0x11:
+            val = 0x01 if self._nav_conf else 0x00
+            self._tx(HUD_S, bap_st(0x11) + [val])
+            self._log(f"[HUD_RX] Responded RG_Status={val}")
+        elif fct == 0x12:
+            a = ARROWS[self.arrow_idx]
+            dist = a["dist_m"] * 10
+            d0,d1,d2,d3 = dist&0xFF,(dist>>8)&0xFF,(dist>>16)&0xFF,(dist>>24)&0xFF
+            self._tx(HUD_S, [0x80,0x08] + bap_st(0x12) + [d0,d1,d2,d3])
+            self._tx(HUD_S, [0xC0,0x00,0x01,0x64,0x01])
+        elif fct == 0x13:
+            self._tx(HUD_S, [0x80,0x01] + bap_st(0x13) + [0x00])  # empty string
+        elif fct == 0x17:
+            a = ARROWS[self.arrow_idx]
+            m1 = [a["main"], a["dir"], 0x00, 0x00]
+            m2 = [0x01, 0x00, 0x00, 0x00]
+            m3 = [0x01, 0x00, 0x00, 0x00]
+            self._tx(HUD_S, [0x80,0x0C] + bap_st(0x17) + m1)
+            self._tx(HUD_S, [0xC0] + m2 + m3[:3])
+            self._tx(HUD_S, [0xC1, m3[3]])
+            self._log(f"[HUD_RX] Pushed ManeuverDescriptor main=0x{a['main']:02X} dir=0x{a['dir']:02X}")
+        elif fct == 0x14:
+            self._tx(HUD_S, bap_st(0x14) + list(d[2:]))
+            # fn=0x14 is the last function in the HUD poll cycle
+            if not self._hud_poll_done and self._hud_activ:
+                self._hud_poll_done = True
+                self._log("[NAV] HUD completed first poll cycle — sending arrows now")
+                self._nav_conf = True
+                self._on_nav_ready()
+        # ── fn >= 0x80: already use correct encoding in HUD_S heartbeat ───────
+        elif fct==0x82: self._tx(HUD_S, bap_st(0x02) + [0x03,0x00,0x32,0x00,0x04,0x08])
+        elif fct==0x83: self._tx_multi(HUD_S, bap_st(0x03) + HUD_FL + [0x00,0x00])
+        elif fct==0x84: self._tx(HUD_S, bap_st(0x04) + [0x0A])
+        elif fct==0x8F: self._tx(HUD_S, bap_st(0x0F) + [0x00])
+        elif fct==0x90: self._tx(HUD_S, bap_st(0x10) + [0x02,0x35,0x01])
+        elif fct==0x91: self._tx(HUD_S, bap_st(0x11) + [0x01 if self._hud_activ else 0x00])
+        elif fct==0x95:
+            v=[0xF6,0x0E,0x00,0x00,0x01,0x01] if self._hud_activ else [0x00,0x00,0x00,0x00,0xFF,0x00]
+            self._tx(HUD_S, bap_st(0x15) + v)
+        elif fct==0xA5: self._tx_multi(HUD_S, bap_st(0x25) + [0x00]*8)
+        elif fct==0xA6: self._tx(HUD_S, bap_st(0x26) + [0x00])
+        else:
+            self._log(f"[HUD_RX] Unhandled fn=0x{fct:02X}  data={bytes(d).hex().upper()}")
+
+    def _handle_clu_get(self, fct):
+        if   fct==0x43: self._tx(CLU_S,[0x80,0x08,0x40,0x43]+CLU_FL[:4]); self._tx(CLU_S,[0xC0]+CLU_FL[4:])
+        elif fct==0x44: self._tx(CLU_S,[0x40,0x44,0x0A])
+        elif fct==0x42: self._tx(CLU_S,[0x40,0x42,0x03,0x00,0x31,0x00,0x04,0x08])
+        elif fct==0x4F: self._tx(CLU_S,[0x40,0x4F,0x00,0x00])
+        elif fct==0x5E: self._tx(CLU_S,[0x40,0x5E,0x00])
+        elif fct==0x69: self._tx(CLU_S,[0x40,0x69,0x06])
+        elif fct==0x6A: self._tx(CLU_S,[0x80,0x08,0x40,0x6A,0x00,0x00,0x00,0x00]); self._tx(CLU_S,[0xC0,0x00,0x00,0x00,0x00])
+        elif fct==0x70: self._tx(CLU_S,[0x40,0x70,0x00,0x00,0x00,0x00])
+
+    # ── HUD helpers ───────────────────────────────────────────────────────────
+    def _hud_init(self):
+        if self._hud_inited: return
+        self._hud_inited = True
+        self._log("[INIT] HUD BAP init — starting 23-step heartbeat cycle")
+        # Seed the first two functions immediately so the HUD has something to react to,
+        # then the cycle continues one-per-second via _hud_tick.
+        self._tx(HUD_S,[0x3C,0xA7,0x04])                            # fn=0x27
+        self._tx(HUD_S,[0x3C,0x84,0x0A])                            # fn=0x04 HeartBeat interval
+        self._tx(HUD_S,[0x3C,0x8F,0x00])                            # fn=0x0F FSGOp=normal
+
+    def _hud_activate(self):
+        self._hud_activ=True
+        self._log("[NAV] Activating navigation mode")
+
+    def _send_arrows(self):
+        self._send_hud_arrows()
+        self._send_cluster_arrows()
+
+    def _send_hud_arrows(self):
+        a = ARROWS[self.arrow_idx]
+        self._log(f"[ARROW] -> HUD  {a['name']}  offroad={a['offroad']}  dist={a['dist_m']}m")
+
+        # ── fn=0x11 RG_Status = 0x01 (active) ── HUD_S ───────────────────────
+        # bap_st(0x11) = [0x4C, 0x91]
+        self._tx(HUD_S, bap_st(0x11) + [0x01])
+
+        # ── fn=0x39 ManeuverState = 0x04 (CallForAction) ── HUD_S ─────────────
+        # IMPORTANT: fn=0x39, NOT fn=0x37. Confirmed from MIB3 NAV log: 4cb9 04 00 00 00 00 00
+        # fn=0x37 is a different function (all-zeros, purpose unknown)
+        self._tx(HUD_S, bap_st(0x39) + [0x04, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+        # ── fn=0x12 DistanceToNextManeuver — long 8B ── HUD_S ─────────────────
+        # Offroad: dist=0, bytes4-5=0xFFFF (validity=invalid) — from MIB3 NAV log
+        # On-road: dist_le×10, byte4=0x00 unit=m, byte5=0x01 bargraph_on, byte6=%, byte7=0x01 valid
+        h12 = bap_st(0x12)   # [0x4C, 0x92]
+        if a["offroad"]:
+            p12 = [0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]
+        else:
+            dist = a["dist_m"] * 10
+            d0,d1,d2,d3 = dist&0xFF,(dist>>8)&0xFF,(dist>>16)&0xFF,(dist>>24)&0xFF
+            p12 = [d0, d1, d2, d3, 0x00, 0x01, 0x64, 0x01]
+        self._tx(HUD_S, [0x80, 0x08] + h12 + p12[:4])
+        self._tx(HUD_S, [0xC0] + p12[4:])
+
+        # ── fn=0x17 ManeuverDescriptor — long 12B ── HUD_S ────────────────────
+        # Payload = 3 maneuvers × [MainElement, Direction, Z_Level, SidestreetsLen]
+        # Offroad compass: main=0x09, dir=0x00 — confirmed from MIB3 (46455ms)
+        # Maneuvers 2+3: all zeros (MIB3 uses 0x00, not 0x01/NoInfo)
+        h17 = bap_st(0x17)   # [0x4C, 0x97]
+        m1 = [a["main"], a["dir"], 0x00, 0x00]
+        self._tx(HUD_S, [0x80, 0x0C] + h17 + m1)
+        self._tx(HUD_S, [0xC0] + [0x00]*7)
+        self._tx(HUD_S, [0xC1, 0x00])
+
+        # ── fn=0x1D ── HUD_D ──────────────────────────────────────────────────
+        # Observed in MIB3 just before fn=0x21: 80 03 3c9d 00 00 ff
+        h1d = bap_hb(0x1D)   # [0x3C, 0x9D]
+        self._tx(HUD_D, [0x80, 0x03] + h1d + [0x00, 0x00, 0xFF])
+
+        # ── fn=0x21 compass/arrow visual ── HUD_D ────────────────────────────
+        # Payload: [bearing_0_255, 0x02, 0x02, 0x03, 0x00]
+        # bearing: direction in 0-255 scale (0x5F=95°~East from MIB3 offroad log)
+        # Long-start with 0x90 prefix (as MIB3 uses 0x90 not 0x80 for HUD_D fn=0x21)
+        h21 = bap_hb(0x21)   # [0x3C, 0xA1]
+        bearing = a.get("bearing", 0x00)
+        self._tx(HUD_D, [0x90, 0x05] + h21 + [bearing, 0x02, 0x02, 0x03])
+        self._tx(HUD_D, [0xD0, 0x00])
+
+        self._mark_sent(HUD_S, h17 + [a["main"], a["dir"]])
+
+    def _send_cluster_arrows(self):
+        a = ARROWS[self.arrow_idx]
+        bearing = a.get("bearing", 0x00)
+        self._log(f"[ARROW] -> CLU  {a['name']}  bearing=0x{bearing:02X}")
+
+        # ── CLU_D fn=0x10 CompassInfo ─────────────────────────────────────────
+        # From MIB3 NAV log: 3c50 13 04 00 04 10 02
+        # [heading_deg_0-255, signal%, 0x00, 0x04, 0x10, 0x02]
+        h10c = bap_hb(0x10, CLU_LSG)   # [0x3C, 0x50]
+        self._tx(CLU_D, h10c + [bearing, 0x64, 0x00, 0x04, 0x10, 0x02])
+
+        # ── CLU_D fn=0x20 arrow visual ────────────────────────────────────────
+        # From MIB3 NAV log: 80 05 3c60 5f060207 c000 02
+        # Payload: [bearing, 0x06, 0x02, 0x07, 0x00, 0x02] — 5 bytes
+        h20c = bap_hb(0x20, CLU_LSG)   # [0x3C, 0x60]
+        self._tx(CLU_D, [0x80, 0x05] + h20c + [bearing, 0x06, 0x02, 0x07])
+        self._tx(CLU_D, [0xC0, 0x00, 0x02])
+
+        # ── CLU_S fn=0x13 CurrentPositionInfo = empty ─────────────────────────
+        self._tx(CLU_S, bap_hb(0x13, CLU_LSG) + [0x00])           # 3c 53 00
+
+        # ── CLU_S nav-active markers (only present when nav active in MIB3 log) ─
+        self._tx(CLU_S, [0x80, 0x02] + bap_hb(0x1C, CLU_LSG) + [0x00, 0x00])
+        self._tx(CLU_S, bap_hb(0x1E, CLU_LSG) + [0x07])           # 3c 5e 07 (MIB3 uses 0x07)
+        self._tx(CLU_S, bap_hb(0x29, CLU_LSG) + [0x06])           # 3c 69 06
+
+        self._mark_sent(CLU_D, h10c + [bearing])
+
+    def next_arrow(self): self.arrow_idx=(self.arrow_idx+1)%len(ARROWS); self._maybe_send()
+    def prev_arrow(self): self.arrow_idx=(self.arrow_idx-1)%len(ARROWS); self._maybe_send()
+    def _maybe_send(self):
+        if self._nav_conf or self._clu_conf: self._send_arrows()

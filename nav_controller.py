@@ -12,6 +12,7 @@ Needs:  pip install python-can
         modules/ folder alongside this script
 """
 
+import argparse
 import can, threading, time, importlib.util, os, sys, queue
 
 # ── Serial throughput (csscan_serial) ─────────────────────────────────────────
@@ -58,8 +59,10 @@ for c in CAN_AVAILABLE_CONFIGS:
 #   CAN_AVAILABLE_CONFIGS = can.detect_available_configs("gs_usb")
 
 import tkinter as tk
-from tkinter import font as tkfont
+from tkinter import filedialog, font as tkfont, ttk
 from datetime import datetime
+
+from bap import HudBapSession, load_hud_bap_messages
 
 # ── IGN CRC LUTs (0x3C0 Klemmen_Status_01) ───────────────────────────────────
 # b2=0x23: Kl_S=1, Kl_15=1, Kl_Infotainment=1  (ignition ON)
@@ -82,8 +85,6 @@ MFL = {
     "OK":      {"code":0x07, "event":0x01, "label":"OK",      "icon":"✓"},
     "RETURN":  {"code":0x08, "event":0x01, "label":"BACK",    "icon":"↩"},
     "VIEW":    {"code":0x23, "event":0x01, "label":"VIEW",    "icon":"⊞"},
-    # Thumbwheel: Tastencode=0x06 (Up__Down_ThumbWheel), Eventcode encodes direction
-    # Eventcode 1 = W_1_Tick_up,  Eventcode 15 (0x0F) = W_1_Tick_dn  (DBC VAL_)
     "WHEEL_U": {"code":0x06, "event":0x01, "label":"WHEEL ▲", "icon":"▲"},
     "WHEEL_D": {"code":0x06, "event":0x0F, "label":"WHEEL ▼", "icon":"▼"},
 }
@@ -112,15 +113,61 @@ C = {
 }
 
 MODULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules")
+DEFAULT_APP_CONFIG = {
+    "start_ignition": False,
+    "verbose_bap": False,
+    "hud_mode": "full",
+    "hud_arrow": "straight",
+    "hud_distance_m": 500,
+    "auto_open_hud": False,
+}
+
+HUD_SOURCE_IDS = {
+    0x17330400,  # HUD_BOOT
+    0x17330410,  # HUD_RX
+    0x17333200,  # HUD_GET
+    0x17333202,  # HUD_ASG
+}
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Audi MLB CAN Navigation Controller")
+    parser.add_argument("--ignition", choices=("on", "off"), default="off",
+                        help="Set the initial ignition state.")
+    parser.add_argument("--verbose-bap", action="store_true",
+                        help="Enable verbose 5F/HUD BAP logging.")
+    parser.add_argument("--hud-mode", choices=("full", "minimal"), default="full",
+                        help="Select full emulation or minimal straight-arrow HUD mode.")
+    parser.add_argument("--hud-arrow", choices=("straight", "left", "right", "offroad"), default="straight",
+                        help="Arrow shape used by minimal HUD mode.")
+    parser.add_argument("--hud-distance", type=int, default=500,
+                        help="Distance in meters used by minimal HUD mode.")
+    parser.add_argument("--auto-open-hud", action="store_true",
+                        help="Open the HUD BAP monitor window on startup.")
+    return parser.parse_args(argv)
+
+
+def make_app_config(args):
+    cfg = dict(DEFAULT_APP_CONFIG)
+    cfg.update({
+        "start_ignition": args.ignition == "on",
+        "verbose_bap": bool(args.verbose_bap),
+        "hud_mode": args.hud_mode,
+        "hud_arrow": args.hud_arrow,
+        "hud_distance_m": max(0, int(args.hud_distance)),
+        "auto_open_hud": bool(args.auto_open_hud),
+    })
+    return cfg
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BUS MANAGER
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BusManager:
-    def __init__(self, log_cb, status_cb):
+    def __init__(self, log_cb, status_cb, frame_cb=None):
         self._log    = log_cb
         self._status = status_cb
+        self._frame  = frame_cb or (lambda *_args, **_kwargs: None)
         self._bus    = None
         self._stop   = threading.Event()
 
@@ -129,9 +176,11 @@ class BusManager:
         # _tx_q:   normal periodic ECU frames
         self._prio_q = queue.Queue()
         self._tx_q   = queue.Queue()  # unbounded
+        self._bus_lock = threading.Lock()  # guards bus.send() — shared with ECUs for atomic MF sequences
 
         self._main_thread   = None   # connection thread
         self._writer_thread = None   # serial writer
+        self._reader_thread = None   # shared RX dispatcher
         self._tick_thread   = None   # ignition heartbeat — runs from app start
 
         self._ecus     = []
@@ -155,7 +204,7 @@ class BusManager:
         else:
             ecu.enabled = self.ignition
         if self.connected and self._bus:
-            ecu.attach(self._bus, self._tx_q)
+            ecu.attach(self._bus, self._tx_q, self._bus_lock, self._emit_frame)
 
     def get_ecus(self):
         return list(self._ecus)
@@ -178,6 +227,8 @@ class BusManager:
             self._main_thread.join(timeout=3)
         if self._writer_thread:
             self._writer_thread.join(timeout=2)
+        if self._reader_thread:
+            self._reader_thread.join(timeout=2)
         if self._tick_thread:
             self._tick_thread.join(timeout=2)
 
@@ -240,6 +291,10 @@ class BusManager:
             target=self._writer_loop, daemon=True, name="CANWriter"
         )
         self._writer_thread.start()
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, daemon=True, name="CANReader"
+        )
+        self._reader_thread.start()
 
         # Attach ECU modules — apply ignition state first, then start threads
         for e in self._ecus:
@@ -247,7 +302,7 @@ class BusManager:
                 e.set_enabled(self.ignition)
             else:
                 e.enabled = self.ignition
-            e.attach(self._bus, self._tx_q)
+            e.attach(self._bus, self._tx_q, self._bus_lock, self._emit_frame)
 
         try:
             self._stop.wait()  # block until stop() — tick loop runs independently
@@ -257,6 +312,41 @@ class BusManager:
             self._bus.shutdown()
             self.connected = False
             self._status("off", "")
+
+    def _emit_frame(self, direction: str, arb_id: int, data):
+        try:
+            self._frame(direction, arb_id, list(data))
+        except Exception:
+            pass
+
+    def _dispatch_message(self, msg):
+        for ecu in self._ecus:
+            handler = getattr(ecu, "on_message", None)
+            if not callable(handler):
+                continue
+            try:
+                wants = getattr(ecu, "wants_message", None)
+                if callable(wants) and not wants(msg):
+                    continue
+                handler(msg)
+            except Exception as e:
+                self._log(f"RX err [{getattr(ecu, 'ECU_ID', '?')}] {e}")
+
+    def _reader_loop(self):
+        while not self._stop.is_set():
+            if not self._bus:
+                time.sleep(0.05)
+                continue
+            try:
+                msg = self._bus.recv(timeout=0.05)
+            except Exception as e:
+                self._log(f"RX bus err: {e}")
+                time.sleep(0.1)
+                continue
+            if msg is None:
+                continue
+            self._emit_frame("rx", msg.arbitration_id, list(msg.data))
+            self._dispatch_message(msg)
 
     def _writer_loop(self):
         """
@@ -284,11 +374,13 @@ class BusManager:
                 if elapsed < IFG_SECS:
                     time.sleep(IFG_SECS - elapsed)
                 try:
-                    self._bus.send(can.Message(
-                        arbitration_id=arb_id,
-                        data=data,
-                        is_extended_id=arb_id > 0x7FF
-                    ))
+                    with self._bus_lock:
+                        self._bus.send(can.Message(
+                            arbitration_id=arb_id,
+                            data=data,
+                            is_extended_id=arb_id > 0x7FF
+                        ))
+                    self._emit_frame("tx", arb_id, data)
                 except can.CanError as e:
                     self._log(f"TX err {hex(arb_id)}: {e}")
                 last_send = time.monotonic()
@@ -326,6 +418,10 @@ class BusManager:
         btn = MFL.get(key)
         if not btn:
             return
+        if key == "OFF":
+            self._prio_q.put((0x5BF, MFL_CLEAR))
+            self._log(f"MFL {btn['label']:8s} → {' '.join(f'{b:02X}' for b in MFL_CLEAR)}")
+            return
         press = [btn["code"], 0x00, btn["event"], 0x21]
         self._prio_q.put((0x5BF, press))
         self._log(f"MFL {btn['label']:8s} → {' '.join(f'{b:02X}' for b in press)}")
@@ -337,7 +433,7 @@ class BusManager:
 # MODULE LOADER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_modules(log_cb=None):
+def load_modules(log_cb=None, config=None):
     ecus = []
     if not os.path.isdir(MODULES_DIR):
         return ecus
@@ -360,9 +456,12 @@ def load_modules(log_cb=None):
                 if (isinstance(cls, type) and
                         issubclass(cls, ECUModule) and cls is not ECUModule):
                     try:
-                        inst = cls(log_cb=log_cb)
+                        inst = cls(log_cb=log_cb, config=config)
                     except TypeError:
-                        inst = cls()
+                        try:
+                            inst = cls(log_cb=log_cb)
+                        except TypeError:
+                            inst = cls()
                     ecus.append(inst)
                     break
             except Exception:
@@ -422,7 +521,11 @@ class MFLBtn(tk.Frame):
         self._af = self.after(160, lambda: self._bg(C["btn"]))
 
 
-def _hex(data): return " ".join(f"{b:02X}" for b in data[:8])
+def _hex(data):
+    """Format up to 8 bytes as hex. Handles flat list or list-of-frames (shows current frame)."""
+    if data and isinstance(data[0], list):
+        data = data[0]   # multi-frame state: show first/current frame
+    return " ".join(f"{b:02X}" for b in data[:8])
 
 
 class ECUCard(tk.Frame):
@@ -461,7 +564,7 @@ class ECUCard(tk.Frame):
                      width=7, anchor="w").pack(side="left", padx=(6,2), pady=2)
             tk.Label(row, text=s.name[:17], font=fi, bg=bg, fg=C["sub"],
                      width=17, anchor="w").pack(side="left")
-            dl = tk.Label(row, text=_hex(s.data), font=fd, bg=bg, fg=C["text"],
+            dl = tk.Label(row, text=_hex(s.current_display()), font=fd, bg=bg, fg=C["text"],
                           width=22, anchor="w")
             dl.pack(side="left", padx=3)
             cl = tk.Label(row, text="0", font=fc, bg=bg, fg=C["sub"], width=5, anchor="e")
@@ -474,7 +577,7 @@ class ECUCard(tk.Frame):
             if s.arb_id not in self._rows: continue
             dl, cl, bg = self._rows[s.arb_id]
             cl.configure(text=str(s.tx_count))
-            dl.configure(text=_hex(s.data))
+            dl.configure(text=_hex(s.current_display()))
             if s.tx_count and (time.monotonic() - s.last_tx) < 0.25:
                 dl.configure(fg=C["on"]); active = True
             else:
@@ -499,34 +602,209 @@ def _panel(parent, title):
     return o
 
 
+class BapTableWindow(tk.Toplevel):
+    COLS = ("direction", "timestamp", "canid", "opcode", "lsgid", "fctid", "data", "text")
+
+    def __init__(self, parent, title):
+        super().__init__(parent)
+        self.title(title)
+        self.configure(bg=C["bg"])
+        self.geometry("1320x620")
+        self.minsize(960, 360)
+
+        top = tk.Frame(self, bg=C["panel"])
+        top.pack(fill="x", padx=8, pady=(8, 4))
+        tk.Button(
+            top,
+            text="Copy Selected",
+            font=tkfont.Font(family="Segoe UI", size=8),
+            bg=C["btn"],
+            fg=C["text"],
+            activebackground=C["btn_hov"],
+            activeforeground=C["text"],
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=self.copy_selected_rows,
+        ).pack(side="right", padx=10, pady=6)
+        self._status = tk.Label(
+            top,
+            text="",
+            font=tkfont.Font(family="Consolas", size=8),
+            bg=C["panel"],
+            fg=C["sub"],
+            anchor="w",
+        )
+        self._status.pack(fill="x", padx=10, pady=8)
+
+        body = tk.Frame(self, bg=C["bg"])
+        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        self._tree = ttk.Treeview(body, columns=self.COLS, show="headings")
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        self._tree.tag_configure("hud_source", background="#4a2f0b", foreground=C["text"])
+        self._tree.bind("<Control-c>", lambda _event: self.copy_selected_rows())
+        self._tree.bind("<Control-C>", lambda _event: self.copy_selected_rows())
+        self.bind("<Control-c>", lambda _event: self.copy_selected_rows())
+        self.bind("<Control-C>", lambda _event: self.copy_selected_rows())
+        ysb = ttk.Scrollbar(body, orient="vertical", command=self._tree.yview)
+        xsb = ttk.Scrollbar(body, orient="horizontal", command=self._tree.xview)
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        self._tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+
+        widths = {
+            "direction": 70,
+            "timestamp": 110,
+            "canid": 120,
+            "opcode": 140,
+            "lsgid": 150,
+            "fctid": 220,
+            "data": 320,
+            "text": 360,
+        }
+        anchors = {
+            "direction": "center",
+            "timestamp": "center",
+            "canid": "w",
+            "opcode": "w",
+            "lsgid": "w",
+            "fctid": "w",
+            "data": "w",
+            "text": "w",
+        }
+        headers = {
+            "direction": "Direction",
+            "timestamp": "Timestamp",
+            "canid": "CAN ID",
+            "opcode": "Opcode",
+            "lsgid": "LSG ID",
+            "fctid": "Function",
+            "data": "Data",
+            "text": "Text",
+        }
+        for col in self.COLS:
+            self._tree.heading(col, text=headers[col])
+            self._tree.column(col, width=widths[col], stretch=True, anchor=anchors[col])
+
+    def set_status(self, text: str):
+        self._status.configure(text=text)
+
+    def clear(self):
+        for item in self._tree.get_children():
+            self._tree.delete(item)
+
+    def load_messages(self, messages):
+        self.clear()
+        for message in messages:
+            self.append_message(message)
+        self.set_status(f"{len(messages)} decoded messages")
+
+    def append_message(self, message):
+        self._tree.insert(
+            "",
+            "end",
+            values=(
+                message.direction.upper(),
+                message.timestamp,
+                message.can_id_label,
+                message.opcode_text,
+                message.lsg_text,
+                message.fct_text,
+                message.data_text,
+                message.text,
+            ),
+            tags=("hud_source",) if message.can_id in HUD_SOURCE_IDS else (),
+        )
+        self._tree.yview_moveto(1.0)
+
+    def append_messages(self, messages):
+        if not messages:
+            return
+        for message in messages:
+            self._tree.insert(
+                "",
+                "end",
+                values=(
+                    message.direction.upper(),
+                    message.timestamp,
+                    message.can_id_label,
+                    message.opcode_text,
+                    message.lsg_text,
+                    message.fct_text,
+                    message.data_text,
+                    message.text,
+                ),
+                tags=("hud_source",) if message.can_id in HUD_SOURCE_IDS else (),
+            )
+        self._tree.yview_moveto(1.0)
+
+    def copy_selected_rows(self):
+        items = self._tree.selection()
+        if not items:
+            self.set_status("No rows selected")
+            return
+        lines = []
+        for item in items:
+            values = self._tree.item(item, "values")
+            lines.append("\t".join(str(value) for value in values))
+        self.clipboard_clear()
+        self.clipboard_append("\n".join(lines))
+        noun = "row" if len(lines) == 1 else "rows"
+        self.set_status(f"Copied {len(lines)} {noun} to clipboard")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
     REFRESH = 200
+    HUD_FRAME_REFRESH = 20
 
-    def __init__(self):
+    def __init__(self, config=None):
         super().__init__()
+        self._cfg = dict(DEFAULT_APP_CONFIG)
+        if config:
+            self._cfg.update(config)
         self.title("CAN Nav Controller"); self.configure(bg=C["bg"])
-        self.minsize(920, 580); self.resizable(True, True)
+        self.geometry("1560x920")
+        self.minsize(1320, 820); self.resizable(True, True)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self._ign = False; self._cards = []
-        self._setup_bus(); self._build(); self._start_refresh()
+        self._hud_logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "hud_bap")
+        self._hud_session = HudBapSession(self._hud_logs_dir)
+        self._hud_live_win = None
+        self._hud_frame_q = queue.Queue()
+        self._setup_bus(); self._build(); self._start_refresh(); self._start_hud_frame_drain()
+        self.after(50, lambda: self._log(
+            f"Startup config: ignition={'on' if self._cfg.get('start_ignition') else 'off'}"
+            f" hud_mode={self._cfg.get('hud_mode')}"
+            f" verbose_bap={'on' if self._cfg.get('verbose_bap') else 'off'}"
+            f" arrow={self._cfg.get('hud_arrow')}"
+            f" distance={self._cfg.get('hud_distance_m')}m"
+        ))
+        if self._cfg.get("auto_open_hud"):
+            self.after(200, self._open_hud_bap_window)
+        if self._cfg.get("start_ignition"):
+            self.after(300, self._apply_initial_ignition)
 
     def _setup_bus(self):
         self._mgr = BusManager(
             log_cb=    lambda m: self.after(0, self._log, m),
             status_cb= lambda s, d: self.after(0, self._setstatus, s, d),
+            frame_cb=  lambda d, a, data: self._hud_frame_q.put((d, a, list(data))),
         )
-        for ecu in load_modules(log_cb=lambda m: self.after(0, self._log, m)):
+        for ecu in load_modules(log_cb=lambda m: self.after(0, self._log, m), config=self._cfg):
             self._mgr.register_ecu(ecu)
         self._mgr.start()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build(self):
-        self.columnconfigure(0, minsize=285, weight=0)
+        self.columnconfigure(0, minsize=520, weight=0)
         self.columnconfigure(2, weight=1)
         self.rowconfigure(2, weight=1)
 
@@ -550,24 +828,13 @@ class App(tk.Tk):
 
         tk.Frame(self, bg=C["border"], height=1).grid(row=1,column=0,columnspan=3,sticky="ew")
 
-        # Left panel as scrollable canvas — no clipping
-        left_outer = tk.Frame(self, bg=C["bg"])
-        left_outer.grid(row=2,column=0,sticky="nsew",padx=(10,5),pady=10)
-        left_outer.columnconfigure(0,weight=1); left_outer.rowconfigure(0,weight=1)
-        left_cvs = tk.Canvas(left_outer, bg=C["bg"], highlightthickness=0, width=300)
-        left_cvs.grid(row=0,column=0,sticky="nsew")
-        left_sb = tk.Scrollbar(left_outer, orient="vertical", command=left_cvs.yview,
-                               bg=C["panel"], troughcolor=C["bg"], width=8)
-        left_sb.grid(row=0,column=1,sticky="ns")
-        left_cvs.configure(yscrollcommand=left_sb.set)
-        left = tk.Frame(left_cvs, bg=C["bg"])
-        left_win = left_cvs.create_window((0,0), window=left, anchor="nw")
-        left_cvs.bind("<Configure>", lambda e: left_cvs.itemconfig(left_win, width=e.width))
-        left.bind("<Configure>", lambda e: left_cvs.configure(scrollregion=left_cvs.bbox("all")))
+        left = tk.Frame(self, bg=C["bg"])
+        left.grid(row=2,column=0,sticky="nsew",padx=(10,5),pady=10)
         left.columnconfigure(0, weight=1)
-        left_cvs.bind("<Shift-MouseWheel>",
-                      lambda e: left_cvs.yview_scroll(int(-e.delta/120), "units"))
-        self._build_ign(left); self._build_mfl(left); self._build_stalk(left); self._build_log(left)
+        self._build_ign(left)
+        self._build_controls(left)
+        self._build_hud_bap(left)
+        self._build_log(left)
 
         tk.Frame(self, bg=C["border"], width=1).grid(row=2,column=1,sticky="ns")
 
@@ -617,29 +884,34 @@ class App(tk.Tk):
             self._inds[name] = d
         tk.Frame(pnl, bg=C["panel"], height=6).pack()
 
+    def _build_controls(self, parent):
+        row = tk.Frame(parent, bg=C["bg"])
+        row.pack(fill="x", pady=(0,6))
+        row.columnconfigure(0, weight=1, uniform="ctrl")
+        row.columnconfigure(1, weight=1, uniform="ctrl")
+        self._build_mfl(row).grid(row=0, column=0, sticky="nsew", padx=(0,3))
+        self._build_stalk(row).grid(row=0, column=1, sticky="nsew", padx=(3,0))
+
     def _build_mfl(self, parent):
-        pnl = _panel(parent, "MFL STEERING WHEEL  (0x5BF)")
-        pnl.pack(fill="x", pady=(0,6))
-        g = tk.Frame(pnl, bg=C["panel"]); g.pack(padx=12, pady=(4,12))
-        for c in range(3): g.columnconfigure(c, weight=1, minsize=74)
+        pnl = _panel(parent, "MFL  (0x5BF)")
+        g = tk.Frame(pnl, bg=C["panel"]); g.pack(fill="x", padx=12, pady=(8,12))
+        for c in range(3): g.columnconfigure(c, weight=1, minsize=78)
         self._btns = {}
         for key, row, col in MFL_LAYOUT:
             b = MFLBtn(g, key, cmd=lambda k=key: self._mfl(k))
             b.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
             self._btns[key] = b
+        return pnl
 
     def _build_stalk(self, parent):
         pnl = _panel(parent, "STALK / BLINKERS  (16)")
-        pnl.pack(fill="x", pady=(0,6))
         BTNS = [
-            ("tip_left",    "tip_left",    "<<", "TIP<"),
             ("blink_left",  "blink_left",  "<",  "LEFT"),
-            ("blink_hazard","blink_hazard","!!", "HAZ"),
+            ("blink_off",   "blink_off",   "X",  "OFF"),
             ("blink_right", "blink_right", ">",  "RIGHT"),
-            ("tip_right",   "tip_right",   ">>", "TIP>"),
         ]
-        g = tk.Frame(pnl, bg=C["panel"]); g.pack(padx=10, pady=(4,4), fill="x")
-        for c in range(5): g.columnconfigure(c, weight=1, minsize=46)
+        g = tk.Frame(pnl, bg=C["panel"]); g.pack(padx=10, pady=(8,4), fill="x")
+        for c in range(3): g.columnconfigure(c, weight=1, minsize=64)
         self._stalk_btns = {}
         fi = tkfont.Font(family="Segoe UI", size=11)
         fl = tkfont.Font(family="Segoe UI", size=6)
@@ -657,22 +929,9 @@ class App(tk.Tk):
                 w.bind("<ButtonRelease-1>", lambda e,b=(frm,il,nl),c=cmd: self._stalk_release(b,c))
                 w.bind("<Enter>",  lambda e,b=(frm,il,nl): self._stalk_bg(b, C["btn_hov"]))
                 w.bind("<Leave>",  lambda e,b=(frm,il,nl): self._stalk_bg(b, C["btn"]))
-        off_row = tk.Frame(pnl, bg=C["panel"]); off_row.pack(fill="x", padx=10, pady=(0,8))
-        off_f = tk.Frame(off_row, bg=C["btn"], cursor="hand2",
-                         highlightbackground=C["border"], highlightthickness=1)
-        off_f.pack(fill="x")
-        off_l = tk.Label(off_f, text="X  OFF",
-                         font=tkfont.Font(family="Segoe UI", size=9),
-                         bg=C["btn"], fg=C["sub"])
-        off_l.pack(pady=4)
-        self._stalk_btns["blink_off"] = (off_f, off_l, None)
-        for w in (off_f, off_l):
-            w.bind("<ButtonPress-1>",   lambda e,b=(off_f,off_l,None): self._stalk_press(b))
-            w.bind("<ButtonRelease-1>", lambda e,b=(off_f,off_l,None): self._stalk_release(b,"blink_off"))
-            w.bind("<Enter>",  lambda e,b=(off_f,off_l,None): self._stalk_bg(b, C["btn_hov"]))
-            w.bind("<Leave>",  lambda e,b=(off_f,off_l,None): self._stalk_bg(b, C["btn"]))
         self._stalk_enabled = False
         self._update_stalk_buttons()
+        return pnl
 
     def _stalk_bg(self, trio, colour):
         frm, il, nl = trio
@@ -697,6 +956,12 @@ class App(tk.Tk):
             if getattr(e, "ECU_ID", None) == "16": return e
         return None
 
+    def _find_infotainment_ecu(self):
+        for e in self._mgr.get_ecus():
+            if getattr(e, "ECU_ID", None) == "5F":
+                return e
+        return None
+
     def _update_stalk_buttons(self):
         ecu = self._find_stalk_ecu()
         self._stalk_enabled = self._ign and (ecu is not None)
@@ -714,10 +979,78 @@ class App(tk.Tk):
 
     def _build_log(self, parent):
         pnl = _panel(parent, "LOG"); pnl.pack(fill="both", expand=True)
+        hdr = tk.Frame(pnl, bg=C["panel"]); hdr.pack(fill="x", padx=6, pady=(2,0))
+        tk.Button(
+            hdr,
+            text="Copy",
+            font=tkfont.Font(family="Segoe UI",size=8),
+            bg=C["btn"],
+            fg=C["text"],
+            activebackground=C["btn_hov"],
+            activeforeground=C["text"],
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=self._copy_log,
+        ).pack(side="right", pady=4)
         self._log_w = tk.Text(pnl, bg=C["log_bg"], fg=C["log_fg"],
             font=tkfont.Font(family="Consolas",size=8),
-            relief="flat", bd=0, state="disabled", wrap="none", height=8)
+            relief="flat", bd=0, state="disabled", wrap="none", height=20)
         self._log_w.pack(fill="both", expand=True, padx=2, pady=2)
+
+    def _build_hud_bap(self, parent):
+        pnl = _panel(parent, "HUD BAP"); pnl.pack(fill="x", pady=(0,6))
+        row = tk.Frame(pnl, bg=C["panel"]); row.pack(fill="x", padx=8, pady=(4, 4))
+        tk.Button(
+            row,
+            text="Open Live Window",
+            font=tkfont.Font(family="Segoe UI", size=8),
+            bg=C["btn"],
+            fg=C["text"],
+            activebackground=C["btn_hov"],
+            activeforeground=C["text"],
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=self._open_hud_bap_window,
+        ).pack(side="left", padx=(0, 6), pady=4)
+        tk.Button(
+            row,
+            text="Start Nav",
+            font=tkfont.Font(family="Segoe UI", size=8),
+            bg=C["btn"],
+            fg=C["text"],
+            activebackground=C["btn_hov"],
+            activeforeground=C["text"],
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=self._start_nav_demo,
+        ).pack(side="left", padx=(0, 6), pady=4)
+        tk.Button(
+            row,
+            text="Load Log",
+            font=tkfont.Font(family="Segoe UI", size=8),
+            bg=C["btn"],
+            fg=C["text"],
+            activebackground=C["btn_hov"],
+            activeforeground=C["text"],
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=self._load_hud_bap_log,
+        ).pack(side="left", pady=4)
+        self._hud_log_lbl = tk.Label(
+            pnl,
+            text=f"Session log: {os.path.basename(str(self._hud_session.path))}",
+            font=tkfont.Font(family="Consolas", size=7),
+            bg=C["panel"],
+            fg=C["sub"],
+            justify="left",
+            anchor="w",
+            wraplength=260,
+        )
+        self._hud_log_lbl.pack(fill="x", padx=10, pady=(0, 8))
 
     def _build_ecu_cards(self):
         for ecu in self._mgr.get_ecus():
@@ -744,6 +1077,21 @@ class App(tk.Tk):
             self._log("Ignition OFF")
         self._update_stalk_buttons()
 
+    def _apply_initial_ignition(self):
+        if not self._ign:
+            self._toggle_ign()
+            self._log("Startup config: ignition=on")
+
+    def _start_nav_demo(self):
+        ecu = self._find_infotainment_ecu()
+        if ecu is None:
+            self._log("Start Nav: infotainment module 5F not attached")
+            return
+        if hasattr(ecu, "start_nav_demo") and ecu.start_nav_demo():
+            self._log("Start Nav: manual route trigger sent")
+        else:
+            self._log("Start Nav: trigger ignored")
+
     def _mfl(self, key: str):
         self._btns[key].flash()                # always give visual feedback
         if not self._mgr.connected:
@@ -751,15 +1099,91 @@ class App(tk.Tk):
             return
         self._mgr.queue_mfl(key)
 
+    def _open_hud_bap_window(self):
+        if self._hud_live_win is not None and self._hud_live_win.winfo_exists():
+            self._hud_live_win.focus_force()
+            return
+        self._hud_live_win = BapTableWindow(self, "HUD Bap")
+        self._hud_live_win.load_messages(self._hud_session.messages)
+        self._hud_live_win.set_status(f"Live session log: {self._hud_session.path}")
+
+    def _load_hud_bap_log(self):
+        path = filedialog.askopenfilename(
+            title="Load HUD BAP Log",
+            initialdir=self._hud_logs_dir,
+            filetypes=[("Log files", "*.log"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        win = BapTableWindow(self, f"HUD Bap Log - {os.path.basename(path)}")
+        win.set_status(f"Loading {path} ...")
+
+        def _worker():
+            try:
+                messages = load_hud_bap_messages(path)
+                error = None
+            except Exception as exc:
+                messages = []
+                error = str(exc)
+            self.after(0, self._finish_load_hud_bap_log, win, path, messages, error)
+
+        threading.Thread(target=_worker, daemon=True, name="HudBapLogLoad").start()
+
+    def _finish_load_hud_bap_log(self, win, path, messages, error):
+        if error:
+            win.set_status(f"Failed to load {path}: {error}")
+            return
+        win.load_messages(messages)
+        win.set_status(f"{len(messages)} decoded messages from {path}")
+
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _on_bus_frame(self, direction: str, arb_id: int, data: list):
+        message = self._hud_session.handle_frame(direction, arb_id, data)
+        if message is None:
+            return
+        if self._hud_live_win is not None and self._hud_live_win.winfo_exists():
+            self._hud_live_win.append_message(message)
+
+    def _drain_hud_frames(self, batch_limit=250):
+        messages = []
+        drained = 0
+        while drained < batch_limit:
+            try:
+                direction, arb_id, data = self._hud_frame_q.get_nowait()
+            except queue.Empty:
+                break
+            message = self._hud_session.handle_frame(direction, arb_id, data)
+            if message is not None:
+                messages.append(message)
+            drained += 1
+        if self._hud_live_win is not None and self._hud_live_win.winfo_exists():
+            if messages:
+                self._hud_live_win.append_messages(messages)
+            self._hud_live_win.set_status(
+                f"Live session log: {self._hud_session.path}"
+                f"  pending={self._hud_frame_q.qsize()}"
+            )
+
+    def _copy_log(self):
+        try:
+            text = self._log_w.get("1.0", "end-1c")
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self._log("Log copied to clipboard")
+        except Exception as exc:
+            self._log(f"Copy log failed: {exc}")
 
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        _, bottom = self._log_w.yview()
+        stick_to_bottom = bottom >= 0.999
         self._log_w.configure(state="normal")
         self._log_w.insert("end", f"[{ts}] {msg}\n")
-        self._log_w.see("end")
         if int(self._log_w.index("end-1c").split(".")[0]) > 600:
             self._log_w.delete("1.0", "80.0")
+        if stick_to_bottom:
+            self._log_w.see("end")
         self._log_w.configure(state="disabled")
 
     def _setstatus(self, state: str, detail: str):
@@ -784,8 +1208,18 @@ class App(tk.Tk):
             self.after(self.REFRESH, _r)
         self.after(self.REFRESH, _r)
 
-    def _close(self): self._mgr.stop(); self.destroy()
+    def _start_hud_frame_drain(self):
+        def _r():
+            self._drain_hud_frames(batch_limit=1000)
+            self.after(self.HUD_FRAME_REFRESH, _r)
+        self.after(self.HUD_FRAME_REFRESH, _r)
+
+    def _close(self):
+        self._mgr.stop()
+        self._hud_session.close()
+        self.destroy()
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    args = parse_args()
+    App(config=make_app_config(args)).mainloop()
