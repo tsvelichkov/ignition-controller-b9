@@ -56,17 +56,11 @@ FULLINIT_HANDOFF_BUNDLE = [
 ]
 FULLINIT_HANDOFF_OFFSETS = [0.000, 0.010, 0.032, 0.048, 0.066, 0.080, 0.095]
 
-ARROWS = [
-    {"name": "Offroad", "main": 0x09, "dir": 0x00, "dist_m": 0, "bearing": 0x5F, "offroad": True},
-    {"name": "Turn Right", "main": 0x0D, "dir": 0x40, "dist_m": 500, "bearing": 0x40, "offroad": False},
-    {"name": "Turn Left", "main": 0x0D, "dir": 0xC0, "dist_m": 500, "bearing": 0xC0, "offroad": False},
-    {"name": "Straight", "main": 0x0B, "dir": 0x00, "dist_m": 500, "bearing": 0x00, "offroad": False},
-]
 ARROW_PRESETS = {
-    "offroad": ARROWS[0],
-    "right": ARROWS[1],
-    "left": ARROWS[2],
-    "straight": ARROWS[3],
+    "offroad": {"name": "Offroad", "main": 0x09, "dir": 0x00, "dist_m": 0, "bearing": 0x5F, "offroad": True},
+    "right": {"name": "Turn Right", "main": 0x0D, "dir": 0x40, "dist_m": 500, "bearing": 0x40, "offroad": False},
+    "left": {"name": "Turn Left", "main": 0x0D, "dir": 0xC0, "dist_m": 500, "bearing": 0xC0, "offroad": False},
+    "straight": {"name": "Straight", "main": 0x0B, "dir": 0x00, "dist_m": 500, "bearing": 0x00, "offroad": False},
 }
 
 
@@ -99,6 +93,12 @@ class InfotainmentECU(ECUModule):
     PHASE_WAIT_ACTIVE_CONFIG = "WAIT_ACTIVE_CONFIG"
     PHASE_NAV_ACTIVE = "NAV_ACTIVE"
 
+    @staticmethod
+    def _encode_text_payload(text):
+        clean = (text or "").strip() or "Offroad"
+        data = clean.encode("ascii", "replace")[:31]
+        return [len(data)] + list(data)
+
     def __init__(self, log_cb=None, config=None):
         super().__init__(log_cb)
         self._cfg = config or {}
@@ -108,7 +108,6 @@ class InfotainmentECU(ECUModule):
         self._rx_pending = queue.Queue()
         self._tick = 0
         self._mfl_ctr = 0
-        self.arrow_idx = 3
 
         self._phase = self.PHASE_STANDBY_INIT
         self._hud_inited = False
@@ -120,22 +119,12 @@ class InfotainmentECU(ECUModule):
         self._asg_last = {}
         self._asg_81_done = False
         self._asg_82_done = False
-        self._fsg_bootstrap_sent = False
         self._boot_1102_seen = False
         self._boot_1101_seen = False
         self._a4_nav_prime_sent = False
         self._a4_nav_prime_cleared = False
-        self._asg_81_at = 0.0
-        self._boot_1102_at = 0.0
-        self._boot_1101_at = 0.0
-        self._synthetic_boot_1102_sent = False
-        self._synthetic_boot_1101_sent = False
         self._hud_get_82_seen = 0
         self._hud_get_81_seen = False
-        self._await_hud_status01_ack = False
-        self._hud_status01_ack_seen = False
-        self._pending_get_handoff = []
-        self._get_handoff_release_at = 0.0
         self._active_visual_keepalive_next_at = 0.0
 
         self._init_cfg_seen = False
@@ -155,7 +144,6 @@ class InfotainmentECU(ECUModule):
         self._hud_status_0f_seen = False
         self._hud_status_10_seen = False
         self._hud_status_14_seen = False
-        self._standby_script_active = False
         self._a4_preready_prime_done = False
         self._a4_seed_bundle_sent = False
         self._a4_postseed_followup_sent = False
@@ -165,47 +153,71 @@ class InfotainmentECU(ECUModule):
         self._pre_active_running_sent = False
         self._pre_active_running_due_at = 0.0
         self._pre_active_fn36_next_at = 0.0
-        self._handoff_locked = False
-        self._handoff_stage = "await_asg_82"
-        self._post_get_82_count = 0
         self._ready_ack_sent = False
         self._a4_preready_poll10_promoted = False
         self._a4_preready_poll11_promoted = False
-        self._ready_promotion_stage = 0
-        self._ready_promotion_sent = False
         self._reset_nav_state()
 
     def set_enabled(self, on: bool):
-        if self.enabled and not on:
+        was_enabled = self.enabled
+        self.enabled = on
+        if was_enabled and not on:
             self._log("Ignition OFF — resetting HUD state")
             self._reset_session()
-        self.enabled = on
+
+    def get_nav_settings(self):
+        arrow = self._current_arrow()
+        return {
+            "enabled": bool(self._cfg.get("hud_nav_enabled", True)),
+            "distance_enabled": bool(self._cfg.get("hud_distance_enabled", True)),
+            "distance_m": max(0, int(self._cfg.get("hud_distance_m", arrow.get("dist_m", 0)))),
+            "distance_graph": int(self._cfg.get("hud_distance_graph", 0x64)) & 0xFF,
+            "street_name": self._cfg.get("hud_street_name", "Offroad"),
+            "arrow_main": arrow.get("main", 0x00),
+            "arrow_dir": arrow.get("dir", 0x00),
+            "arrow_bearing": arrow.get("bearing", 0x00),
+        }
+
+    def configure_nav(self, *, enabled=None, distance_enabled=None, distance_m=None, street_name=None,
+                      arrow_main=None, arrow_dir=None, arrow_bearing=None,
+                      distance_graph=None):
+        if enabled is not None:
+            self._cfg["hud_nav_enabled"] = bool(enabled)
+        if distance_enabled is not None:
+            self._cfg["hud_distance_enabled"] = bool(distance_enabled)
+        if distance_m is not None:
+            self._cfg["hud_distance_m"] = max(0, int(distance_m))
+        if distance_graph is not None:
+            self._cfg["hud_distance_graph"] = int(distance_graph) & 0xFF
+        if street_name is not None:
+            self._cfg["hud_street_name"] = (street_name or "").strip() or "Offroad"
+        if arrow_main is not None:
+            self._cfg["hud_arrow_main"] = int(arrow_main) & 0xFF
+        if arrow_dir is not None:
+            self._cfg["hud_arrow_dir"] = int(arrow_dir) & 0xFF
+        if arrow_bearing is not None:
+            self._cfg["hud_arrow_bearing"] = int(arrow_bearing) & 0xFF
+        self._sync_nav_state()
+        if self._phase in (self.PHASE_WAIT_ACTIVE_CONFIG, self.PHASE_NAV_ACTIVE):
+            self._send_hud_route_payloads()
 
     def _reset_session(self):
         self._phase = self.PHASE_STANDBY_INIT
         self._hud_inited = False
         self._hud_bap_ok = False
+        self._status_t = 0.0
         self._standby_step = 0
         self._ready_since = 0.0
+        self._demo_route = False
         self._asg_last.clear()
         self._asg_81_done = False
         self._asg_82_done = False
-        self._fsg_bootstrap_sent = False
         self._boot_1102_seen = False
         self._boot_1101_seen = False
         self._a4_nav_prime_sent = False
         self._a4_nav_prime_cleared = False
-        self._asg_81_at = 0.0
-        self._boot_1102_at = 0.0
-        self._boot_1101_at = 0.0
-        self._synthetic_boot_1102_sent = False
-        self._synthetic_boot_1101_sent = False
         self._hud_get_82_seen = 0
         self._hud_get_81_seen = False
-        self._await_hud_status01_ack = False
-        self._hud_status01_ack_seen = False
-        self._pending_get_handoff = []
-        self._get_handoff_release_at = 0.0
         self._active_visual_keepalive_next_at = 0.0
         self._init_cfg_seen = False
         self._init_cfg_lead = 0x12
@@ -224,7 +236,6 @@ class InfotainmentECU(ECUModule):
         self._hud_status_0f_seen = False
         self._hud_status_10_seen = False
         self._hud_status_14_seen = False
-        self._standby_script_active = False
         self._a4_preready_prime_done = False
         self._a4_seed_bundle_sent = False
         self._a4_postseed_followup_sent = False
@@ -234,14 +245,9 @@ class InfotainmentECU(ECUModule):
         self._pre_active_running_sent = False
         self._pre_active_running_due_at = 0.0
         self._pre_active_fn36_next_at = 0.0
-        self._handoff_locked = False
-        self._handoff_stage = "await_asg_82"
-        self._post_get_82_count = 0
         self._ready_ack_sent = False
         self._a4_preready_poll10_promoted = False
         self._a4_preready_poll11_promoted = False
-        self._ready_promotion_stage = 0
-        self._ready_promotion_sent = False
         self._reset_nav_state()
         while True:
             try:
@@ -256,7 +262,6 @@ class InfotainmentECU(ECUModule):
             if phase == self.PHASE_STANDBY_READY:
                 self._ready_since = time.monotonic()
                 self._standby_step = 0
-                self._standby_script_active = False
                 self._a4_preready_prime_done = False
                 self._a4_seed_bundle_sent = False
                 self._a4_postseed_followup_sent = False
@@ -268,8 +273,6 @@ class InfotainmentECU(ECUModule):
                 self._ready_ack_sent = False
                 self._a4_preready_poll10_promoted = False
                 self._a4_preready_poll11_promoted = False
-                self._ready_promotion_stage = 0
-                self._ready_promotion_sent = True
                 self._pre_active_fn36_next_at = 0.0
                 self._active_visual_keepalive_next_at = 0.0
             elif phase == self.PHASE_PRE_ACTIVE:
@@ -287,6 +290,19 @@ class InfotainmentECU(ECUModule):
         preset = dict(ARROW_PRESETS.get(self._cfg.get("hud_arrow", "straight"), ARROW_PRESETS["straight"]))
         if not preset.get("offroad"):
             preset["dist_m"] = max(0, int(self._cfg.get("hud_distance_m", preset["dist_m"])))
+        main_override = self._cfg.get("hud_arrow_main")
+        dir_override = self._cfg.get("hud_arrow_dir")
+        bearing_override = self._cfg.get("hud_arrow_bearing")
+        custom_arrow = any(value is not None for value in (main_override, dir_override, bearing_override))
+        if main_override is not None:
+            preset["main"] = int(main_override) & 0xFF
+        if dir_override is not None:
+            preset["dir"] = int(dir_override) & 0xFF
+        if bearing_override is not None:
+            preset["bearing"] = int(bearing_override) & 0xFF
+        if custom_arrow:
+            preset["offroad"] = preset.get("main", 0x00) == 0x09
+            preset["name"] = f"0x{preset['main']:02X}/0x{preset['dir']:02X}"
         return preset
 
     def _reset_nav_state(self):
@@ -313,7 +329,7 @@ class InfotainmentECU(ECUModule):
             state["route_guidance_active"] = False
             state["session_state"] = [0x00, 0x00]
             state["compass_info"] = list(DEFAULT_COMPASS_INFO)
-            state["current_position_info"] = list(DEFAULT_CURRENT_POSITION_INFO_OFFROAD)
+            state["current_position_info"] = self._encode_text_payload(self._cfg.get("hud_street_name", "Offroad"))
             state["next_maneuver_visible"] = False
             state["next_maneuver_distance_m"] = None
             state["destination_distance_m"] = None
@@ -322,14 +338,16 @@ class InfotainmentECU(ECUModule):
             return
         if self._phase in (self.PHASE_WAIT_ACTIVE_CONFIG, self.PHASE_NAV_ACTIVE):
             arrow = self._current_arrow()
+            nav_enabled = bool(self._cfg.get("hud_nav_enabled", True))
+            distance_enabled = bool(self._cfg.get("hud_distance_enabled", True))
             state["fsg_state"] = 0x00
-            state["route_guidance_active"] = True
+            state["route_guidance_active"] = nav_enabled
             state["session_state"] = [0x00, 0x00]
             state["compass_info"] = list(DEFAULT_COMPASS_INFO)
-            state["current_position_info"] = list(DEFAULT_CURRENT_POSITION_INFO_OFFROAD)
-            state["next_maneuver_visible"] = not arrow.get("offroad", False)
-            state["next_maneuver_distance_m"] = max(int(arrow.get("dist_m", 0)), 0) if not arrow.get("offroad", False) else None
-            state["destination_distance_m"] = max(int(arrow.get("dist_m", 0)), 0) if not arrow.get("offroad", False) else None
+            state["current_position_info"] = self._encode_text_payload(self._cfg.get("hud_street_name", "Offroad"))
+            state["next_maneuver_visible"] = nav_enabled and not arrow.get("offroad", False)
+            state["next_maneuver_distance_m"] = max(int(arrow.get("dist_m", 0)), 0) if state["next_maneuver_visible"] and distance_enabled else None
+            state["destination_distance_m"] = max(int(arrow.get("dist_m", 0)), 0) if state["next_maneuver_visible"] and distance_enabled else None
             state["info_states"] = 0xFF
             state["function_sync"] = list(FUNC_SYNC_ACTIVE)
             return
@@ -337,7 +355,7 @@ class InfotainmentECU(ECUModule):
         state["route_guidance_active"] = False
         state["session_state"] = [0x00, 0x01]
         state["compass_info"] = [0x00, 0x00, 0x00]
-        state["current_position_info"] = list(DEFAULT_CURRENT_POSITION_INFO_OFFROAD)
+        state["current_position_info"] = self._encode_text_payload(self._cfg.get("hud_street_name", "Offroad"))
         state["next_maneuver_visible"] = False
         state["next_maneuver_distance_m"] = None
         state["destination_distance_m"] = None
@@ -422,9 +440,6 @@ class InfotainmentECU(ECUModule):
                 f" hud_bap={'OK' if self._hud_bap_ok else 'wait'}"
                 f" boot={'11-01' if self._boot_1101_seen else '11-02' if self._boot_1102_seen else 'wait'}"
                 f" handoff={self._handoff_status_text()}"
-                f" init18={'yes' if self._init_cfg_seen else 'no'}"
-                f" fn36={'yes' if self._fn36_seen else 'no'}"
-                f" nav={'YES' if self._nav_conf else 'no'}"
             )
 
     def _advance_startup_transition(self, now):
@@ -482,7 +497,6 @@ class InfotainmentECU(ECUModule):
         if (self._phase == self.PHASE_STANDBY_READY and not self._init_cfg_seen and
                 fn == 0x11 and payload[:3] == [0xFC, 0x1F, 0x01] and not self._a4_nav_kick_sent):
             self._a4_nav_kick_sent = True
-            self._standby_script_active = True
             self._log("[A4] cold fn=0x11 seen -> arm nav-ready promotion window")
             self._schedule_activation_frame(time.monotonic() + 0.050, HUD_S, [0x3C, 0xA7, 0x04])
         self._respond_to_hud_poll(opcode, fn, payload)
@@ -499,7 +513,6 @@ class InfotainmentECU(ECUModule):
                     self._send_display_config(0x12)
                 if not self._a4_preready_prime_done:
                     base = time.monotonic()
-                    self._standby_script_active = True
                     self._a4_preready_prime_done = True
                     self._log("[A4] queue nav prime window from 31 14")
                     self._schedule_activation_frame(base + 0.652, HUD_S, [0x3C, 0xAB, 0x02, 0x00, 0x00, 0x00])
@@ -518,7 +531,6 @@ class InfotainmentECU(ECUModule):
 
     def _handle_hud_status(self, fn, payload):
         if fn == 0x01:
-            self._hud_status01_ack_seen = True
             return
         if fn == 0x0F and payload:
             was_ready = self._hud_status_0f_ready
@@ -546,25 +558,6 @@ class InfotainmentECU(ECUModule):
     def _hud_ready_for_route(self):
         return self._hud_status_0f_ready and self._hud_status_10_ready and self._hud_status_14_ready
 
-    def _maybe_trigger_ready_promotion(self, now):
-        return
-        if self._phase != self.PHASE_STANDBY_READY:
-            return
-        if self._ready_promotion_sent or self._ready_promotion_stage:
-            return
-        if self._hud_ready_for_route() or not self._ready_since:
-            return
-        if not self._hud_get_81_seen:
-            return
-        if (now - self._ready_since) < 15.0:
-            return
-        if (self._standby_step % 10) != 2:
-            return
-        self._log("[HUD] Triggering standby-ready promotion sequence")
-        self._tx(HUD_S, [0x4C, 0xA6, 0x00])
-        self._tx(HUD_S, [0x4C, 0x8F, 0x00])
-        self._ready_promotion_stage = 1
-
     def _handle_hud_boot(self, data):
         if len(data) != 2 or data[0] != 0x11:
             self._vlog(f"[HUD_BOOT] raw={' '.join(f'{b:02X}' for b in data)}")
@@ -573,12 +566,10 @@ class InfotainmentECU(ECUModule):
         self._vlog(f"[HUD_BOOT] state=0x{state:02X}")
         if state == 0x02:
             self._boot_1102_seen = True
-            self._boot_1102_at = time.monotonic()
             self._log("[HUD_BOOT] 11 02 -> bootstrap request")
             self._dtx(HUD_S, [0x4C, 0x8F, 0x00])
         elif state == 0x01:
             self._boot_1101_seen = True
-            self._boot_1101_at = time.monotonic()
             self._log("[HUD_BOOT] 11 01 -> bootstrap ready")
 
     def _handle_request(self, can_id, data):
@@ -675,21 +666,6 @@ class InfotainmentECU(ECUModule):
         if self._phase == self.PHASE_STANDBY_INIT:
             self._log("[HANDOFF] ASG complete -> STANDBY_READY")
             self._set_phase(self.PHASE_STANDBY_READY)
-
-    def _queue_pending_get_handoff(self, marker):
-        if marker not in self._pending_get_handoff:
-            self._pending_get_handoff.append(marker)
-
-    def _release_pending_get_handoff(self):
-        self._await_hud_status01_ack = False
-        self._get_handoff_release_at = 0.0
-        if not self._pending_get_handoff:
-            return
-        pending = list(self._pending_get_handoff)
-        self._pending_get_handoff.clear()
-        self._log(f"[HANDOFF] release buffered GET markers: {' '.join(f'1C{m:02X}' for m in pending)}")
-        for marker in pending:
-            self._handle_handoff_marker("HUD_GET", marker)
 
     def _handle_handoff_marker(self, source, marker):
         if not self._hud_inited:
@@ -902,24 +878,6 @@ class InfotainmentECU(ECUModule):
         self._hud_inited = True
         self._log("[INIT] HUD standby handshake armed")
 
-    def _poll14_recent_for_prime(self):
-        return self._last_poll14_at and (time.monotonic() - self._last_poll14_at) <= 1.2
-
-    def _send_preready_prime_step(self):
-        if self._a4_preready_prime_done:
-            self._dtx(HUD_S, [0x3C, 0x8F, 0x00])
-            return True
-        if not self._poll14_recent_for_prime():
-            return False
-        self._dtx(HUD_S, [0x3C, 0xAB, 0x02, 0x00, 0x00, 0x00])
-        self._prime_a4_nav_activation()
-        self._a4_preready_prime_done = True
-        self._dtx(HUD_S, [0x3C, 0x8F, 0x00])
-        return True
-
-    def _send_standby_heartbeat_step(self):
-        return
-
     def _respond_to_active_poll(self, fn):
         return False
 
@@ -972,7 +930,6 @@ class InfotainmentECU(ECUModule):
         if self._activation_script:
             base = max(base, self._activation_script[-1]["due_at"] + 0.010)
         self._set_phase(self.PHASE_PRE_ACTIVE)
-        self._standby_script_active = True
         self._pre_active_bundle_sent = True
         self._pre_active_running_sent = False
         self._pre_active_running_due_at = base + 5.000
@@ -1024,7 +981,6 @@ class InfotainmentECU(ECUModule):
         base = time.monotonic()
         if self._activation_script:
             base = max(base, self._activation_script[-1]["due_at"] + 0.010)
-        self._standby_script_active = True
         self._schedule_activation_frame(base + 0.210, HUD_S, [0x4C, 0xAD, 0x00, 0x01, 0xF4, 0x01, 0x00, 0x01])
         self._schedule_activation_frame(base + 0.360, HUD_S, [0x4C, 0xAD, 0x00, 0x01, 0xEE, 0x02, 0x00, 0x01])
         self._schedule_activation_frame(base + 0.590, HUD_S, [0x4C, 0xAB, 0x02, 0x02, 0xFF, 0x00])
@@ -1122,8 +1078,6 @@ class InfotainmentECU(ECUModule):
             self._tx(item["arb_id"], frames[0])
         else:
             self._tx_mf_atomic(item["arb_id"], frames)
-        if self._phase in (self.PHASE_STANDBY_READY, self.PHASE_PRE_ACTIVE) and not self._activation_script:
-            self._standby_script_active = False
 
     def _queue_a4_mib3_preready_script(self):
         base = time.monotonic()
@@ -1258,12 +1212,13 @@ class InfotainmentECU(ECUModule):
         if not self._nav_state["next_maneuver_visible"] or dist_m is None:
             return [0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]
         dist_dm = int(dist_m) * 10
+        graph = int(self._cfg.get("hud_distance_graph", 0x64)) & 0xFF
         return [
             dist_dm & 0xFF,
             (dist_dm >> 8) & 0xFF,
             (dist_dm >> 16) & 0xFF,
             (dist_dm >> 24) & 0xFF,
-            0x00, 0x01, 0x64, 0x01,
+            0x00, 0x01, graph, 0x01,
         ]
 
     def _send_active_visual_keepalive(self):
@@ -1271,7 +1226,7 @@ class InfotainmentECU(ECUModule):
         arrow = self._current_arrow()
         bearing = arrow.get("bearing", 0x00)
         self._vlog(f"[VIS] bearing=0x{bearing:02X}")
-        self._tx(HUD_S, bap_hb(0x11) + [0x01])
+        self._tx(HUD_S, bap_hb(0x11) + self._route_guidance_status_payload())
         self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x13, self._current_position_info_payload(), atomic=True, force_long=True)
         self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x39, self._maneuver_state_payload(), atomic=True)
         self._tx(HUD_S, bap_hb(0x35) + self._unknown35_payload())
@@ -1294,12 +1249,3 @@ class InfotainmentECU(ECUModule):
         self._send_active_visual_keepalive()
         self._log(f"[ARROW] -> HUD {arrow['name']} dist={arrow['dist_m']}m")
 
-    def next_arrow(self):
-        self.arrow_idx = (self.arrow_idx + 1) % len(ARROWS)
-        if self._phase == self.PHASE_NAV_ACTIVE:
-            self._send_hud_route_payloads()
-
-    def prev_arrow(self):
-        self.arrow_idx = (self.arrow_idx - 1) % len(ARROWS)
-        if self._phase == self.PHASE_NAV_ACTIVE:
-            self._send_hud_route_payloads()

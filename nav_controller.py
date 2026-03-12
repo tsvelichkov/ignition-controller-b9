@@ -117,8 +117,15 @@ DEFAULT_APP_CONFIG = {
     "start_ignition": False,
     "verbose_bap": False,
     "hud_mode": "full",
+    "hud_nav_enabled": True,
+    "hud_distance_enabled": True,
     "hud_arrow": "straight",
+    "hud_arrow_main": None,
+    "hud_arrow_dir": None,
+    "hud_arrow_bearing": None,
     "hud_distance_m": 500,
+    "hud_distance_graph": 0x64,
+    "hud_street_name": "Offroad",
     "auto_open_hud": False,
 }
 
@@ -889,8 +896,10 @@ class App(tk.Tk):
         row.pack(fill="x", pady=(0,6))
         row.columnconfigure(0, weight=1, uniform="ctrl")
         row.columnconfigure(1, weight=1, uniform="ctrl")
+        row.columnconfigure(2, weight=1, uniform="ctrl")
         self._build_mfl(row).grid(row=0, column=0, sticky="nsew", padx=(0,3))
-        self._build_stalk(row).grid(row=0, column=1, sticky="nsew", padx=(3,0))
+        self._build_stalk(row).grid(row=0, column=1, sticky="nsew", padx=3)
+        self._build_nav_controls(row).grid(row=0, column=2, sticky="nsew", padx=(3,0))
 
     def _build_mfl(self, parent):
         pnl = _panel(parent, "MFL  (0x5BF)")
@@ -931,6 +940,111 @@ class App(tk.Tk):
                 w.bind("<Leave>",  lambda e,b=(frm,il,nl): self._stalk_bg(b, C["btn"]))
         self._stalk_enabled = False
         self._update_stalk_buttons()
+        return pnl
+
+    def _nav_settings(self):
+        settings = {
+            "enabled": bool(self._cfg.get("hud_nav_enabled", True)),
+            "distance_enabled": bool(self._cfg.get("hud_distance_enabled", True)),
+            "distance_m": max(0, int(self._cfg.get("hud_distance_m", 500))),
+            "distance_graph": int(self._cfg.get("hud_distance_graph", 0x64)) & 0xFF,
+            "street_name": self._cfg.get("hud_street_name", "Offroad"),
+            "arrow_main": self._cfg.get("hud_arrow_main"),
+            "arrow_dir": self._cfg.get("hud_arrow_dir"),
+            "arrow_bearing": self._cfg.get("hud_arrow_bearing"),
+        }
+        ecu = self._find_infotainment_ecu()
+        if ecu is not None and hasattr(ecu, "get_nav_settings"):
+            settings.update(ecu.get_nav_settings())
+        return settings
+
+    def _build_nav_controls(self, parent):
+        pnl = _panel(parent, "NAV HUD  (5F)")
+        settings = self._nav_settings()
+        body = tk.Frame(pnl, bg=C["panel"])
+        body.pack(fill="x", padx=10, pady=(8, 10))
+
+        self._nav_enabled_var = tk.BooleanVar(value=bool(settings["enabled"]))
+        self._nav_distance_enabled_var = tk.BooleanVar(value=bool(settings["distance_enabled"]))
+        self._nav_distance_var = tk.StringVar(value=str(settings["distance_m"]))
+        self._nav_distance_graph_var = tk.StringVar(value=f"{int(settings['distance_graph']) & 0xFF:02X}")
+        self._nav_street_var = tk.StringVar(value=str(settings["street_name"]))
+        self._nav_arrow_main_var = tk.StringVar(value=f"{int(settings['arrow_main']) & 0xFF:02X}")
+        self._nav_arrow_dir_var = tk.StringVar(value=f"{int(settings['arrow_dir']) & 0xFF:02X}")
+        self._nav_arrow_bearing_var = tk.StringVar(value=f"{int(settings['arrow_bearing']) & 0xFF:02X}")
+
+        tk.Checkbutton(
+            body,
+            text="Navigation enabled",
+            variable=self._nav_enabled_var,
+            bg=C["panel"],
+            fg=C["text"],
+            activebackground=C["panel"],
+            activeforeground=C["text"],
+            selectcolor=C["panel"],
+            highlightthickness=0,
+            font=tkfont.Font(family="Segoe UI", size=8),
+        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 2))
+        tk.Checkbutton(
+            body,
+            text="Distance visible",
+            variable=self._nav_distance_enabled_var,
+            bg=C["panel"],
+            fg=C["text"],
+            activebackground=C["panel"],
+            activeforeground=C["text"],
+            selectcolor=C["panel"],
+            highlightthickness=0,
+            font=tkfont.Font(family="Segoe UI", size=8),
+        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(0, 6))
+
+        labels = [
+            ("Arrow main", self._nav_arrow_main_var),
+            ("Arrow dir", self._nav_arrow_dir_var),
+            ("Bearing", self._nav_arrow_bearing_var),
+            ("Distance m", self._nav_distance_var),
+            ("Graph", self._nav_distance_graph_var),
+        ]
+        for col, (label, var) in enumerate(labels):
+            tk.Label(body, text=label, font=tkfont.Font(family="Segoe UI", size=7),
+                     bg=C["panel"], fg=C["sub"]).grid(row=2, column=col, sticky="w", padx=(0, 4))
+            tk.Entry(
+                body,
+                textvariable=var,
+                width=8,
+                font=tkfont.Font(family="Consolas", size=8),
+                bg=C["bg"],
+                fg=C["text"],
+                insertbackground=C["text"],
+                relief="flat",
+            ).grid(row=3, column=col, sticky="ew", padx=(0, 6), pady=(0, 6))
+            body.columnconfigure(col, weight=1)
+
+        tk.Label(body, text="Street name", font=tkfont.Font(family="Segoe UI", size=7),
+                 bg=C["panel"], fg=C["sub"]).grid(row=4, column=0, columnspan=5, sticky="w")
+        tk.Entry(
+            body,
+            textvariable=self._nav_street_var,
+            font=tkfont.Font(family="Consolas", size=8),
+            bg=C["bg"],
+            fg=C["text"],
+            insertbackground=C["text"],
+            relief="flat",
+        ).grid(row=5, column=0, columnspan=5, sticky="ew", pady=(0, 8))
+
+        tk.Button(
+            body,
+            text="Apply Nav Settings",
+            font=tkfont.Font(family="Segoe UI", size=8),
+            bg=C["btn"],
+            fg=C["text"],
+            activebackground=C["btn_hov"],
+            activeforeground=C["text"],
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            command=self._apply_nav_settings,
+        ).grid(row=6, column=0, columnspan=5, sticky="ew")
         return pnl
 
     def _stalk_bg(self, trio, colour):
@@ -1091,6 +1205,67 @@ class App(tk.Tk):
             self._log("Start Nav: manual route trigger sent")
         else:
             self._log("Start Nav: trigger ignored")
+
+    def _parse_hex_byte(self, raw, label):
+        text = str(raw).strip()
+        if text.lower().startswith("0x"):
+            text = text[2:]
+        value = int(text, 16)
+        if not 0 <= value <= 0xFF:
+            raise ValueError(f"{label} must be between 00 and FF")
+        return value
+
+    def _apply_nav_settings(self):
+        ecu = self._find_infotainment_ecu()
+        if ecu is None:
+            self._log("Apply Nav: infotainment module 5F not attached")
+            return
+        try:
+            distance_m = max(0, int(self._nav_distance_var.get().strip() or "0"))
+            distance_graph = self._parse_hex_byte(self._nav_distance_graph_var.get(), "Graph")
+            arrow_main = self._parse_hex_byte(self._nav_arrow_main_var.get(), "Arrow main")
+            arrow_dir = self._parse_hex_byte(self._nav_arrow_dir_var.get(), "Arrow dir")
+            arrow_bearing = self._parse_hex_byte(self._nav_arrow_bearing_var.get(), "Bearing")
+        except ValueError as exc:
+            self._log(f"Apply Nav: {exc}")
+            return
+
+        street_name = (self._nav_street_var.get() or "").strip() or "Offroad"
+        enabled = bool(self._nav_enabled_var.get())
+        distance_enabled = bool(self._nav_distance_enabled_var.get())
+
+        self._cfg["hud_nav_enabled"] = enabled
+        self._cfg["hud_distance_enabled"] = distance_enabled
+        self._cfg["hud_distance_m"] = distance_m
+        self._cfg["hud_distance_graph"] = distance_graph
+        self._cfg["hud_street_name"] = street_name
+        self._cfg["hud_arrow_main"] = arrow_main
+        self._cfg["hud_arrow_dir"] = arrow_dir
+        self._cfg["hud_arrow_bearing"] = arrow_bearing
+
+        if hasattr(ecu, "configure_nav"):
+            ecu.configure_nav(
+                enabled=enabled,
+                distance_enabled=distance_enabled,
+                distance_m=distance_m,
+                distance_graph=distance_graph,
+                street_name=street_name,
+                arrow_main=arrow_main,
+                arrow_dir=arrow_dir,
+                arrow_bearing=arrow_bearing,
+            )
+            self._log(
+                f"Apply Nav: enabled={'yes' if enabled else 'no'}"
+                f" distance_visible={'yes' if distance_enabled else 'no'}"
+                f" main=0x{arrow_main:02X}"
+                f" dir=0x{arrow_dir:02X}"
+                f" bearing=0x{arrow_bearing:02X}"
+                f" distance={distance_m}m"
+                f" graph=0x{distance_graph:02X}"
+                f" street={street_name}"
+            )
+        else:
+            self._log("Apply Nav: infotainment module does not support live nav updates")
 
     def _mfl(self, key: str):
         self._btns[key].flash()                # always give visual feedback
