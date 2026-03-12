@@ -10,8 +10,7 @@ import queue
 import time
 
 from ecu_base import ECUModule
-from bap import BAP_LSG_HUD_NAV, BAP_OP_HEARTBEAT_STATUS, BAP_OP_STATUS, build_bap_header, decode_bap_header
-from hud_bap_hints import HUD_NAV_FUNCTION_NAMES
+from bap import BAP_LSG_HUD_NAV, BAP_OP_HEARTBEAT_STATUS, BAP_OP_STATUS, build_bap_header, decode_bap_header, function_label
 
 HUD_S = 0x17333210
 HUD_D = 0x17333211
@@ -30,7 +29,8 @@ HB_INTERVAL_S = 10
 NAV_DATA_REFRESH_S = 4.0
 DEFAULT_COMPASS_INFO = [0x02, 0x35, 0x01]
 DEFAULT_CURRENT_POSITION_INFO_OFFROAD = [0x07, 0x4F, 0x66, 0x66, 0x72, 0x6F, 0x61, 0x64]
-DEFAULT_UNKNOWN35_PAYLOAD = [0x00, 0x00, 0x30, 0x00, 0x00, 0x00]
+# FSG_Setup (0x35): VoiceGuidance, POI_Types, FunctionSupport, Dummy2-4 (BAP-FC-NAV-SD p.243)
+DEFAULT_FSG_SETUP_PAYLOAD = [0x00, 0x00, 0x30, 0x00, 0x00, 0x00]
 DEFAULT_FEATURE_ENABLE_MASK = [
     0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00,
@@ -60,10 +60,10 @@ FULLINIT_HANDOFF_BUNDLE = [
 FULLINIT_HANDOFF_OFFSETS = [0.000, 0.010, 0.032, 0.048, 0.066, 0.080, 0.095]
 
 ARROW_PRESETS = {
-    "offroad": {"name": "Offroad", "main": 0x09, "dir": 0x00, "dist_m": 0, "bearing": 0x5F, "offroad": True},
-    "right": {"name": "Turn Right", "main": 0x0D, "dir": 0x40, "dist_m": 500, "bearing": 0x40, "offroad": False},
-    "left": {"name": "Turn Left", "main": 0x0D, "dir": 0xC0, "dist_m": 500, "bearing": 0xC0, "offroad": False},
-    "straight": {"name": "Straight", "main": 0x0B, "dir": 0x00, "dist_m": 500, "bearing": 0x00, "offroad": False},
+    "offroad": {"name": "Offroad", "main": 0x09, "dir": 0x00, "dist_m": 0, "offroad": True},
+    "right": {"name": "Turn Right", "main": 0x0D, "dir": 0x40, "dist_m": 500, "offroad": False},
+    "left": {"name": "Turn Left", "main": 0x0D, "dir": 0xC0, "dist_m": 500, "offroad": False},
+    "straight": {"name": "Straight", "main": 0x0B, "dir": 0x00, "dist_m": 500, "offroad": False},
 }
 
 # Central source of truth for live HUD navigation content.
@@ -74,13 +74,37 @@ NAV_STATE_TEMPLATE = {
     "12_DistanceToNextManeuver_visible": False,
     "12_DistanceToNextManeuver_m": None,
     "13_CurrentPositionInfo": list(DEFAULT_CURRENT_POSITION_INFO_OFFROAD),
-    "14_NavigationSessionState": [0x00, 0x01],
+    # TurnToInfo session: [turn_len, session] (BAP-FC-NAV-SD p.41). Minimal payload for nav session state.
+    # turn_len=0 (no street), session: 0x00=inactive, 0x01=active
+    "14_TurnToInfo_session": [0x00, 0x01],
     "15_DistanceToDestination_m": None,
     "15_DistanceToDestination": list(DISTANCE_TO_DESTINATION_ACTIVE),
-    "17_ManeuverDescriptor": dict(ARROW_PRESETS["straight"]),
-    "21_ArrowBearing": ARROW_PRESETS["straight"]["bearing"],
+    # ManeuverDescriptor (0x17): up to 3 maneuvers, each MainElement+Direction+Z_Level+Sidestreets (BAP-FC-NAV-SD p.53)
+    # Maneuver_1: [main, dir, z_level, sidestreets_len]; M2,M3 empty (0x00) for now
+    "17_ManeuverDescriptor": [
+        0x0B, 0x00, 0x00,
+        0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00],
     "25_FunctionSynchronisation": list(FUNC_SYNC_IDLE),
+    # InfoStates (0x26): 0x00=no error, 0x01=no nav medium, 0x02=db corrupted, 0x03=no GPS,
+    # 0x04=db update ongoing, 0x05=init MOST Map, 0x06=mobile nav active, 0x07=no db, 0xFF=unknown (BAP-FC-NAV-SD p.158)
     "26_InfoStates": 0x00,
+    # MIB3 periodic extras (hardcoded from log)
+    "27_ActiveRgType": [0x04],
+    "31_Exitview": [0x00, 0x00, 0x00],
+    "14_TurnToInfo_street": [0x07, 0x4F, 0x66, 0x66, 0x72, 0x6F, 0x61, 0x64, 0x00],  # "Offroad"
+    "16_TimeToDestination": [0x10, 0x17, 0x13, 0x09, 0x03, 0x1A, 0x3E],
+    "2D_MapScale": [0x00, 0x11, 0xE8, 0x03, 0x01, 0x01],
+    "2F_Altitude": [0x00, 0x00, 0x00],
+    # ManeuverState: [State, Dummy1, Dummy2, Dummy3] (BAP-FC-NAV-SD p.250)
+    # State: 0x00=init/unknown, 0x01=Follow, 0x02=Prepare, 0x03=Distance, 0x04=CallForAction
+    "37_ManeuverState": [0x04, 0x00, 0x00, 0x00],
+    "3C_DistanceToDestinationExtended": [0x86, 0x0B, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01],
+    "2E_DestinationInfo": [
+        0x2F, 0x61, 0xE6, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF,
+        0x07, 0x4F, 0x66, 0x66, 0x72, 0x6F, 0x61, 0x64, 0x00,
+    ],
 }
 
 
@@ -161,11 +185,10 @@ class InfotainmentECU(ECUModule):
             "street_name": self._cfg.get("hud_street_name", "Offroad"),
             "arrow_main": arrow.get("main", 0x00),
             "arrow_dir": arrow.get("dir", 0x00),
-            "arrow_bearing": arrow.get("bearing", 0x00),
         }
 
     def configure_nav(self, *, enabled=None, distance_enabled=None, distance_m=None, street_name=None,
-                      arrow_main=None, arrow_dir=None, arrow_bearing=None,
+                      arrow_main=None, arrow_dir=None,
                       distance_graph=None):
         was_enabled = bool(self._cfg.get("hud_nav_enabled", False))
         if enabled is not None:
@@ -182,8 +205,6 @@ class InfotainmentECU(ECUModule):
             self._cfg["hud_arrow_main"] = int(arrow_main) & 0xFF
         if arrow_dir is not None:
             self._cfg["hud_arrow_dir"] = int(arrow_dir) & 0xFF
-        if arrow_bearing is not None:
-            self._cfg["hud_arrow_bearing"] = int(arrow_bearing) & 0xFF
         self._sync_nav_state()
         nav_enabled = bool(self._cfg.get("hud_nav_enabled", False))
         if self._phase == self.PHASE_READY:
@@ -237,14 +258,11 @@ class InfotainmentECU(ECUModule):
             preset["dist_m"] = max(0, int(self._cfg.get("hud_distance_m", preset["dist_m"])))
         main_override = self._cfg.get("hud_arrow_main")
         dir_override = self._cfg.get("hud_arrow_dir")
-        bearing_override = self._cfg.get("hud_arrow_bearing")
-        custom_arrow = any(value is not None for value in (main_override, dir_override, bearing_override))
+        custom_arrow = any(value is not None for value in (main_override, dir_override))
         if main_override is not None:
             preset["main"] = int(main_override) & 0xFF
         if dir_override is not None:
             preset["dir"] = int(dir_override) & 0xFF
-        if bearing_override is not None:
-            preset["bearing"] = int(bearing_override) & 0xFF
         if custom_arrow:
             preset["offroad"] = preset.get("main", 0x00) == 0x09
             preset["name"] = f"0x{preset['main']:02X}/0x{preset['dir']:02X}"
@@ -268,10 +286,10 @@ class InfotainmentECU(ECUModule):
             state["12_DistanceToNextManeuver_visible"] = not arrow.get("offroad", False)
             state["12_DistanceToNextManeuver_m"] = max(int(arrow.get("dist_m", 0)), 0) if state["12_DistanceToNextManeuver_visible"] and distance_enabled else None
             state["13_CurrentPositionInfo"] = self._encode_text_payload(self._cfg.get("hud_street_name", "Offroad"))
-            state["14_NavigationSessionState"] = [0x00, 0x00]
+            state["14_TurnToInfo_session"] = [0x00, 0x00]
             state["15_DistanceToDestination_m"] = max(int(arrow.get("dist_m", 0)), 0) if state["12_DistanceToNextManeuver_visible"] and distance_enabled else None
-            state["17_ManeuverDescriptor"] = dict(arrow)
-            state["21_ArrowBearing"] = arrow.get("bearing", 0x00)
+            state["17_ManeuverDescriptor"] = [arrow["main"], arrow["dir"], 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+            state["_21_val"] = 0x5F if arrow.get("offroad") else arrow.get("dir", 0x00)
             state["25_FunctionSynchronisation"] = list(FUNC_SYNC_ACTIVE)
             state["26_InfoStates"] = 0xFF
             return
@@ -281,10 +299,10 @@ class InfotainmentECU(ECUModule):
         state["12_DistanceToNextManeuver_visible"] = False
         state["12_DistanceToNextManeuver_m"] = None
         state["13_CurrentPositionInfo"] = self._encode_text_payload(self._cfg.get("hud_street_name", "Offroad"))
-        state["14_NavigationSessionState"] = [0x00, 0x01]
+        state["14_TurnToInfo_session"] = [0x00, 0x01]
         state["15_DistanceToDestination_m"] = None
-        state["17_ManeuverDescriptor"] = dict(arrow)
-        state["21_ArrowBearing"] = arrow.get("bearing", 0x00)
+        state["17_ManeuverDescriptor"] = [arrow["main"], arrow["dir"], 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        state["_21_val"] = 0x5F if arrow.get("offroad") else arrow.get("dir", 0x00)
         state["25_FunctionSynchronisation"] = list(FUNC_SYNC_IDLE)
         state["26_InfoStates"] = 0x00
 
@@ -390,7 +408,7 @@ class InfotainmentECU(ECUModule):
             return
         opcode, lsg, fn, payload = decoded
         self._vlog(f"[HUD_RX] op={opcode} lsg=0x{lsg:02X} fn=0x{fn:02X} payload={bytes(payload).hex().upper()}")
-        known_hud_rx = {0x01, 0x02, 0x03, 0x04, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x21, 0x25, 0x26, 0x32, 0x35, 0x39}
+        known_hud_rx = {0x01, 0x02, 0x03, 0x04, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x21, 0x25, 0x26, 0x27, 0x2D, 0x2E, 0x2F, 0x31, 0x32, 0x35, 0x37, 0x39, 0x3C}
         if fn not in known_hud_rx:
             self._vlog(f"[HUD_RX] ignore unsupported fn=0x{fn:02X} lsg=0x{lsg:02X}")
             return
@@ -549,7 +567,7 @@ class InfotainmentECU(ECUModule):
                 return
 
     def _hud_fn_name(self, fn):
-        return HUD_NAV_FUNCTION_NAMES.get(fn, f"0x{fn:02X}")
+        return function_label(fn)
 
     def _function_list_payload(self):
         return list(A4_MIB3_READY_FUNCTION_LIST)
@@ -569,8 +587,8 @@ class InfotainmentECU(ECUModule):
     def _function_sync_payload(self):
         return list(self._nav_state["25_FunctionSynchronisation"])
 
-    def _unknown35_payload(self):
-        return list(DEFAULT_UNKNOWN35_PAYLOAD)
+    def _fsg_setup_payload(self):
+        return list(DEFAULT_FSG_SETUP_PAYLOAD)
 
     def _feature_enable_payload(self):
         return list(DEFAULT_FEATURE_ENABLE_MASK)
@@ -580,15 +598,13 @@ class InfotainmentECU(ECUModule):
         return [0x04, state, 0x00, 0x00, 0x00, 0x00]
 
     def _send_maneuver_descriptor(self):
-        arrow = self._nav_state["17_ManeuverDescriptor"]
+        payload = list(self._nav_state["17_ManeuverDescriptor"])
         h17 = bap_st(0x17)
-        descriptor = [arrow["main"], arrow["dir"], 0x00, 0x00]
-        self._tx_mf_atomic(HUD_S, [
-            [0xA0, 0x0C] + h17 + descriptor,
-            [0xC0, 0x00, 0x01, 0x3D, 0x01],
-            [0xE0] + [0x00] * 7,
-            [0xE1, 0x00],
-        ])
+        # BAP multi-frame: first frame 8 bytes max; 0x80/0x0C = first frame, 12-byte total; payload split across frames
+        frames = [[0x80, 0x0C] + h17 + payload[:4]]
+        frames.append([0xC0] + payload[4:11])
+        frames.append([0xC1] + payload[11:12])
+        self._tx_mf_atomic(HUD_S, frames)
 
     def _reply_known_hud_nav_function(self, fn, payload, source, opcode=None):
         fn_name = self._hud_fn_name(fn)
@@ -627,7 +643,7 @@ class InfotainmentECU(ECUModule):
             self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x13, self._current_position_info_payload(), atomic=True)
             return True
         if fn == 0x14:
-            self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x14, list(self._nav_state["14_NavigationSessionState"]), atomic=True)
+            self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x14, list(self._nav_state["14_TurnToInfo_session"]), atomic=True)
             return True
         if fn == 0x15:
             self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x15, self._destination_distance_payload(), atomic=True)
@@ -636,8 +652,8 @@ class InfotainmentECU(ECUModule):
             self._send_maneuver_descriptor()
             return True
         if fn == 0x21:
-            bearing = self._nav_state["21_ArrowBearing"]
-            self._tx(HUD_D, [0x90, 0x05] + bap_hb(0x21) + [bearing, 0x02, 0x02, 0x03])
+            val = self._nav_state.get("_21_val", 0x00)
+            self._tx(HUD_D, [0x90, 0x05] + bap_hb(0x21) + [val, 0x02, 0x02, 0x03])
             self._tx(HUD_D, [0xD0, 0x00])
             return True
         if fn == 0x25:
@@ -650,11 +666,35 @@ class InfotainmentECU(ECUModule):
             self._tx_bap(HUD_D, BAP_OP_HEARTBEAT_STATUS, HUD_LSG, 0x32, self._feature_enable_payload(), atomic=True, force_long=True)
             return True
         if fn == 0x35:
-            self._tx_bap(HUD_S, BAP_OP_HEARTBEAT_STATUS, HUD_LSG, 0x35, self._unknown35_payload(), atomic=True)
+            self._tx_bap(HUD_S, BAP_OP_HEARTBEAT_STATUS, HUD_LSG, 0x35, self._fsg_setup_payload(), atomic=True)
             return True
         if fn == 0x39:
             reply_opcode = BAP_OP_HEARTBEAT_STATUS if opcode == BAP_OP_HEARTBEAT_STATUS else BAP_OP_STATUS
             self._tx_bap(HUD_S, reply_opcode, HUD_LSG, 0x39, self._maneuver_state_payload(), atomic=True)
+            return True
+        if fn == 0x27:
+            self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x27, list(self._nav_state["27_ActiveRgType"]))
+            return True
+        if fn == 0x31:
+            self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x31, list(self._nav_state["31_Exitview"]))
+            return True
+        if fn == 0x16:
+            self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x16, list(self._nav_state["16_TimeToDestination"]))
+            return True
+        if fn == 0x2D:
+            self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x2D, list(self._nav_state["2D_MapScale"]))
+            return True
+        if fn == 0x2E:
+            self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x2E, list(self._nav_state["2E_DestinationInfo"]), atomic=True)
+            return True
+        if fn == 0x2F:
+            self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x2F, list(self._nav_state["2F_Altitude"]))
+            return True
+        if fn == 0x37:
+            self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x37, list(self._nav_state["37_ManeuverState"]))
+            return True
+        if fn == 0x3C:
+            self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x3C, list(self._nav_state["3C_DistanceToDestinationExtended"]), atomic=True)
             return True
         self._vlog(f"[BAP] no response mapping for {source} {fn_name}")
         return False
@@ -774,20 +814,28 @@ class InfotainmentECU(ECUModule):
 
     def _send_active_visual_keepalive(self):
         self._sync_nav_state()
-        arrow = self._nav_state["17_ManeuverDescriptor"]
-        bearing = self._nav_state["21_ArrowBearing"]
-        self._vlog(f"[VIS] bearing=0x{bearing:02X}")
+        val = self._nav_state.get("_21_val", 0x00)
         self._tx(HUD_S, bap_hb(0x11) + self._route_guidance_status_payload())
         self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x39, self._maneuver_state_payload(), atomic=True)
-        self._tx(HUD_S, bap_hb(0x35) + self._unknown35_payload())
+        self._tx(HUD_S, bap_hb(0x35) + self._fsg_setup_payload())
         self._tx(HUD_D, bap_hb(0x1D) + [0x00, 0x00, 0xFF])
-        self._tx(HUD_D, [0x90, 0x05] + bap_hb(0x21) + [bearing, 0x02, 0x02, 0x03])
+        self._tx(HUD_D, [0x90, 0x05] + bap_hb(0x21) + [val, 0x02, 0x02, 0x03])
         self._tx(HUD_D, [0xD0, 0x00])
         self._tx_bap(HUD_D, BAP_OP_HEARTBEAT_STATUS, HUD_LSG, 0x32, self._feature_enable_payload(), atomic=True, force_long=True)
+        # MIB3 periodic extras
+        self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x27, list(self._nav_state["27_ActiveRgType"]))
+        self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x31, list(self._nav_state["31_Exitview"]))
+        self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x14, list(self._nav_state["14_TurnToInfo_street"]))
+        self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x16, list(self._nav_state["16_TimeToDestination"]))
+        self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x2E, list(self._nav_state["2E_DestinationInfo"]), atomic=True)
+        self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x2D, list(self._nav_state["2D_MapScale"]))
+        self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x2F, list(self._nav_state["2F_Altitude"]))
+        self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x37, list(self._nav_state["37_ManeuverState"]))
+        self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x3C, list(self._nav_state["3C_DistanceToDestinationExtended"]), atomic=True)
 
     def _send_hud_route_payloads(self):
         self._sync_nav_state()
-        arrow = self._nav_state["17_ManeuverDescriptor"]
+        arrow = self._configured_nav_arrow()
         self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x13, self._current_position_info_payload(), atomic=True, force_long=True)
         self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x12, self._distance_payload(), atomic=True)
         self._send_maneuver_descriptor()

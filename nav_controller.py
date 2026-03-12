@@ -128,7 +128,6 @@ DEFAULT_APP_CONFIG = {
     "hud_arrow": "straight",
     "hud_arrow_main": None,
     "hud_arrow_dir": None,
-    "hud_arrow_bearing": None,
     "hud_distance_m": 500,
     "hud_distance_graph": 0x64,
     "hud_street_name": "Offroad",
@@ -999,7 +998,6 @@ class App(tk.Tk):
             "street_name": self._cfg.get("hud_street_name", "Offroad"),
             "arrow_main": self._cfg.get("hud_arrow_main"),
             "arrow_dir": self._cfg.get("hud_arrow_dir"),
-            "arrow_bearing": self._cfg.get("hud_arrow_bearing"),
         }
         ecu = self._find_infotainment_ecu()
         if ecu is not None and hasattr(ecu, "get_nav_settings"):
@@ -1017,10 +1015,8 @@ class App(tk.Tk):
         self._nav_distance_var = tk.StringVar(value=str(settings["distance_m"]))
         self._nav_distance_graph_var = tk.StringVar(value=f"{int(settings['distance_graph']) & 0xFF:02X}")
         self._nav_street_var = tk.StringVar(value=str(settings["street_name"]))
-        self._nav_arrow_main_var = tk.StringVar(value=f"{int(settings['arrow_main']) & 0xFF:02X}")
-        self._nav_arrow_dir_var = tk.StringVar(value=f"{int(settings['arrow_dir']) & 0xFF:02X}")
-        self._nav_arrow_bearing_var = tk.StringVar(value=f"{int(settings['arrow_bearing']) & 0xFF:02X}")
-
+        self._nav_arrow_main_var = tk.StringVar(value=f"{int(settings.get('arrow_main') or 0) & 0xFF:02X}")
+        self._nav_arrow_dir_var = tk.StringVar(value=f"{int(settings.get('arrow_dir') or 0) & 0xFF:02X}")
         tk.Checkbutton(
             body,
             text="Navigation enabled",
@@ -1032,7 +1028,7 @@ class App(tk.Tk):
             selectcolor=C["panel"],
             highlightthickness=0,
             font=tkfont.Font(family="Segoe UI", size=8),
-        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 2))
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 2))
         tk.Checkbutton(
             body,
             text="Distance visible",
@@ -1044,12 +1040,11 @@ class App(tk.Tk):
             selectcolor=C["panel"],
             highlightthickness=0,
             font=tkfont.Font(family="Segoe UI", size=8),
-        ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(0, 6))
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 6))
 
         labels = [
             ("Arrow main", self._nav_arrow_main_var),
             ("Arrow dir", self._nav_arrow_dir_var),
-            ("Bearing", self._nav_arrow_bearing_var),
             ("Distance m", self._nav_distance_var),
             ("Graph", self._nav_distance_graph_var),
         ]
@@ -1069,7 +1064,7 @@ class App(tk.Tk):
             body.columnconfigure(col, weight=1)
 
         tk.Label(body, text="Street name", font=tkfont.Font(family="Segoe UI", size=7),
-                 bg=C["panel"], fg=C["sub"]).grid(row=4, column=0, columnspan=5, sticky="w")
+                 bg=C["panel"], fg=C["sub"]).grid(row=4, column=0, columnspan=4, sticky="w")
         tk.Entry(
             body,
             textvariable=self._nav_street_var,
@@ -1078,7 +1073,7 @@ class App(tk.Tk):
             fg=C["text"],
             insertbackground=C["text"],
             relief="flat",
-        ).grid(row=5, column=0, columnspan=5, sticky="ew", pady=(0, 8))
+        ).grid(row=5, column=0, columnspan=4, sticky="ew", pady=(0, 8))
 
         tk.Button(
             body,
@@ -1273,7 +1268,6 @@ class App(tk.Tk):
             distance_graph = self._parse_hex_byte(self._nav_distance_graph_var.get(), "Graph")
             arrow_main = self._parse_hex_byte(self._nav_arrow_main_var.get(), "Arrow main")
             arrow_dir = self._parse_hex_byte(self._nav_arrow_dir_var.get(), "Arrow dir")
-            arrow_bearing = self._parse_hex_byte(self._nav_arrow_bearing_var.get(), "Bearing")
         except ValueError as exc:
             self._log(f"Apply Nav: {exc}")
             return
@@ -1289,8 +1283,6 @@ class App(tk.Tk):
         self._cfg["hud_street_name"] = street_name
         self._cfg["hud_arrow_main"] = arrow_main
         self._cfg["hud_arrow_dir"] = arrow_dir
-        self._cfg["hud_arrow_bearing"] = arrow_bearing
-
         if hasattr(ecu, "configure_nav"):
             ecu.configure_nav(
                 enabled=enabled,
@@ -1300,14 +1292,12 @@ class App(tk.Tk):
                 street_name=street_name,
                 arrow_main=arrow_main,
                 arrow_dir=arrow_dir,
-                arrow_bearing=arrow_bearing,
             )
             self._log(
                 f"Apply Nav: enabled={'yes' if enabled else 'no'}"
                 f" distance_visible={'yes' if distance_enabled else 'no'}"
                 f" main=0x{arrow_main:02X}"
                 f" dir=0x{arrow_dir:02X}"
-                f" bearing=0x{arrow_bearing:02X}"
                 f" distance={distance_m}m"
                 f" graph=0x{distance_graph:02X}"
                 f" street={street_name}"
