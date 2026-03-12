@@ -47,7 +47,7 @@ FUNCTION_NAMES = {
     0x03: "FunctionList",
     0x04: "HeartbeatInterval",
     0x0D: "Unknown0D",
-    0x0E: "Unknown0E",
+    0x0E: "FSGSetup",
     0x0F: "FSGOperationState",
     0x10: "CompassInfo",
     0x11: "RouteGuidanceStatus",
@@ -188,9 +188,83 @@ def _asciiish_text(data: list[int]) -> str:
     return _asciiish_text_core(data)
 
 
+# Navigation_SD FunctionList bit positions (bit N = available when set)
+NAV_SD_FUNCTIONLIST_BITS = {
+    1: "GetAll",
+    2: "BAP_Config",
+    3: "FunctionList",
+    4: "HeartBeat",
+    15: "FSG_OperationState",
+    16: "CompassInfo",
+    17: "RG_Status",
+    18: "DistanceToNextManeuver",
+    19: "CurrentPositionInfo",
+    20: "TurnToInfo",
+    21: "DistanceToDestination",
+    22: "TimeToDestination",
+    23: "ManeuverDescriptor",
+    24: "LaneGuidance",
+    25: "TMCinfo",
+    26: "MagnetFieldZone",
+    27: "Calibration",
+    28: "ASG_Capabilities",
+    29: "LastDest_List",
+    30: "FavoriteDest_List",
+    31: "PreferredDest_List",
+    32: "NavBook",
+    33: "Address_List",
+    34: "RG_ActDeact",
+    35: "RepeatLastNavAnnouncement",
+    36: "VoiceGuidance",
+    37: "FunctionSynchronisation",
+    38: "InfoStates",
+    39: "ActiveRgType",
+    40: "TrafficBlock_Indication",
+    41: "GetNextListPos",
+    42: "NbSpeller",
+    43: "MapColorAndType",
+    44: "MapViewAndOrientation",
+    45: "MapScale",
+    46: "DestinationInfo",
+    47: "Altitude",
+    48: "OnlineNavigationState",
+    49: "Exitview",
+    50: "SemidynamicRouteGuidance",
+    51: "POI_Search",
+    52: "POI_List",
+    53: "FSG_Setup",
+    54: "Map_Presentation",
+    55: "ManeuverState",
+    56: "ETC_Status",
+    57: "MapContentSettings",
+    58: "VideoStreams",
+    59: "RequestSync_Video",
+    60: "DistanceToDestinationExtended",
+    61: "LaneGuidance2",
+    62: "Picture",
+}
+
+
+def _decode_nav_sd_functionlist(payload: list[int]) -> str:
+    """Decode Navigation_SD FunctionList bitmask; return available functions (single line for Treeview)."""
+    if len(payload) < 8:
+        return _hex(payload)
+    available = []
+    for bit, name in sorted(NAV_SD_FUNCTIONLIST_BITS.items()):
+        byte_idx = bit // 8
+        bit_idx = bit % 8
+        if (payload[byte_idx] >> bit_idx) & 1:
+            available.append(name)
+    if not available:
+        return "FunctionList=(none)"
+    return "FunctionList=\n" + "\n".join(available)
+
+
 def describe_bap_message(can_id: int, opcode: int, lsg_id: int, fct_id: int, payload: list[int]) -> str:
     ascii_text = _asciiish_text(payload)
     if fct_id == 0x03 and payload:
+        if lsg_id == BAP_LSG_HUD_NAV:
+            return _decode_nav_sd_functionlist(payload)
         return f"FunctionList={_hex(payload)}"
     if fct_id == 0x04 and payload:
         return f"heartbeat interval={payload[0]}s"

@@ -122,6 +122,13 @@ ECU modules in `modules/` are loaded automatically. Each module subclasses `ECUM
 
 To add a new ECU, create a `.py` file in `modules/` that subclasses `ECUModule`.
 
+## Related Repos
+
+- [`MIGINC/BAP_RE`](https://github.com/MIGINC/BAP_RE) — reverse-engineering notes and traces for the BAP protocol. Useful as a protocol reference for:
+  - BAP glossary and roles like `FSG`, `ASG`, and `LSG`
+  - startup flow around `BAP_Config (0x02)` and `FunctionList (0x03)`
+  - `FSGOperationState (0x0F)` meanings such as `0x00 = Normal Operation`, `0x01 = Off/Standby`, `0x03 = Initializing`, `0x0E = Function Inactive`
+
 ## License
 
 See repository for license information.

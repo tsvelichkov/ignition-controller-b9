@@ -64,6 +64,12 @@ from datetime import datetime
 
 from bap import HudBapSession, load_hud_bap_messages
 
+try:
+    from tksheet import Sheet
+    TKSHEET_AVAILABLE = True
+except ImportError:
+    TKSHEET_AVAILABLE = False
+
 # ── IGN CRC LUTs (0x3C0 Klemmen_Status_01) ───────────────────────────────────
 # b2=0x23: Kl_S=1, Kl_15=1, Kl_Infotainment=1  (ignition ON)
 IGN_CRC = [0x9B,0x2E,0xDE,0x6B,0x11,0xA4,0x54,0xE1,
@@ -117,7 +123,7 @@ DEFAULT_APP_CONFIG = {
     "start_ignition": False,
     "verbose_bap": False,
     "hud_mode": "full",
-    "hud_nav_enabled": True,
+    "hud_nav_enabled": False,
     "hud_distance_enabled": True,
     "hud_arrow": "straight",
     "hud_arrow_main": None,
@@ -609,8 +615,23 @@ def _panel(parent, title):
     return o
 
 
+def _message_to_row(message) -> list:
+    return [
+        message.direction.upper(),
+        message.timestamp,
+        message.can_id_label,
+        message.opcode_text,
+        message.lsg_text,
+        message.fct_text,
+        message.data_text,
+        message.text,
+    ]
+
+
 class BapTableWindow(tk.Toplevel):
     COLS = ("direction", "timestamp", "canid", "opcode", "lsgid", "fctid", "data", "text")
+    HEADERS = ["Direction", "Timestamp", "CAN ID", "Opcode", "LSG ID", "Function", "Data", "Text"]
+    WIDTHS = [70, 110, 120, 140, 150, 220, 320, 360]
 
     def __init__(self, parent, title):
         super().__init__(parent)
@@ -618,6 +639,8 @@ class BapTableWindow(tk.Toplevel):
         self.configure(bg=C["bg"])
         self.geometry("1320x620")
         self.minsize(960, 360)
+        self._messages = []
+        self._use_sheet = TKSHEET_AVAILABLE
 
         top = tk.Frame(self, bg=C["panel"])
         top.pack(fill="x", padx=8, pady=(8, 4))
@@ -649,116 +672,141 @@ class BapTableWindow(tk.Toplevel):
         body.rowconfigure(0, weight=1)
         body.columnconfigure(0, weight=1)
 
-        self._tree = ttk.Treeview(body, columns=self.COLS, show="headings")
-        self._tree.grid(row=0, column=0, sticky="nsew")
-        self._tree.tag_configure("hud_source", background="#4a2f0b", foreground=C["text"])
-        self._tree.bind("<Control-c>", lambda _event: self.copy_selected_rows())
-        self._tree.bind("<Control-C>", lambda _event: self.copy_selected_rows())
-        self.bind("<Control-c>", lambda _event: self.copy_selected_rows())
-        self.bind("<Control-C>", lambda _event: self.copy_selected_rows())
-        ysb = ttk.Scrollbar(body, orient="vertical", command=self._tree.yview)
-        xsb = ttk.Scrollbar(body, orient="horizontal", command=self._tree.xview)
-        ysb.grid(row=0, column=1, sticky="ns")
-        xsb.grid(row=1, column=0, sticky="ew")
-        self._tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-
-        widths = {
-            "direction": 70,
-            "timestamp": 110,
-            "canid": 120,
-            "opcode": 140,
-            "lsgid": 150,
-            "fctid": 220,
-            "data": 320,
-            "text": 360,
-        }
-        anchors = {
-            "direction": "center",
-            "timestamp": "center",
-            "canid": "w",
-            "opcode": "w",
-            "lsgid": "w",
-            "fctid": "w",
-            "data": "w",
-            "text": "w",
-        }
-        headers = {
-            "direction": "Direction",
-            "timestamp": "Timestamp",
-            "canid": "CAN ID",
-            "opcode": "Opcode",
-            "lsgid": "LSG ID",
-            "fctid": "Function",
-            "data": "Data",
-            "text": "Text",
-        }
-        for col in self.COLS:
-            self._tree.heading(col, text=headers[col])
-            self._tree.column(col, width=widths[col], stretch=True, anchor=anchors[col])
+        if self._use_sheet:
+            self._sheet = Sheet(
+                body,
+                headers=self.HEADERS,
+                data=[],
+                show_row_index=True,
+                height=520,
+                theme="dark",
+                table_wrap="w",
+                max_column_width=400,
+            )
+            self._sheet.enable_bindings(
+                "single_select", "drag_select", "select_all",
+                "copy", "arrowkeys", "row_select",
+            )
+            self._sheet.disable_bindings("edit_cell", "edit_header", "edit_index")
+            self._sheet.grid(row=0, column=0, sticky="nsew")
+            self.bind("<Control-c>", lambda _e: self.copy_selected_rows())
+            self.bind("<Control-C>", lambda _e: self.copy_selected_rows())
+            self._tree = None
+        else:
+            style = ttk.Style()
+            style.configure("HudBap.Treeview", rowheight=72)
+            self._tree = ttk.Treeview(body, columns=self.COLS, show="headings", style="HudBap.Treeview")
+            self._tree.grid(row=0, column=0, sticky="nsew")
+            self._tree.tag_configure("hud_source", background="#4a2f0b", foreground=C["text"])
+            self._tree.bind("<Control-c>", lambda _e: self.copy_selected_rows())
+            self._tree.bind("<Control-C>", lambda _e: self.copy_selected_rows())
+            self.bind("<Control-c>", lambda _e: self.copy_selected_rows())
+            self.bind("<Control-C>", lambda _e: self.copy_selected_rows())
+            ysb = ttk.Scrollbar(body, orient="vertical", command=self._tree.yview)
+            xsb = ttk.Scrollbar(body, orient="horizontal", command=self._tree.xview)
+            ysb.grid(row=0, column=1, sticky="ns")
+            xsb.grid(row=1, column=0, sticky="ew")
+            self._tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+            for col, width in zip(self.COLS, self.WIDTHS):
+                self._tree.heading(col, text=dict(zip(self.COLS, self.HEADERS))[col])
+                self._tree.column(col, width=width, stretch=True)
+            self._sheet = None
 
     def set_status(self, text: str):
         self._status.configure(text=text)
 
     def clear(self):
-        for item in self._tree.get_children():
-            self._tree.delete(item)
+        self._messages = []
+        if self._use_sheet:
+            self._sheet.set_sheet_data([], reset_col_positions=False)
+        else:
+            for item in self._tree.get_children():
+                self._tree.delete(item)
 
     def load_messages(self, messages):
         self.clear()
-        for message in messages:
-            self.append_message(message)
+        self._messages = list(messages)
+        if self._use_sheet:
+            self._refresh_sheet()
+        else:
+            for message in messages:
+                self._tree.insert(
+                    "",
+                    "end",
+                    values=_message_to_row(message),
+                    tags=("hud_source",) if message.can_id in HUD_SOURCE_IDS else (),
+                )
         self.set_status(f"{len(messages)} decoded messages")
 
+    def _refresh_sheet(self):
+        if not self._use_sheet:
+            return
+        self._sheet.set_sheet_data([_message_to_row(m) for m in self._messages])
+        self._sheet.set_all_cell_sizes_to_text()
+        for r, m in enumerate(self._messages):
+            if m.can_id in HUD_SOURCE_IDS:
+                for c in range(len(self.HEADERS)):
+                    self._sheet[(r, c)].bg = "#4a2f0b"
+        self._sheet.refresh()
+
     def append_message(self, message):
-        self._tree.insert(
-            "",
-            "end",
-            values=(
-                message.direction.upper(),
-                message.timestamp,
-                message.can_id_label,
-                message.opcode_text,
-                message.lsg_text,
-                message.fct_text,
-                message.data_text,
-                message.text,
-            ),
-            tags=("hud_source",) if message.can_id in HUD_SOURCE_IDS else (),
-        )
-        self._tree.yview_moveto(1.0)
+        self._messages.append(message)
+        row = _message_to_row(message)
+        if self._use_sheet:
+            self._refresh_sheet()
+        else:
+            self._tree.insert(
+                "",
+                "end",
+                values=row,
+                tags=("hud_source",) if message.can_id in HUD_SOURCE_IDS else (),
+            )
+        if not self._use_sheet:
+            self._tree.yview_moveto(1.0)
 
     def append_messages(self, messages):
         if not messages:
             return
-        for message in messages:
-            self._tree.insert(
-                "",
-                "end",
-                values=(
-                    message.direction.upper(),
-                    message.timestamp,
-                    message.can_id_label,
-                    message.opcode_text,
-                    message.lsg_text,
-                    message.fct_text,
-                    message.data_text,
-                    message.text,
-                ),
-                tags=("hud_source",) if message.can_id in HUD_SOURCE_IDS else (),
-            )
-        self._tree.yview_moveto(1.0)
+        self._messages.extend(messages)
+        if self._use_sheet:
+            self._refresh_sheet()
+        else:
+            for message in messages:
+                self._tree.insert(
+                    "",
+                    "end",
+                    values=_message_to_row(message),
+                    tags=("hud_source",) if message.can_id in HUD_SOURCE_IDS else (),
+                )
+            self._tree.yview_moveto(1.0)
 
     def copy_selected_rows(self):
-        items = self._tree.selection()
-        if not items:
-            self.set_status("No rows selected")
-            return
-        lines = []
-        for item in items:
-            values = self._tree.item(item, "values")
-            lines.append("\t".join(str(value) for value in values))
-        self.clipboard_clear()
-        self.clipboard_append("\n".join(lines))
+        if self._use_sheet:
+            boxes = self._sheet.get_all_selection_boxes()
+            if not boxes:
+                self.set_status("No rows selected")
+                return
+            lines = []
+            for (r1, c1, r2, c2) in boxes:
+                data = self._sheet[(r1, c1):(r2, c2)].data
+                for row in data:
+                    lines.append("\t".join(str(v) for v in row))
+            if not lines:
+                self.set_status("No rows selected")
+                return
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(lines))
+        else:
+            items = self._tree.selection()
+            if not items:
+                self.set_status("No rows selected")
+                return
+            lines = []
+            for item in items:
+                values = self._tree.item(item, "values")
+                lines.append("\t".join(str(v) for v in values))
+            self.clipboard_clear()
+            self.clipboard_append("\n".join(lines))
         noun = "row" if len(lines) == 1 else "rows"
         self.set_status(f"Copied {len(lines)} {noun} to clipboard")
 
@@ -944,7 +992,7 @@ class App(tk.Tk):
 
     def _nav_settings(self):
         settings = {
-            "enabled": bool(self._cfg.get("hud_nav_enabled", True)),
+            "enabled": bool(self._cfg.get("hud_nav_enabled", False)),
             "distance_enabled": bool(self._cfg.get("hud_distance_enabled", True)),
             "distance_m": max(0, int(self._cfg.get("hud_distance_m", 500))),
             "distance_graph": int(self._cfg.get("hud_distance_graph", 0x64)) & 0xFF,

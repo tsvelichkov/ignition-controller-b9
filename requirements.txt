@@ -1,2 +1,3 @@
 python-can>=4.0.0
 python-can-csscan-serial   # CSS Electronics USB adapter (default interface)
+tksheet>=7.0.0             # Table widget with dynamic row height for BAP viewer
