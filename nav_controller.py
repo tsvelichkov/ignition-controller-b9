@@ -130,7 +130,11 @@ DEFAULT_APP_CONFIG = {
     "hud_arrow_dir": None,
     "hud_distance_m": 500,
     "hud_distance_graph": 0x64,
+    "hud_distance_unit": "m",
     "hud_street_name": "Offroad",
+    "hud_lane_guidance_enabled": False,
+    "hud_lane_num_lanes": 3,
+    "hud_lane_recommended": 2,
     "auto_open_hud": False,
 }
 
@@ -884,11 +888,23 @@ class App(tk.Tk):
 
         left = tk.Frame(self, bg=C["bg"])
         left.grid(row=2,column=0,sticky="nsew",padx=(10,5),pady=10)
-        left.columnconfigure(0, weight=1)
-        self._build_ign(left)
-        self._build_controls(left)
-        self._build_hud_bap(left)
-        self._build_log(left)
+        left.columnconfigure(0, weight=1, uniform="left")
+        left.columnconfigure(1, weight=1, uniform="left")
+        left.columnconfigure(2, weight=1, uniform="left")
+        left.rowconfigure(0, weight=0)
+        left.rowconfigure(1, weight=0)
+        left.rowconfigure(2, weight=1)
+        left.rowconfigure(3, weight=0)
+        ign = self._build_ign(left)
+        ign.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, 3), pady=(0, 3))
+        mfl = self._build_mfl(left)
+        mfl.grid(row=1, column=0, sticky="nsew", padx=(0, 3), pady=3)
+        stalk = self._build_stalk(left)
+        stalk.grid(row=1, column=1, sticky="nsew", padx=3, pady=3)
+        nav = self._build_nav_controls(left)
+        nav.grid(row=0, column=2, rowspan=2, sticky="nsew", padx=(3, 0), pady=(0, 6))
+        self._build_hud_bap(left).grid(row=2, column=0, columnspan=3, sticky="nsew", pady=(0, 6))
+        self._build_log(left).grid(row=3, column=0, columnspan=3, sticky="nsew")
 
         tk.Frame(self, bg=C["border"], width=1).grid(row=2,column=1,sticky="ns")
 
@@ -914,7 +930,7 @@ class App(tk.Tk):
         self._build_ecu_cards()
 
     def _build_ign(self, parent):
-        pnl = _panel(parent, "IGNITION"); pnl.pack(fill="x", pady=(0,6))
+        pnl = _panel(parent, "IGNITION")
         self._ign_btn = tk.Button(pnl, text="OFF",
             font=tkfont.Font(family="Segoe UI",size=14,weight="bold"),
             width=9, bg=C["btn"], fg=C["off"], activebackground=C["btn_hov"],
@@ -937,6 +953,7 @@ class App(tk.Tk):
                      bg=C["panel"], fg=C["border"]).pack(side="right")
             self._inds[name] = d
         tk.Frame(pnl, bg=C["panel"], height=6).pack()
+        return pnl
 
     def _build_controls(self, parent):
         row = tk.Frame(parent, bg=C["bg"])
@@ -995,14 +1012,109 @@ class App(tk.Tk):
             "distance_enabled": bool(self._cfg.get("hud_distance_enabled", True)),
             "distance_m": max(0, int(self._cfg.get("hud_distance_m", 500))),
             "distance_graph": int(self._cfg.get("hud_distance_graph", 0x64)) & 0xFF,
+            "distance_unit": self._cfg.get("hud_distance_unit", "m"),
             "street_name": self._cfg.get("hud_street_name", "Offroad"),
             "arrow_main": self._cfg.get("hud_arrow_main"),
             "arrow_dir": self._cfg.get("hud_arrow_dir"),
+            "lane_guidance_enabled": bool(self._cfg.get("hud_lane_guidance_enabled", False)),
+            "lane_num_lanes": max(2, min(8, int(self._cfg.get("hud_lane_num_lanes", 3)))),
+            "lane_recommended": max(0, min(7, int(self._cfg.get("hud_lane_recommended", 2)))),
         }
         ecu = self._find_infotainment_ecu()
         if ecu is not None and hasattr(ecu, "get_nav_settings"):
             settings.update(ecu.get_nav_settings())
         return settings
+
+    def _current_lanes_from_vars(self):
+        """Build list of lane dicts from current _nav_lane_vars (for passing to _rebuild_lane_rows)."""
+        lanes = []
+        for v in self._nav_lane_vars:
+            try:
+                direction = int(v["direction"].get().strip() or "0", 16) & 0xFF
+                lane_type = int(v["lane_type"].get().strip() or "1", 16) & 0xFF
+                mark_l = int(v["mark_l"].get().strip() or "0") & 0x0F
+                mark_r = int(v["mark_r"].get().strip() or "0") & 0x0F
+                lane_desc = int(v["lane_desc"].get().strip() or "0", 16) & 0x0F
+                guidance = 0x02 if v["preferred"].get() else 0x00
+            except ValueError:
+                direction, lane_type, mark_l, mark_r, lane_desc, guidance = 0, 1, 0, 0, 0, 0
+            lanes.append({
+                "direction": direction, "sidestreets_len": 0, "lane_type": lane_type,
+                "marking_left": mark_l, "marking_right": mark_r,
+                "lane_description": lane_desc, "guidance": guidance,
+            })
+        return lanes
+
+    def _rebuild_lane_rows(self, initial_lanes=None):
+        """Rebuild lane rows in _nav_lane_rows_frame from _nav_lane_num_var; optionally seed from initial_lanes."""
+        for w in self._nav_lane_rows_frame.winfo_children():
+            w.destroy()
+        self._nav_lane_vars.clear()
+        try:
+            n = max(2, min(8, int(self._nav_lane_num_var.get().strip() or "3")))
+        except ValueError:
+            n = 3
+        self._nav_lane_num_var.set(str(n))
+        small = tkfont.Font(family="Segoe UI", size=7)
+        entry_font = tkfont.Font(family="Consolas", size=8)
+        # Header
+        tk.Label(self._nav_lane_rows_frame, text="Preferred", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=0, padx=(0, 4), pady=(0, 2))
+        tk.Label(self._nav_lane_rows_frame, text="Dir", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=1, padx=(0, 4))
+        tk.Label(self._nav_lane_rows_frame, text="Type", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=2, padx=(0, 4))
+        tk.Label(self._nav_lane_rows_frame, text="ML", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=3, padx=(0, 4))
+        tk.Label(self._nav_lane_rows_frame, text="MR", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=4, padx=(0, 4))
+        tk.Label(self._nav_lane_rows_frame, text="Desc", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=5, padx=(0, 4))
+        preferred_set = False
+        if initial_lanes:
+            for L in initial_lanes:
+                if int(L.get("guidance", 0)) == 0x02:
+                    preferred_set = True
+                    break
+        for i in range(n):
+            if initial_lanes and i < len(initial_lanes):
+                L = initial_lanes[i]
+                direction = f"{int(L.get('direction', 0)) & 0xFF:02X}"
+                lane_type = f"{int(L.get('lane_type', 1)) & 0xFF:02X}"
+                mark_l = str(int(L.get("marking_left", 0)) & 0x0F)
+                mark_r = str(int(L.get("marking_right", 0)) & 0x0F)
+                lane_desc = f"{int(L.get('lane_description', 0)) & 0x0F:X}"
+                preferred = int(L.get("guidance", 0)) == 0x02
+                if preferred:
+                    preferred_set = True
+            else:
+                direction = "00"
+                lane_type = "01"
+                mark_l = "0"
+                mark_r = "0"
+                lane_desc = "0"
+                preferred = not preferred_set and (i == n - 1 or i == n // 2)
+                if preferred:
+                    preferred_set = True
+            var_pref = tk.BooleanVar(value=preferred)
+            var_dir = tk.StringVar(value=direction)
+            var_type = tk.StringVar(value=lane_type)
+            var_ml = tk.StringVar(value=mark_l)
+            var_mr = tk.StringVar(value=mark_r)
+            var_desc = tk.StringVar(value=lane_desc)
+            row = i + 1
+            tk.Checkbutton(
+                self._nav_lane_rows_frame, variable=var_pref,
+                bg=C["panel"], fg=C["text"], activebackground=C["panel"], activeforeground=C["text"],
+                selectcolor=C["panel"], highlightthickness=0, font=small,
+            ).grid(row=row, column=0, padx=(0, 4), pady=1)
+            def _entry(parent, var, w=2):
+                return tk.Entry(parent, textvariable=var, width=w, font=entry_font, bg=C["bg"], fg=C["text"], insertbackground=C["text"], relief="flat")
+            _entry(self._nav_lane_rows_frame, var_dir, 2).grid(row=row, column=1, padx=(0, 4), pady=1)
+            _entry(self._nav_lane_rows_frame, var_type, 2).grid(row=row, column=2, padx=(0, 4), pady=1)
+            _entry(self._nav_lane_rows_frame, var_ml, 1).grid(row=row, column=3, padx=(0, 4), pady=1)
+            _entry(self._nav_lane_rows_frame, var_mr, 1).grid(row=row, column=4, padx=(0, 4), pady=1)
+            _entry(self._nav_lane_rows_frame, var_desc, 1).grid(row=row, column=5, padx=(0, 4), pady=1)
+            self._nav_lane_vars.append({
+                "direction": var_dir, "lane_type": var_type, "mark_l": var_ml, "mark_r": var_mr,
+                "lane_desc": var_desc, "preferred": var_pref,
+            })
+        if not preferred_set and self._nav_lane_vars:
+            self._nav_lane_vars[0]["preferred"].set(True)
 
     def _build_nav_controls(self, parent):
         pnl = _panel(parent, "NAV HUD  (5F)")
@@ -1012,11 +1124,15 @@ class App(tk.Tk):
 
         self._nav_enabled_var = tk.BooleanVar(value=bool(settings["enabled"]))
         self._nav_distance_enabled_var = tk.BooleanVar(value=bool(settings["distance_enabled"]))
+        self._nav_lane_guidance_var = tk.BooleanVar(value=bool(settings["lane_guidance_enabled"]))
         self._nav_distance_var = tk.StringVar(value=str(settings["distance_m"]))
-        self._nav_distance_graph_var = tk.StringVar(value=f"{int(settings['distance_graph']) & 0xFF:02X}")
+        self._nav_distance_graph_var = tk.IntVar(value=min(100, max(0, int(settings['distance_graph']) & 0xFF)))
+        self._nav_distance_unit_var = tk.StringVar(value=str(settings.get("distance_unit", "m")))
         self._nav_street_var = tk.StringVar(value=str(settings["street_name"]))
         self._nav_arrow_main_var = tk.StringVar(value=f"{int(settings.get('arrow_main') or 0) & 0xFF:02X}")
         self._nav_arrow_dir_var = tk.StringVar(value=f"{int(settings.get('arrow_dir') or 0) & 0xFF:02X}")
+        self._nav_lane_num_var = tk.StringVar(value=str(settings["lane_num_lanes"]))
+        self._nav_lane_vars = []  # list of {direction, lane_type, mark_l, mark_r, lane_desc, preferred} per lane
         tk.Checkbutton(
             body,
             text="Navigation enabled",
@@ -1040,31 +1156,106 @@ class App(tk.Tk):
             selectcolor=C["panel"],
             highlightthickness=0,
             font=tkfont.Font(family="Segoe UI", size=8),
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        tk.Checkbutton(
+            body,
+            text="Lane guidance",
+            variable=self._nav_lane_guidance_var,
+            bg=C["panel"],
+            fg=C["text"],
+            activebackground=C["panel"],
+            activeforeground=C["text"],
+            selectcolor=C["panel"],
+            highlightthickness=0,
+            font=tkfont.Font(family="Segoe UI", size=8),
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        lane_top = tk.Frame(body, bg=C["panel"])
+        lane_top.grid(row=3, column=0, columnspan=5, sticky="w", pady=(0, 4))
+        tk.Label(lane_top, text="Lanes:", font=tkfont.Font(family="Segoe UI", size=7),
+                 bg=C["panel"], fg=C["sub"]).pack(side="left", padx=(0, 4))
+        lane_num_label = tk.Label(lane_top, textvariable=self._nav_lane_num_var, width=2,
+                 font=tkfont.Font(family="Consolas", size=9), bg=C["panel"], fg=C["text"])
+        lane_num_label.pack(side="left", padx=(0, 4))
+        def _lane_minus():
+            try:
+                n = max(2, min(8, int(self._nav_lane_num_var.get().strip() or "3")))
+            except ValueError:
+                n = 3
+            if n <= 2:
+                return
+            self._nav_lane_num_var.set(str(n - 1))
+            initial = self._current_lanes_from_vars()[: n - 1]
+            self._rebuild_lane_rows(initial_lanes=initial)
+        def _lane_plus():
+            try:
+                n = max(2, min(8, int(self._nav_lane_num_var.get().strip() or "3")))
+            except ValueError:
+                n = 3
+            if n >= 8:
+                return
+            self._nav_lane_num_var.set(str(n + 1))
+            initial = self._current_lanes_from_vars()
+            initial.append({"direction": 0, "sidestreets_len": 0, "lane_type": 1, "marking_left": 0, "marking_right": 0, "lane_description": 0, "guidance": 0})
+            self._rebuild_lane_rows(initial_lanes=initial)
+        btn_style = dict(font=tkfont.Font(family="Segoe UI", size=9), width=2, relief="flat", bd=0, cursor="hand2",
+                        bg=C["btn"], fg=C["text"], activebackground=C["btn_hov"], activeforeground=C["text"])
+        tk.Button(lane_top, text="−", command=_lane_minus, **btn_style).pack(side="left", padx=(0, 2))
+        tk.Button(lane_top, text="+", command=_lane_plus, **btn_style).pack(side="left", padx=(0, 8))
+        self._nav_lane_rows_frame = tk.Frame(body, bg=C["panel"])
+        self._nav_lane_rows_frame.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(0, 6))
+        body.columnconfigure(0, weight=1)
+        initial_lanes = settings.get("lanes")
+        if not initial_lanes:
+            n = max(2, min(8, int(settings.get("lane_num_lanes", 3))))
+            rec = max(0, min(n - 1, int(settings.get("lane_recommended", 0))))
+            initial_lanes = [
+                {"direction": 0, "sidestreets_len": 0, "lane_type": 1, "marking_left": 0, "marking_right": 0, "lane_description": 0, "guidance": 0x02 if i == rec else 0}
+                for i in range(n)
+            ]
+        self._rebuild_lane_rows(initial_lanes=initial_lanes)
 
         labels = [
             ("Arrow main", self._nav_arrow_main_var),
             ("Arrow dir", self._nav_arrow_dir_var),
-            ("Distance m", self._nav_distance_var),
-            ("Graph", self._nav_distance_graph_var),
+            ("Distance", self._nav_distance_var),
+            ("Unit", self._nav_distance_unit_var),
         ]
         for col, (label, var) in enumerate(labels):
             tk.Label(body, text=label, font=tkfont.Font(family="Segoe UI", size=7),
-                     bg=C["panel"], fg=C["sub"]).grid(row=2, column=col, sticky="w", padx=(0, 4))
+                     bg=C["panel"], fg=C["sub"]).grid(row=5, column=col, sticky="w", padx=(0, 4))
             tk.Entry(
                 body,
                 textvariable=var,
-                width=8,
+                width=6 if label == "Unit" else 8,
                 font=tkfont.Font(family="Consolas", size=8),
                 bg=C["bg"],
                 fg=C["text"],
                 insertbackground=C["text"],
                 relief="flat",
-            ).grid(row=3, column=col, sticky="ew", padx=(0, 6), pady=(0, 6))
+            ).grid(row=6, column=col, sticky="ew", padx=(0, 6), pady=(0, 6))
             body.columnconfigure(col, weight=1)
+        tk.Label(body, text="Graph %", font=tkfont.Font(family="Segoe UI", size=7),
+                 bg=C["panel"], fg=C["sub"]).grid(row=5, column=4, sticky="w", padx=(0, 4))
+        graph_scale = tk.Scale(
+            body,
+            from_=0,
+            to=100,
+            variable=self._nav_distance_graph_var,
+            orient="horizontal",
+            length=120,
+            showvalue=True,
+            bg=C["panel"],
+            fg=C["text"],
+            troughcolor=C["bg"],
+            activebackground=C["panel"],
+            highlightthickness=0,
+            font=tkfont.Font(family="Segoe UI", size=7),
+        )
+        graph_scale.grid(row=6, column=4, sticky="ew", padx=(0, 6), pady=(0, 6))
+        body.columnconfigure(4, weight=1)
 
         tk.Label(body, text="Street name", font=tkfont.Font(family="Segoe UI", size=7),
-                 bg=C["panel"], fg=C["sub"]).grid(row=4, column=0, columnspan=4, sticky="w")
+                 bg=C["panel"], fg=C["sub"]).grid(row=7, column=0, columnspan=5, sticky="w")
         tk.Entry(
             body,
             textvariable=self._nav_street_var,
@@ -1073,7 +1264,7 @@ class App(tk.Tk):
             fg=C["text"],
             insertbackground=C["text"],
             relief="flat",
-        ).grid(row=5, column=0, columnspan=4, sticky="ew", pady=(0, 8))
+        ).grid(row=8, column=0, columnspan=5, sticky="ew", pady=(0, 8))
 
         tk.Button(
             body,
@@ -1087,7 +1278,7 @@ class App(tk.Tk):
             bd=0,
             cursor="hand2",
             command=self._apply_nav_settings,
-        ).grid(row=6, column=0, columnspan=5, sticky="ew")
+        ).grid(row=9, column=0, columnspan=5, sticky="ew")
         return pnl
 
     def _stalk_bg(self, trio, colour):
@@ -1135,7 +1326,7 @@ class App(tk.Tk):
                 self._stalk_bg(trio, C["btn"])
 
     def _build_log(self, parent):
-        pnl = _panel(parent, "LOG"); pnl.pack(fill="both", expand=True)
+        pnl = _panel(parent, "LOG")
         hdr = tk.Frame(pnl, bg=C["panel"]); hdr.pack(fill="x", padx=6, pady=(2,0))
         tk.Button(
             hdr,
@@ -1154,9 +1345,10 @@ class App(tk.Tk):
             font=tkfont.Font(family="Consolas",size=8),
             relief="flat", bd=0, state="disabled", wrap="none", height=20)
         self._log_w.pack(fill="both", expand=True, padx=2, pady=2)
+        return pnl
 
     def _build_hud_bap(self, parent):
-        pnl = _panel(parent, "HUD BAP"); pnl.pack(fill="x", pady=(0,6))
+        pnl = _panel(parent, "HUD BAP")
         row = tk.Frame(pnl, bg=C["panel"]); row.pack(fill="x", padx=8, pady=(4, 4))
         tk.Button(
             row,
@@ -1208,6 +1400,7 @@ class App(tk.Tk):
             wraplength=260,
         )
         self._hud_log_lbl.pack(fill="x", padx=10, pady=(0, 8))
+        return pnl
 
     def _build_ecu_cards(self):
         for ecu in self._mgr.get_ecus():
@@ -1265,7 +1458,10 @@ class App(tk.Tk):
             return
         try:
             distance_m = max(0, int(self._nav_distance_var.get().strip() or "0"))
-            distance_graph = self._parse_hex_byte(self._nav_distance_graph_var.get(), "Graph")
+            distance_graph = max(0, min(0x64, int(self._nav_distance_graph_var.get())))
+            distance_unit = (self._nav_distance_unit_var.get() or "m").strip().lower() or "m"
+            if distance_unit not in ("m", "km"):
+                distance_unit = "m"
             arrow_main = self._parse_hex_byte(self._nav_arrow_main_var.get(), "Arrow main")
             arrow_dir = self._parse_hex_byte(self._nav_arrow_dir_var.get(), "Arrow dir")
         except ValueError as exc:
@@ -1275,27 +1471,61 @@ class App(tk.Tk):
         street_name = (self._nav_street_var.get() or "").strip() or "Offroad"
         enabled = bool(self._nav_enabled_var.get())
         distance_enabled = bool(self._nav_distance_enabled_var.get())
+        lane_guidance_enabled = bool(self._nav_lane_guidance_var.get())
+
+        lanes = []
+        preferred_index = None
+        for i, v in enumerate(self._nav_lane_vars):
+            try:
+                direction = int(v["direction"].get().strip() or "0", 16) & 0xFF
+                lane_type = int(v["lane_type"].get().strip() or "1", 16) & 0xFF
+                mark_l = int(v["mark_l"].get().strip() or "0") & 0x0F
+                mark_r = int(v["mark_r"].get().strip() or "0") & 0x0F
+                lane_desc = int(v["lane_desc"].get().strip() or "0", 16) & 0x0F
+                preferred = bool(v["preferred"].get())
+            except ValueError:
+                direction, lane_type, mark_l, mark_r, lane_desc = 0, 1, 0, 0, 0
+                preferred = i == 0
+            guidance = 0x02 if preferred else 0x00
+            if preferred:
+                preferred_index = i
+            lanes.append({
+                "direction": direction, "sidestreets_len": 0, "lane_type": lane_type,
+                "marking_left": mark_l, "marking_right": mark_r,
+                "lane_description": lane_desc, "guidance": guidance,
+            })
+        if preferred_index is None and lanes:
+            lanes[0]["guidance"] = 0x02
 
         self._cfg["hud_nav_enabled"] = enabled
         self._cfg["hud_distance_enabled"] = distance_enabled
         self._cfg["hud_distance_m"] = distance_m
         self._cfg["hud_distance_graph"] = distance_graph
+        self._cfg["hud_distance_unit"] = distance_unit
         self._cfg["hud_street_name"] = street_name
         self._cfg["hud_arrow_main"] = arrow_main
         self._cfg["hud_arrow_dir"] = arrow_dir
+        self._cfg["hud_lane_guidance_enabled"] = lane_guidance_enabled
+        self._cfg["hud_lanes"] = lanes
+        self._cfg["hud_lane_num_lanes"] = len(lanes)
+        self._cfg["hud_lane_recommended"] = preferred_index if preferred_index is not None else 0
         if hasattr(ecu, "configure_nav"):
             ecu.configure_nav(
                 enabled=enabled,
                 distance_enabled=distance_enabled,
                 distance_m=distance_m,
                 distance_graph=distance_graph,
+                distance_unit=distance_unit,
                 street_name=street_name,
                 arrow_main=arrow_main,
                 arrow_dir=arrow_dir,
+                lane_guidance_enabled=lane_guidance_enabled,
+                lanes=lanes,
             )
             self._log(
                 f"Apply Nav: enabled={'yes' if enabled else 'no'}"
                 f" distance_visible={'yes' if distance_enabled else 'no'}"
+                f" lane_guidance={'yes' if lane_guidance_enabled else 'no'}"
                 f" main=0x{arrow_main:02X}"
                 f" dir=0x{arrow_dir:02X}"
                 f" distance={distance_m}m"

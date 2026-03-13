@@ -14,6 +14,7 @@ BAP_OP_STATUS = 4
 BAP_OP_STATUS_ACK = 5
 BAP_OP_ACK = 6
 BAP_OP_ERROR = 7
+BAP_OP_RESET = 0  # Reset (array/property reset to default)
 
 BAP_OPCODE_NAMES = {
     BAP_OP_GET: "Get",
@@ -23,6 +24,7 @@ BAP_OPCODE_NAMES = {
     BAP_OP_STATUS_ACK: "StatusAck",
     BAP_OP_ACK: "Ack",
     BAP_OP_ERROR: "Error",
+    BAP_OP_RESET: "Reset",
 }
 
 BAP_LSG_CLUSTER_NAV = 0x31
@@ -43,6 +45,7 @@ LSG_NAMES = {
 }
 
 FUNCTION_NAMES = {
+    0x01: "GetAll",
     0x02: "BAP_Config",
     0x03: "FunctionList",
     0x04: "HeartbeatInterval",
@@ -283,6 +286,9 @@ def _decode_nav_sd_functionlist(payload: list[int]) -> str:
 
 def describe_bap_message(can_id: int, opcode: int, lsg_id: int, fct_id: int, payload: list[int]) -> str:
     ascii_text = _asciiish_text(payload)
+    if fct_id == 0x01 and payload:
+        # GetAll StatusAll: concatenated property values (BAP-FC-NAV-SD p.15)
+        return f"GetAll StatusAll {len(payload)} bytes (bundled property values)"
     if fct_id == 0x02 and len(payload) >= 6:
         # BAP_Config: BAP_Version_major, minor, LSG_Class, LSG_Sub_Class, LSG_Version_major, minor (BAP-FC-NAV-SD p.17)
         bap_maj, bap_min = payload[0], payload[1]
@@ -329,12 +335,13 @@ def describe_bap_message(can_id: int, opcode: int, lsg_id: int, fct_id: int, pay
         bargraph_pct = payload[6]
         validity = payload[7] if len(payload) > 7 else 0
         dist_valid = bool(validity & 1)
-        if not dist_valid or unit == 0xFF:
-            bargraph_str = "bargraph=off" if bargraph_on == 0 else (f"bargraph={bargraph_pct}%" if bargraph_on == 1 else "bargraph=n/a")
-            return f"DistanceToNextManeuver unavailable {bargraph_str}"
         unit_names = {0x00: "m", 0x01: "km", 0x02: "yd", 0x03: "ft", 0x04: "mi", 0x05: "1/4mi", 0xFF: "n/a"}
         unit_str = unit_names.get(unit, f"0x{unit:02X}")
-        return f"DistanceToNextManeuver dist={dist_raw / 10:.1f}{unit_str} bargraph={bargraph_pct}%"
+        if not dist_valid or unit == 0xFF:
+            bargraph_str = "bargraph=off" if bargraph_on == 0 else (f"bargraph={bargraph_pct}%" if bargraph_on == 1 else "bargraph=n/a")
+            return f"DistanceToNextManeuver invalid {bargraph_str}"
+        bg_str = f" bargraph={bargraph_pct}%" if bargraph_on == 1 else " bargraph=off"
+        return f"DistanceToNextManeuver dist={dist_raw / 10:.1f}{unit_str}{bg_str}"
     if fct_id == 0x13 and len(payload) >= 1:
         # CurrentPositionInfo: PositionInfo string (len+UTF8) (BAP-FC-NAV-SD p.39)
         n = payload[0]
@@ -409,17 +416,26 @@ def describe_bap_message(can_id: int, opcode: int, lsg_id: int, fct_id: int, pay
         if not parts:
             return "ManeuverDescriptor inactive (no maneuver)"
         return f"ManeuverDescriptor {' '.join(parts)}"
-    if fct_id == 0x18 and len(payload) >= 5:
-        # LaneGuidance StatusArray: ASG_ID|TAID, LaneGuidanceOnOff, Mode|RecordAddress, Start, Elements (BAP-FC-NAV-SD p.66)
+    if fct_id == 0x18 and len(payload) >= 4:
         asg_id = (payload[0] >> 4) & 0x0F
         taid = payload[0] & 0x0F
-        on_off = payload[1]
-        rec_addr = payload[2] & 0x0F
-        start, elements = payload[3], payload[4]
         asg_names = {0x0: "default", 0x1: "cluster", 0x2: "HUD", 0x3: "rear"}
-        on_off_str = "on" if on_off == 0x01 else "off"
-        arr_info = f" elements={elements}" if elements else ""
-        return f"LaneGuidance ASG={asg_names.get(asg_id, asg_id)} TAID={taid} OnOff={on_off_str}{arr_info}"
+        if len(payload) == 4:
+            # GetArray: ASG_ID|TAID, Mode|RecordAddress, Start, Elements (BAP-FC-NAV-SD p.66)
+            mode_ra = payload[1]
+            rec_addr = mode_ra & 0x0F
+            start, elements = payload[2], payload[3]
+            ra_names = {0x0: "full", 0x1: "LaneDir+Sidestreets+Type+Desc+Guidance", 0x2: "LaneDir+Desc+Guidance", 0x3: "Desc+Guidance", 0xF: "Pos"}
+            ra_str = ra_names.get(rec_addr, f"0x{rec_addr:X}")
+            return f"LaneGuidance GetArray ASG={asg_names.get(asg_id, asg_id)} TAID={taid} RecordAddr={ra_str} Start={start} Elements={elements}"
+        if len(payload) >= 5:
+            # StatusArray: ASG_ID|TAID, LaneGuidanceOnOff, Mode|RecordAddress, Start, Elements (BAP-FC-NAV-SD p.66)
+            on_off = payload[1]
+            rec_addr = payload[2] & 0x0F
+            start, elements = payload[3], payload[4]
+            on_off_str = "on" if on_off == 0x01 else "off"
+            arr_info = f" elements={elements}" if elements else ""
+            return f"LaneGuidance ASG={asg_names.get(asg_id, asg_id)} TAID={taid} OnOff={on_off_str}{arr_info}"
     if fct_id == 0x1D and payload:
         # ManeuverSupplement: HUD-specific, e.g. roundabout exit / supplement value (Word) + validity
         if len(payload) >= 3:

@@ -122,6 +122,23 @@ ECU modules in `modules/` are loaded automatically. Each module subclasses `ECUM
 
 To add a new ECU, create a `.py` file in `modules/` that subclasses `ECUModule`.
 
+## Lane guidance (HUD)
+
+The NAV HUD panel can send **LaneGuidance** (BAP function `0x18`) so the HUD or cluster shows lane recommendations. You set the **number of lanes** (2–8); the UI then shows one row per lane. Each row configures that lane and has a **Preferred** checkbox (exactly one lane should be preferred = “best recommendation”). Values follow the BAP Navigation_SD function catalogue (e.g. *476121999-BAP-FC-NAV-SD-P30DF48-v2-80-F*), §14.5 LaneGuidance.
+
+| Input | Type | Supported values |
+|-------|------|------------------|
+| **Dir** (LaneDirection) | Byte (hex) | `00` = straight (default), `40` = left, `C0` = right; `00`–`FE` per ManeuverDescriptor Direction; `FF` = invalid. |
+| **Type** (LaneType) | Byte (hex) | `00` unspecific, `01` normal, `02` blocked, `03` forbidden, `04` restricted, `05` breakdown, `06` dynamically controlled, `07` car pools, `08` bus, `09` bicycle, `0A` taxi, `0B` truck, `0C` bus & bicycle, `0D` bus & taxi, `0E` taxi & bicycle, `0F` bus/taxi/bicycle, `10` green strip, `11` motorway, `12` tramway (road), `13` separated tramway, `14` exit lane, `15` enter lane, `16` toll, `17` further lanes left (leftmost only), `18` further lanes right (rightmost only), `19` hide lane, `1A` ETC/non-ETC mixed; `1B`–`FF` reserved. |
+| **ML** (LaneMarking_left) | Nibble | `0` = no line, `1` = solid, `2` = dashed; `3`–`F` reserved. |
+| **MR** (LaneMarking_right) | Nibble | Same as ML. |
+| **Desc** (LaneDescription) | Nibble (hex) | `0` lane available, `1` merging left, `2` merging right, `3` ending later, `4` forbidden, `5` expanding left, `6` expanding right, `7` available later, `8` multiple additional lane begin, `9` multiple continuation with lane ends, `A` lane begins in the middle, `B`–`E` reserved, `F` not supported. |
+| **Preferred** (GuidanceInfo) | Checkbox | Checked = best recommendation (`0x2`); unchecked = not recommended (`0x0`). Only one lane should be preferred. |
+
+- **LaneDirection** encoding matches ManeuverDescriptor Direction (e.g. turn on mainroad). `0xFF` = invalid.
+- **LaneSidestreets** is not exposed in the UI; the emulator sends length `0` (no sidestreet data).
+- Record format: RecordAddress `0` = full (Dir, SidestreetsLen, Type, MarkL\|MarkR, Desc\|Guidance); RecordAddress `2` = reduced (Dir, Desc\|Guidance).
+
 ## Related Repos
 
 - [`MIGINC/BAP_RE`](https://github.com/MIGINC/BAP_RE) — reverse-engineering notes and traces for the BAP protocol. Useful as a protocol reference for:
