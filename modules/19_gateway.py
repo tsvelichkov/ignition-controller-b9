@@ -151,9 +151,9 @@ class GatewayECU(ECUModule):
         super().__init__(log_cb)
         self._secs = 0
 
-    def set_enabled(self, _):
-        """Always-on — ignore ignition state."""
-        self.enabled = True
+    def set_enabled(self, on: bool):
+        """Respect UI toggle and ignition: when False, stop sending messages."""
+        self.enabled = bool(on)
 
     def _run(self):
         now = time.monotonic()

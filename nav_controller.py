@@ -119,8 +119,12 @@ C = {
 }
 
 MODULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules")
+# 0x3C0 byte 2: 0x23 = KL15/Infotainment on, 0x00/0x21 = off
+KL15_ON_BYTE = 0x23
+
 DEFAULT_APP_CONFIG = {
     "start_ignition": False,
+    "send_ignition_updates": True,
     "verbose_bap": False,
     "hud_mode": "full",
     "hud_nav_enabled": False,
@@ -150,14 +154,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Audi MLB CAN Navigation Controller")
     parser.add_argument("--ignition", choices=("on", "off"), default="off",
                         help="Set the initial ignition state.")
+    parser.add_argument("--no-send-ignition-updates", action="store_true",
+                        help="Do not send periodic 0x3C0; monitor ignition from bus instead.")
     parser.add_argument("--verbose-bap", action="store_true",
                         help="Enable verbose 5F/HUD BAP logging.")
     parser.add_argument("--hud-mode", choices=("full", "minimal"), default="full",
                         help="Select full emulation or minimal straight-arrow HUD mode.")
-    parser.add_argument("--hud-arrow", choices=("straight", "left", "right", "offroad"), default="straight",
-                        help="Arrow shape used by minimal HUD mode.")
-    parser.add_argument("--hud-distance", type=int, default=500,
-                        help="Distance in meters used by minimal HUD mode.")
     parser.add_argument("--auto-open-hud", action="store_true",
                         help="Open the HUD BAP monitor window on startup.")
     return parser.parse_args(argv)
@@ -167,10 +169,9 @@ def make_app_config(args):
     cfg = dict(DEFAULT_APP_CONFIG)
     cfg.update({
         "start_ignition": args.ignition == "on",
+        "send_ignition_updates": not getattr(args, "no_send_ignition_updates", False),
         "verbose_bap": bool(args.verbose_bap),
         "hud_mode": args.hud_mode,
-        "hud_arrow": args.hud_arrow,
-        "hud_distance_m": max(0, int(args.hud_distance)),
         "auto_open_hud": bool(args.auto_open_hud),
     })
     return cfg
@@ -180,12 +181,14 @@ def make_app_config(args):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BusManager:
-    def __init__(self, log_cb, status_cb, frame_cb=None):
+    def __init__(self, log_cb, status_cb, frame_cb=None, ign_from_bus_cb=None):
         self._log    = log_cb
         self._status = status_cb
         self._frame  = frame_cb or (lambda *_args, **_kwargs: None)
+        self._ign_from_bus_cb = ign_from_bus_cb  # called when 0x3C0 RX updates ignition (from another device)
         self._bus    = None
         self._stop   = threading.Event()
+        self.send_ignition_updates = True  # when False, do not send periodic 0x3C0 (another device may send it)
 
         # Shared send queues.
         # _prio_q: urgent frames (MFL button presses) — checked first by writer
@@ -247,6 +250,10 @@ class BusManager:
             self._reader_thread.join(timeout=2)
         if self._tick_thread:
             self._tick_thread.join(timeout=2)
+
+    def set_send_ignition_updates(self, on: bool):
+        """When False, stop sending periodic 0x3C0; ignition state can still be updated from bus RX."""
+        self.send_ignition_updates = bool(on)
 
     def set_ignition(self, on: bool):
         self.ignition = on
@@ -362,6 +369,22 @@ class BusManager:
             if msg is None:
                 continue
             self._emit_frame("rx", msg.arbitration_id, list(msg.data))
+            # Monitor 0x3C0 from bus so ignition state reflects actual bus (e.g. another device sending it)
+            if msg.arbitration_id == 0x3C0 and len(msg.data) >= 3:
+                on = (msg.data[2] == KL15_ON_BYTE)
+                if on != self.ignition:
+                    self.ignition = on
+                    self._ign_on = on
+                    for e in self._ecus:
+                        if hasattr(e, "set_enabled"):
+                            e.set_enabled(on)
+                        else:
+                            e.enabled = on
+                    if self._ign_from_bus_cb:
+                        try:
+                            self._ign_from_bus_cb(on)
+                        except Exception:
+                            pass
             self._dispatch_message(msg)
 
     def _writer_loop(self):
@@ -418,8 +441,8 @@ class BusManager:
             now = time.monotonic()
             if now - last >= 0.100:
                 last = now
-                # 0x3C0 Klemmen_Status_01
-                if self.connected:
+                # 0x3C0 Klemmen_Status_01 — only when we are responsible for sending it
+                if self.connected and self.send_ignition_updates:
                     self._ig_ctr = (self._ig_ctr + 1) & 0x0F
                     if self._ign_on:
                         crc, kl15 = IGN_CRC[self._ig_ctr], 0x23
@@ -839,10 +862,9 @@ class App(tk.Tk):
         self._setup_bus(); self._build(); self._start_refresh(); self._start_hud_frame_drain()
         self.after(50, lambda: self._log(
             f"Startup config: ignition={'on' if self._cfg.get('start_ignition') else 'off'}"
+            f" send_ignition_updates={'on' if self._cfg.get('send_ignition_updates') else 'off'}"
             f" hud_mode={self._cfg.get('hud_mode')}"
             f" verbose_bap={'on' if self._cfg.get('verbose_bap') else 'off'}"
-            f" arrow={self._cfg.get('hud_arrow')}"
-            f" distance={self._cfg.get('hud_distance_m')}m"
         ))
         if self._cfg.get("auto_open_hud"):
             self.after(200, self._open_hud_bap_window)
@@ -854,10 +876,12 @@ class App(tk.Tk):
             log_cb=    lambda m: self.after(0, self._log, m),
             status_cb= lambda s, d: self.after(0, self._setstatus, s, d),
             frame_cb=  lambda d, a, data: self._hud_frame_q.put((d, a, list(data))),
+            ign_from_bus_cb=lambda on: self.after(0, self._on_ignition_from_bus, on),
         )
         for ecu in load_modules(log_cb=lambda m: self.after(0, self._log, m), config=self._cfg):
             self._mgr.register_ecu(ecu)
         self._mgr.start()
+        self._mgr.set_send_ignition_updates(bool(self._cfg.get("send_ignition_updates", True)))
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -939,7 +963,21 @@ class App(tk.Tk):
         self._ign_btn.pack(padx=20, pady=(8,4))
         self._ign_hint = tk.Label(pnl, text="Click to enable ignition",
             font=tkfont.Font(family="Segoe UI",size=8), bg=C["panel"], fg=C["sub"])
-        self._ign_hint.pack(pady=(0,6))
+        self._ign_hint.pack(pady=(0,2))
+        self._send_ign_var = tk.BooleanVar(value=bool(self._cfg.get("send_ignition_updates", True)))
+        def _on_send_ign_toggle():
+            on = bool(self._send_ign_var.get())
+            self._cfg["send_ignition_updates"] = on
+            if hasattr(self, "_mgr") and self._mgr:
+                self._mgr.set_send_ignition_updates(on)
+        tk.Checkbutton(
+            pnl, text="Send ignition updates (0x3C0)",
+            variable=self._send_ign_var,
+            command=_on_send_ign_toggle,
+            bg=C["panel"], fg=C["text"], activebackground=C["panel"], activeforeground=C["text"],
+            selectcolor=C["panel"], highlightthickness=0,
+            font=tkfont.Font(family="Segoe UI", size=8),
+        ).pack(pady=(0, 6))
         self._inds = {}
         for name, tag in [("0x3C0  Ignition","[CORE]"),("0x6B2  Diagnose","[19]"),
                            ("0x331  MFL hb","[5F]"),("NM     Keepalive","[5F]")]:
@@ -1412,6 +1450,23 @@ class App(tk.Tk):
                      bg=C["bg"], fg=C["sub"]).pack(pady=20)
 
     # ── Actions ───────────────────────────────────────────────────────────────
+
+    def _on_ignition_from_bus(self, on: bool):
+        """Update UI from 0x3C0 received on bus (another device sending ignition). Manager already updated ECUs."""
+        if self._ign == on:
+            return
+        self._ign = on
+        if on:
+            self._ign_btn.configure(text="ON ", fg=C["on"])
+            self._ign_hint.configure(text="KL15 active (from bus)")
+            for d in self._inds.values(): d.configure(fg=C["accent"])
+            self._log("Ignition ON (from bus 0x3C0)")
+        else:
+            self._ign_btn.configure(text="OFF", fg=C["off"])
+            self._ign_hint.configure(text="Click to enable ignition")
+            for d in self._inds.values(): d.configure(fg=C["border"])
+            self._log("Ignition OFF (from bus 0x3C0)")
+        self._update_stalk_buttons()
 
     def _toggle_ign(self):
         self._ign = not self._ign; self._mgr.set_ignition(self._ign)

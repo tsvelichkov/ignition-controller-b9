@@ -975,12 +975,6 @@ class InfotainmentECU(ECUModule):
         self._tx(HUD_D, bap_hb(0x1D) + [0x00, 0x00, 0xFF])
         self._tx(HUD_D, [0x90, 0x05] + bap_hb(0x21) + [val, 0x02, 0x02, 0x03])
         self._tx(HUD_D, [0xD0, 0x00])
-        nav_on = bool(self._cfg.get("hud_nav_enabled", False))
-        lane_on = bool(self._cfg.get("hud_lane_guidance_enabled", False))
-        if nav_on and lane_on:
-            self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x18, self._lane_guidance_payload(0x00, 0x00), atomic=True, force_long=True)
-        else:
-            self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x18, [0x00, 0x00, 0x00, 0x00], atomic=True, force_long=True)
         self._tx_bap(HUD_D, BAP_OP_HEARTBEAT_STATUS, HUD_LSG, 0x32, self._feature_enable_payload(), atomic=True, force_long=True)
         # MIB3 periodic extras
         self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x27, list(self._nav_state["27_ActiveRgType"]))

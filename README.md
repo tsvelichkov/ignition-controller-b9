@@ -46,6 +46,22 @@ pip install -r requirements.txt
 python nav_controller.py
 ```
 
+Optional command-line options:
+
+| Option | Description |
+|--------|-------------|
+| `--ignition on` \| `off` | Initial ignition state (default: `off`). |
+| `--no-send-ignition-updates` | Do not send periodic `0x3C0`; monitor ignition from the bus instead (e.g. another device sends it). |
+| `--verbose-bap` | Enable verbose 5F/HUD BAP logging. |
+| `--hud-mode full` \| `minimal` | HUD emulation mode (default: `full`). |
+| `--auto-open-hud` | Open the HUD BAP monitor window on startup. |
+
+Example:
+
+```bash
+python nav_controller.py --ignition on --no-send-ignition-updates --auto-open-hud
+```
+
 ## Project Structure
 
 ```
