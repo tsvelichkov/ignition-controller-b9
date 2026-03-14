@@ -106,6 +106,25 @@ The adapter appears as a USB virtual-serial-port:
 | `virtual`       | No hardware — testing only        |
 | `gs_usb`        | candleLight, Geschwister Schneider|
 
+### Arduino Nano + MCP2515 (8 MHz) with SavvyCAN — init commands S and O
+
+With some SLCAN adapters (e.g. Arduino Nano + MCP2515 8 MHz), SavvyCAN does not send the init sequence when you connect, so you have to type **S2** (or S6 for 500 kbps) and **O** manually to receive CAN messages. CANable works because it sends these automatically.
+
+**Options:**
+
+1. **Init script before SavvyCAN**  
+   Run once (then connect SavvyCAN to the same port):
+   ```bash
+   python slcan_init.py COM10 50000
+   ```
+   Use your COM port; `50000` = 50 kbps (S2), use `500000` for 500 kbps (S6). This sends C, S, O and closes the port; many sketches keep the channel open so SavvyCAN can receive without typing S/O.
+
+2. **This app (nav_controller)**  
+   When using `interface: "lawicel"` or `interface: "slcan"`, the driver sends **C**, **S**, **O** on connect automatically — no manual step.
+
+3. **SavvyCAN**  
+   Check the connection type (e.g. “Lawicel” / “SLCAN”) and whether it has a “send init commands” or similar option so it sends S and O when opening the port.
+
 Example for SocketCAN on Linux:
 
 ```python

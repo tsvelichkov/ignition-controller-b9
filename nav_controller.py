@@ -19,7 +19,7 @@ import can, threading, time, importlib.util, os, sys, queue
 # At 115200 baud a CAN frame takes ~2–3ms → ~300–400 fps max. Queue backs up.
 # Use baudrate=921600 (8×) for ~2400+ fps. IFG prevents adapter buffer overrun.
 IFG_SECS = 0.0005   # 0.5ms min gap between sends (2000 fps max at higher baud)
-SERIAL_BAUDRATE = 921600  # 115200 if adapter unstable; 921600 if supported
+SERIAL_BAUDRATE = 115200  # 115200 if adapter unstable; 921600 if supported
 
 # ── CAN CONNECTION CONFIG ─────────────────────────────────────────────────────
 # Set CAN_INTERFACE to one of the options below. Config is detected at startup.
@@ -27,6 +27,7 @@ SERIAL_BAUDRATE = 921600  # 115200 if adapter unstable; 921600 if supported
 # Option 1: Auto-detect (csscan_serial) — CS-Scan serial adapter
 CAN_INTERFACE = "csscan_serial"
 CAN_AVAILABLE_CONFIGS = can.detect_available_configs(CAN_INTERFACE)
+
 # Inject baudrate for csscan_serial (921600 = 8× throughput; use 115200 if unstable)
 for c in CAN_AVAILABLE_CONFIGS:
     if c.get("interface") == "csscan_serial" and "baudrate" not in c:
@@ -46,9 +47,17 @@ for c in CAN_AVAILABLE_CONFIGS:
 #   CAN_INTERFACE = "serial"
 #   CAN_AVAILABLE_CONFIGS = [{"interface": "serial", "channel": "COM3", "bitrate": 500000}]
 #
-# Option 5: SLCAN — SLCAN protocol over serial (many USB-CAN adapters)
+# Option 5: SLCAN / Lawicel CAN-USB — 115200 serial, 500 kbps CAN (see README Lawicel section)
+#   CAN_INTERFACE = "slcan"
+#   CAN_AVAILABLE_CONFIGS = [{"interface": "slcan", "channel": "COM5", "bitrate": 500000, "tty_baudrate": 115200}]
+#
+# Option 5b: SLCAN auto-detect (any SLCAN adapter)
 #   CAN_INTERFACE = "slcan"
 #   CAN_AVAILABLE_CONFIGS = can.detect_available_configs("slcan")
+#
+# Option 5c: Custom Lawicel driver (use if slcan gives no traffic with SLGreen/Arduino)
+#   CAN_INTERFACE = "lawicel"
+#   CAN_AVAILABLE_CONFIGS = [{"interface": "lawicel", "channel": "COM10", "bitrate": 500000, "tty_baudrate": 115200}]
 #
 # Option 6: Virtual — no hardware, for testing
 #   CAN_INTERFACE = "virtual"
@@ -300,7 +309,19 @@ class BusManager:
             # Higher serial baud = more fps; csscan_serial supports baudrate kw
             if cfg.get("interface") == "csscan_serial":
                 bus_kw["baudrate"] = cfg.get("baudrate", SERIAL_BAUDRATE)
-            self._bus = can.Bus(**bus_kw)
+            # Lawicel CAN-USB / SLCAN: serial port baud (e.g. 115200), bitrate = CAN speed (e.g. 500000)
+            if cfg.get("interface") == "slcan" and "tty_baudrate" in cfg:
+                bus_kw["tty_baudrate"] = cfg["tty_baudrate"]
+            if cfg.get("interface") == "lawicel":
+                from lawicel_canusb import LawicelBusAdapter
+                self._bus = LawicelBusAdapter(
+                    channel=cfg["channel"],
+                    bitrate=cfg.get("bitrate", 500000),
+                    tty_baudrate=cfg.get("tty_baudrate", 115200),
+                    serial_timeout=cfg.get("serial_timeout", 0.05),
+                )
+            else:
+                self._bus = can.Bus(**bus_kw)
             self.connected = True
             self._status("ok", cfg["channel"])
             self._log(f"Connected: {cfg['interface']} / {cfg['channel']}")
@@ -486,6 +507,7 @@ def load_modules(log_cb=None, config=None):
         mod  = importlib.util.module_from_spec(spec)
         try:
             spec.loader.exec_module(mod)
+            sys.modules[spec.name] = mod  # so VZE tab and others can resolve pack_vze_01 etc.
         except Exception as e:
             print(f"[WARN] {fname}: {e}")
             continue
@@ -886,7 +908,7 @@ class App(tk.Tk):
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build(self):
-        self.columnconfigure(0, minsize=520, weight=0)
+        self.columnconfigure(0, minsize=360, weight=0)
         self.columnconfigure(2, weight=1)
         self.rowconfigure(2, weight=1)
 
@@ -912,12 +934,13 @@ class App(tk.Tk):
 
         left = tk.Frame(self, bg=C["bg"])
         left.grid(row=2,column=0,sticky="nsew",padx=(10,5),pady=10)
-        left.columnconfigure(0, weight=1, uniform="left")
-        left.columnconfigure(1, weight=1, uniform="left")
-        left.columnconfigure(2, weight=1, uniform="left")
+        # Ignition + MFL/stalk stay narrow; notebook (col 2) gets remaining width
+        left.columnconfigure(0, weight=0, minsize=130)
+        left.columnconfigure(1, weight=0, minsize=130)
+        left.columnconfigure(2, weight=1)
         left.rowconfigure(0, weight=0)
         left.rowconfigure(1, weight=0)
-        left.rowconfigure(2, weight=1)
+        left.rowconfigure(2, weight=1, minsize=320)
         left.rowconfigure(3, weight=0)
         ign = self._build_ign(left)
         ign.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, 3), pady=(0, 3))
@@ -925,9 +948,18 @@ class App(tk.Tk):
         mfl.grid(row=1, column=0, sticky="nsew", padx=(0, 3), pady=3)
         stalk = self._build_stalk(left)
         stalk.grid(row=1, column=1, sticky="nsew", padx=3, pady=3)
-        nav = self._build_nav_controls(left)
-        nav.grid(row=0, column=2, rowspan=2, sticky="nsew", padx=(3, 0), pady=(0, 6))
-        self._build_hud_bap(left).grid(row=2, column=0, columnspan=3, sticky="nsew", pady=(0, 6))
+        # Tabs in place of former nav panel (col 2): NAV HUD = nav controls + HUD BAP, VZE = traffic signs
+        self._left_notebook = ttk.Notebook(left)
+        self._left_notebook.grid(row=0, column=2, rowspan=3, sticky="nsew", padx=(3, 0), pady=(0, 6))
+        tab_nav = tk.Frame(self._left_notebook, bg=C["bg"])
+        tab_vze = tk.Frame(self._left_notebook, bg=C["bg"])
+        self._left_notebook.add(tab_nav, text="NAV HUD")
+        self._left_notebook.add(tab_vze, text="VZE")
+        tab_nav.columnconfigure(0, weight=1)
+        tab_nav.rowconfigure(1, weight=1)
+        self._build_nav_controls(tab_nav).grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+        self._build_hud_bap(tab_nav).grid(row=1, column=0, sticky="nsew", padx=4, pady=2)
+        self._build_vze_tab(tab_vze).pack(fill="both", expand=True)
         self._build_log(left).grid(row=3, column=0, columnspan=3, sticky="nsew")
 
         tk.Frame(self, bg=C["border"], width=1).grid(row=2,column=1,sticky="ns")
@@ -1348,6 +1380,12 @@ class App(tk.Tk):
                 return e
         return None
 
+    def _find_a5_ecu(self):
+        for e in self._mgr.get_ecus():
+            if getattr(e, "ECU_ID", None) == "A5":
+                return e
+        return None
+
     def _update_stalk_buttons(self):
         ecu = self._find_stalk_ecu()
         self._stalk_enabled = self._ign and (ecu is not None)
@@ -1439,6 +1477,211 @@ class App(tk.Tk):
         )
         self._hud_log_lbl.pack(fill="x", padx=10, pady=(0, 8))
         return pnl
+
+    def _build_vze_tab(self, parent):
+        """VZE tab: A5 loaded check + sign type + first sign (decimal) for testing."""
+        pnl = _panel(parent, "VZE  (0x181)")
+        small = tkfont.Font(family="Segoe UI", size=8)
+        entry_font = tkfont.Font(family="Consolas", size=9)
+        row = tk.Frame(pnl, bg=C["panel"])
+        row.pack(fill="x", padx=8, pady=(4, 4))
+        self._vze_a5_status_lbl = tk.Label(
+            row, text="Module A5: checking…",
+            font=small, bg=C["panel"], fg=C["sub"])
+        self._vze_a5_status_lbl.pack(side="left")
+        self.after(100, self._update_vze_a5_status)
+
+        a5_mod = sys.modules.get("a5_drvassist")
+        if not a5_mod or not getattr(a5_mod, "pack_vze_01", None):
+            tk.Label(pnl, text="VZE pack/unpack not available (a5_drvassist).",
+                     font=small, bg=C["panel"], fg=C["sub"]).pack(pady=8)
+            return pnl
+
+        body = tk.Frame(pnl, bg=C["panel"])
+        body.pack(fill="x", padx=8, pady=(4, 8))
+        body.columnconfigure(1, weight=1)
+
+        # Sign type: 0=EU_RDW, 1=USA, 2=Canada, 3=China (DBC value table)
+        tk.Label(body, text="Sign type", font=small, bg=C["panel"], fg=C["sub"]).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self._vze_anzeigemodus_var = tk.StringVar(value="0")
+        sign_type_combo = ttk.Combobox(
+            body, textvariable=self._vze_anzeigemodus_var,
+            values=["EU_RDW (0)", "USA (1)", "Canada (2)", "China (3)"],
+            width=14, state="readonly", font=entry_font
+        )
+        sign_type_combo.grid(row=0, column=1, sticky="w", pady=2)
+        sign_type_combo.current(0)
+        self._vze_sign_type_combo = sign_type_combo
+
+        tk.Label(body, text="First sign (km/h, decimal)", font=small, bg=C["panel"], fg=C["sub"]).grid(row=1, column=0, sticky="w", padx=(0, 8))
+        self._vze_vz1_var = tk.StringVar(value="90")
+        vze_entry = tk.Entry(body, textvariable=self._vze_vz1_var, width=6, font=entry_font, bg=C["bg"], fg=C["text"], insertbackground=C["text"])
+        vze_entry.grid(row=1, column=1, sticky="w", pady=2)
+        vze_entry.bind("<FocusOut>", lambda e: self._apply_vze_settings())
+        vze_entry.bind("<Return>", lambda e: self._apply_vze_settings())
+        sign_type_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_vze_settings())
+
+        # Bytes 4, 5, 6, 7: one checkbox per bit (0=LSB .. 7=MSB). Build vars first so First sign row can reference them.
+        self._vze_byte_vars = []  # [ [b4_0..b4_7], [b5_0..b5_7], [b6_0..b6_7], [b7_0..b7_7] ]
+        bit_frame = tk.Frame(pnl, bg=C["panel"])
+        for byteno in range(4):
+            row_vars = []
+            for bit in range(8):
+                var = tk.BooleanVar(value=False)
+                var.trace_add("write", lambda *_: self._apply_vze_settings())
+                row_vars.append(var)
+                cb = tk.Checkbutton(
+                    bit_frame, variable=var, text=str(bit),
+                    bg=C["panel"], fg=C["text"], activebackground=C["panel"], activeforeground=C["text"],
+                    selectcolor=C["panel"], highlightthickness=0, font=small,
+                )
+                cb.grid(row=byteno, column=bit + 1, padx=1, pady=1)
+            self._vze_byte_vars.append(row_vars)
+        for row_lbl, row_no in [("Byte 4", 0), ("Byte 5", 1), ("Byte 6", 2), ("Byte 7", 3)]:
+            tk.Label(bit_frame, text=row_lbl, font=small, bg=C["panel"], fg=C["sub"], width=6, anchor="w").grid(row=row_no, column=0, sticky="w", padx=(0, 4))
+        # First sign related (under speed): B4.3=blink, B4.6=weather plain, B4.7=weather rain, B5.0=warning clock
+        first_sign_frame = tk.Frame(pnl, bg=C["panel"])
+        first_sign_frame.pack(fill="x", padx=8, pady=(2, 4))
+        tk.Label(first_sign_frame, text="First sign:", font=small, bg=C["panel"], fg=C["sub"]).pack(side="left", padx=(0, 8))
+        for lbl, var in [
+            ("Sign warning (blink)", self._vze_byte_vars[0][3]),
+            ("Weather plain", self._vze_byte_vars[0][6]),
+            ("Weather rain", self._vze_byte_vars[0][7]),
+            ("Warning clock", self._vze_byte_vars[1][0]),
+        ]:
+            cb = tk.Checkbutton(
+                first_sign_frame, variable=var, text=lbl,
+                bg=C["panel"], fg=C["text"], activebackground=C["panel"], activeforeground=C["text"],
+                selectcolor=C["panel"], highlightthickness=0, font=small,
+            )
+            cb.pack(side="left", padx=(0, 12))
+        bit_frame.pack(fill="x", padx=8, pady=(2, 4))
+
+        btn_row = tk.Frame(pnl, bg=C["panel"])
+        btn_row.pack(pady=(4, 8))
+        tk.Button(
+            btn_row, text="Apply VZE (0x181)",
+            font=tkfont.Font(family="Segoe UI", size=9), bg=C["btn"], fg=C["text"],
+            activebackground=C["btn_hov"], activeforeground=C["text"], relief="flat", bd=0, cursor="hand2",
+            command=self._apply_vze_settings,
+        ).pack(side="left", padx=(0, 6))
+        tk.Button(
+            btn_row, text="Load from A5",
+            font=tkfont.Font(family="Segoe UI", size=8), bg=C["btn"], fg=C["text"],
+            activebackground=C["btn_hov"], activeforeground=C["text"], relief="flat", bd=0, cursor="hand2",
+            command=self._load_vze_from_a5,
+        ).pack(side="left")
+        tk.Frame(pnl, bg=C["panel"], height=4).pack()
+        self._vze_bytes_lbl = tk.Label(
+            pnl,
+            text="0x181 payload: -- -- -- -- -- -- -- --",
+            font=tkfont.Font(family="Consolas", size=9),
+            bg=C["panel"],
+            fg=C["sub"],
+            justify="left",
+        )
+        self._vze_bytes_lbl.pack(fill="x", padx=8, pady=(0, 8))
+        self.after(50, self._update_vze_bytes_display)
+        return pnl
+
+    def _update_vze_a5_status(self):
+        ecu = self._find_a5_ecu()
+        if hasattr(self, "_vze_a5_status_lbl") and self._vze_a5_status_lbl.winfo_exists():
+            if ecu is not None:
+                self._vze_a5_status_lbl.configure(text="Module A5: loaded", fg=C["on"])
+            else:
+                self._vze_a5_status_lbl.configure(text="Module A5: not loaded", fg=C["off"])
+
+    def _update_vze_bytes_display(self):
+        """Show the current form values packed as 0x181 payload (hex bytes) at the bottom."""
+        if not hasattr(self, "_vze_bytes_lbl") or not self._vze_bytes_lbl.winfo_exists():
+            return
+        a5_mod = sys.modules.get("a5_drvassist")
+        if not a5_mod or not getattr(a5_mod, "pack_vze_01", None):
+            return
+        try:
+            idx = self._vze_sign_type_combo.current() if hasattr(self, "_vze_sign_type_combo") and self._vze_sign_type_combo.winfo_exists() else 0
+            anzeigemodus = max(0, min(3, idx))
+            vz1 = max(0, min(255, int(self._vze_vz1_var.get().strip() or "0")))
+            def bits_to_byte(vars_row):
+                return sum(2**i for i in range(8) if vars_row[i].get()) if vars_row else 0
+            bv = self._vze_byte_vars if getattr(self, "_vze_byte_vars", None) and len(getattr(self, "_vze_byte_vars", [])) >= 4 else []
+            b4 = bits_to_byte(bv[0]) if len(bv) > 0 else 0
+            b5 = bits_to_byte(bv[1]) if len(bv) > 1 else 0
+            b6 = bits_to_byte(bv[2]) if len(bv) > 2 else 0
+            b7 = bits_to_byte(bv[3]) if len(bv) > 3 else 0
+        except (ValueError, AttributeError):
+            self._vze_bytes_lbl.configure(text="0x181 payload: (invalid values)")
+            return
+        payload = a5_mod.pack_vze_01(anzeigemodus=anzeigemodus, verkehrszeichen_1=vz1, byte_4=b4, byte_5=b5, byte_6=b6, byte_7=b7)
+        hex_str = " ".join(f"{b:02X}" for b in payload[:8])
+        self._vze_bytes_lbl.configure(text=f"0x181 payload: {hex_str}")
+
+    def _load_vze_from_a5(self):
+        ecu = self._find_a5_ecu()
+        if ecu is None:
+            self._log("Load VZE: module A5 not loaded")
+            return
+        a5_mod = sys.modules.get("a5_drvassist")
+        if not a5_mod or not getattr(a5_mod, "unpack_vze_01", None):
+            self._log("Load VZE: unpack_vze_01 not available")
+            return
+        for s in ecu.get_states():
+            if s.arb_id == 0x181:
+                params = a5_mod.unpack_vze_01(s.data)
+                break
+        else:
+            self._log("Load VZE: no 0x181 state in A5")
+            return
+        if not hasattr(self, "_vze_sign_type_combo"):
+            return
+        self._vze_loading = True
+        try:
+            self._vze_sign_type_combo.current(max(0, min(3, params.get("anzeigemodus", 0))))
+            self._vze_vz1_var.set(str(max(0, min(255, params.get("verkehrszeichen_1", 0)))))
+            # Bits we don't read on load (First sign group): B4.3, B4.6, B4.7, B5.0 — leave checkboxes unchanged
+            skip_bits = {(0, 3), (0, 6), (0, 7), (1, 0)}
+            for byteno, key in enumerate(("byte_4", "byte_5", "byte_6", "byte_7")):
+                b = params.get(key, 0) & 0xFF
+                if getattr(self, "_vze_byte_vars", None) and len(self._vze_byte_vars) > byteno:
+                    for i in range(8):
+                        if (byteno, i) in skip_bits:
+                            continue
+                        self._vze_byte_vars[byteno][i].set(bool((b >> i) & 1))
+        finally:
+            self._vze_loading = False
+        self._update_vze_bytes_display()
+        self._apply_vze_settings()
+        self._log("Load VZE: form filled from current 0x181")
+
+    def _apply_vze_settings(self):
+        if getattr(self, "_vze_loading", False):
+            return
+        ecu = self._find_a5_ecu()
+        if ecu is None:
+            return
+        a5_mod = sys.modules.get("a5_drvassist")
+        if not a5_mod or not getattr(a5_mod, "pack_vze_01", None):
+            self._log("Apply VZE: pack_vze_01 not available")
+            return
+        try:
+            idx = self._vze_sign_type_combo.current() if hasattr(self, "_vze_sign_type_combo") and self._vze_sign_type_combo.winfo_exists() else 0
+            anzeigemodus = max(0, min(3, idx))
+            vz1 = max(0, min(255, int(self._vze_vz1_var.get().strip() or "0")))
+            def bits_to_byte(vars_row):
+                return sum(2**i for i in range(8) if vars_row[i].get()) if vars_row else 0
+            bv = self._vze_byte_vars if getattr(self, "_vze_byte_vars", None) and len(self._vze_byte_vars) >= 4 else []
+            b4 = bits_to_byte(bv[0]) if len(bv) > 0 else 0
+            b5 = bits_to_byte(bv[1]) if len(bv) > 1 else 0
+            b6 = bits_to_byte(bv[2]) if len(bv) > 2 else 0
+            b7 = bits_to_byte(bv[3]) if len(bv) > 3 else 0
+        except ValueError as e:
+            self._log(f"Apply VZE: invalid number — {e}")
+            return
+        payload = a5_mod.pack_vze_01(anzeigemodus=anzeigemodus, verkehrszeichen_1=vz1, byte_4=b4, byte_5=b5, byte_6=b6, byte_7=b7)
+        ecu.update_data(0x181, payload)
+        self._update_vze_bytes_display()
+        self._log(f"Apply VZE: 0x181 type={anzeigemodus} speed={vz1} km/h")
 
     def _build_ecu_cards(self):
         for ecu in self._mgr.get_ecus():

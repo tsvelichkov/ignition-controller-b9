@@ -2,16 +2,62 @@
 modules/a5_drvassist.py — A5 Driver Assistance (Front Camera / VZE)
 
 Sends:
-  0x181  VZE_01  — Traffic sign display (speed limits etc),   100ms  [static]
+  0x181  VZE_01  — Traffic sign display (speed limits etc),   100ms  [editable via UI]
   0x29C  VZE_02  — Traffic sign display 2 (signs 4-5),        100ms  [static]
   0x1F0  EA_02   — Front Assist / object detection / eCall,    50ms  [replay]
   0x30F  SWA_01  — Lane keep / lane change assist (SWA/LKA),  100ms  [replay]
 
-Source: 0000046.TXT + 0000050.TXT car logs.
+VZE_01 (0x181) layout from DBC MLBevo_Gen2: BO_ 385 VZE_01: 8 Gateway.
+Intel (@1+) bit layout: start_bit|length.
 """
 import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ecu_base import ECUModule
+
+
+# Cluster encoding: value = speed * 8/5 (16-bit LE in byte1, byte2). Overrides to match observed: 25→0x2a, 155→0xfa.
+_SPEED_TO_VALUE = {25: 42, 155: 250}
+_VALUE_TO_SPEED = {42: 25, 250: 155}
+
+
+def _speed_to_value(speed):
+    speed = max(0, min(255, int(speed)))
+    return _SPEED_TO_VALUE.get(speed, round(speed * 8 / 5))
+
+
+def _value_to_speed(raw):
+    raw = max(0, min(0xFFFF, int(raw)))
+    return _VALUE_TO_SPEED.get(raw, round(raw * 5 / 8))
+
+
+def pack_vze_01(anzeigemodus=0, verkehrszeichen_1=90, byte_4=0, byte_5=0, byte_6=0, byte_7=0, **kwargs):
+    """Pack VZE_01 (0x181): byte0=sign type, byte1+byte2=speed 16-bit LE, bytes 4–7 from args or 0."""
+    data = [0] * 8
+    data[0] = max(0, min(3, int(anzeigemodus)))
+    val = _speed_to_value(verkehrszeichen_1)
+    data[1] = val & 0xFF
+    data[2] = (val >> 8) & 0xFF
+    data[4] = int(byte_4) & 0xFF
+    data[5] = int(byte_5) & 0xFF
+    data[6] = int(byte_6) & 0xFF
+    data[7] = int(byte_7) & 0xFF
+    return data
+
+
+def unpack_vze_01(data):
+    """Unpack 0x181 to anzeigemodus, verkehrszeichen_1, and bytes 4–7 for UI."""
+    if not data or len(data) < 3:
+        return {}
+    d = list(data)[:8]
+    raw = d[1] + (d[2] << 8)
+    return {
+        "anzeigemodus": d[0] & 3,
+        "verkehrszeichen_1": max(0, min(255, _value_to_speed(raw))),
+        "byte_4": d[4] if len(d) > 4 else 0,
+        "byte_5": d[5] if len(d) > 5 else 0,
+        "byte_6": d[6] if len(d) > 6 else 0,
+        "byte_7": d[7] if len(d) > 7 else 0,
+    }
 
 
 class VzeECU(ECUModule):
@@ -325,7 +371,7 @@ class VzeECU(ECUModule):
     ]
 
     MESSAGES = [
-        (0x181, "VZE_01",  200, [0x00, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01]),  # log: 200ms
+        (0x181, "VZE_01",  200, pack_vze_01()),  # editable from UI; DBC cycle 200ms
         (0x29C, "VZE_02",  200, [0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00]),  # log: 200ms
         (0x1F0, "EA_02",    50, [0xB7, 0x0C, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00]),
         (0x30F, "SWA_01",  100, [0xB5, 0x0C, 0x72, 0x00, 0x00, 0x00, 0x01, 0x00]),
