@@ -1,3 +1,4 @@
 python-can>=4.0.0
-python-can-csscan-serial   # CSS Electronics USB adapter (default interface)
-tksheet>=7.0.0             # Table widget with dynamic row height for BAP viewer
+python-can-csscan-serial   # CSS Electronics USB adapter
+pyserial>=3.5              # Serial port detection for SLCAN/Lawicel
+PyQt6>=6.4.0               # Modern GUI framework

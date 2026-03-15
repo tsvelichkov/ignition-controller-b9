@@ -171,6 +171,7 @@ class InfotainmentECU(ECUModule):
         self._last_fullinit_bundle_at = 0.0
         self._last_raw_handoff_at = {}
         self._lane_guidance_last_asg_taid = 0x21  # HUD ASG=2, TAID=1; updated from GetArray
+        self._lane_guidance_last_req_elements = 0
         self._reset_nav_state()
 
     def set_enabled(self, on: bool):
@@ -184,6 +185,7 @@ class InfotainmentECU(ECUModule):
         arrow = self._configured_nav_arrow()
         return {
             "enabled": bool(self._cfg.get("hud_nav_enabled", False)),
+            "distance_valid": bool(self._cfg.get("hud_distance_valid", True)),
             "distance_enabled": bool(self._cfg.get("hud_distance_enabled", True)),
             "distance_m": max(0, int(self._cfg.get("hud_distance_m", arrow.get("dist_m", 0)))),
             "distance_graph": int(self._cfg.get("hud_distance_graph", 0x64)) & 0xFF,
@@ -198,17 +200,26 @@ class InfotainmentECU(ECUModule):
                 max(2, min(8, int(self._cfg.get("hud_lane_num_lanes", 3)))),
                 max(0, min(7, int(self._cfg.get("hud_lane_recommended", 2)))),
             ),
+            "exitview_variant": self._cfg.get("exitview_variant", "EU"),
+            "exitview_id": max(0, min(65535, int(self._cfg.get("exitview_id", 0)))),
+            "maneuver_state": self._cfg.get("maneuver_state", "CallForAction"),
         }
 
-    def configure_nav(self, *, enabled=None, distance_enabled=None, distance_m=None, street_name=None,
+    EXITVIEW_VARIANT_CODES = {"EU": 0x00, "NAR": 0x01, "ROW": 0x02, "ASIA": 0x03, "Unknown": 0xFF}
+    MANEUVER_STATE_CODES = {"init/unknown": 0x00, "Follow": 0x01, "Prepare": 0x02, "Distance": 0x03, "CallForAction": 0x04}
+
+    def configure_nav(self, *, enabled=None, distance_valid=None, distance_enabled=None, distance_m=None, street_name=None,
                       arrow_main=None, arrow_dir=None,
                       distance_graph=None, distance_unit=None,
-                      lane_guidance_enabled=None, lane_num_lanes=None, lane_recommended=None, lanes=None):
+                      lane_guidance_enabled=None, lane_num_lanes=None, lane_recommended=None, lanes=None,
+                      exitview_variant=None, exitview_id=None, maneuver_state=None):
         was_enabled = bool(self._cfg.get("hud_nav_enabled", False))
         nav_toggled = False
         if enabled is not None:
             self._cfg["hud_nav_enabled"] = bool(enabled)
             nav_toggled = True
+        if distance_valid is not None:
+            self._cfg["hud_distance_valid"] = bool(distance_valid)
         if distance_enabled is not None:
             self._cfg["hud_distance_enabled"] = bool(distance_enabled)
         if distance_m is not None:
@@ -248,6 +259,12 @@ class InfotainmentECU(ECUModule):
             if lanes is None and (lane_num_lanes is not None or lane_recommended is not None):
                 self._cfg["hud_lanes"] = self._default_lanes(num, rec)
             lane_changed = True
+        if exitview_variant is not None:
+            self._cfg["exitview_variant"] = str(exitview_variant)
+        if exitview_id is not None:
+            self._cfg["exitview_id"] = max(0, min(65535, int(exitview_id)))
+        if maneuver_state is not None:
+            self._cfg["maneuver_state"] = str(maneuver_state)
         self._sync_nav_state()
         nav_enabled = bool(self._cfg.get("hud_nav_enabled", False))
         lane_enabled = bool(self._cfg.get("hud_lane_guidance_enabled", False))
@@ -255,9 +272,12 @@ class InfotainmentECU(ECUModule):
             if (nav_toggled and not nav_enabled) or (lane_changed and not lane_enabled):
                 self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x18, [0x00, 0x00, 0x00, 0x00], atomic=True, force_long=True)
             self._send_hud_route_payloads()
-            if lane_changed or nav_toggled:
-                use_changed = (nav_toggled and nav_enabled) or (lane_changed and lane_enabled)
+        if lane_changed or nav_toggled:
+            use_changed = (nav_toggled and nav_enabled) or (lane_changed and lane_enabled)
+            if self._phase == self.PHASE_READY:
                 self._push_lane_guidance(use_changed=use_changed)
+            elif lane_changed and lane_enabled:
+                self._push_lane_guidance(use_changed=True)
         elif nav_enabled and not was_enabled and self._phase == self.PHASE_READY and self._hud_ready_for_route():
             self._log("[NAV] Navigation enabled -> start nav trigger")
             self._demo_route = True
@@ -339,14 +359,21 @@ class InfotainmentECU(ECUModule):
             main = arrow["main"]
             no_dist = self._main_element_no_distance(main)
             state["12_DistanceToNextManeuver_visible"] = not no_dist
-            state["12_DistanceToNextManeuver_m"] = max(int(arrow.get("dist_m", 0)), 0) if state["12_DistanceToNextManeuver_visible"] and distance_enabled else None
+            state["12_DistanceToNextManeuver_m"] = max(int(arrow.get("dist_m", 0)), 0) if state["12_DistanceToNextManeuver_visible"] else None
             state["13_CurrentPositionInfo"] = self._encode_text_payload(self._cfg.get("hud_street_name", "Offroad"))
             state["14_TurnToInfo_session"] = [0x00, 0x00]
-            state["15_DistanceToDestination_m"] = max(int(arrow.get("dist_m", 0)), 0) if state["12_DistanceToNextManeuver_visible"] and distance_enabled else None
+            state["15_DistanceToDestination_m"] = max(int(arrow.get("dist_m", 0)), 0) if state["12_DistanceToNextManeuver_visible"] else None
             state["17_ManeuverDescriptor"] = [main, arrow["dir"], 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
             state["_21_val"] = 0x5F if no_dist else arrow.get("dir", 0x00)
             state["25_FunctionSynchronisation"] = list(FUNC_SYNC_ACTIVE)
             state["26_InfoStates"] = 0xFF
+            variant = self.EXITVIEW_VARIANT_CODES.get(
+                self._cfg.get("exitview_variant", "EU"), 0x00
+            )
+            exit_id = max(0, min(65535, int(self._cfg.get("exitview_id", 0))))
+            state["31_Exitview"] = [variant, exit_id & 0xFF, (exit_id >> 8) & 0xFF]
+            ms = self.MANEUVER_STATE_CODES.get(self._cfg.get("maneuver_state", "CallForAction"), 0x04)
+            state["37_ManeuverState"] = [ms, 0x00, 0x00, 0x00]
             return
         state["0F_FSGOperationState"] = 0x00
         state["10_CompassInfo"] = [0x00, 0x00, 0x00]
@@ -362,6 +389,14 @@ class InfotainmentECU(ECUModule):
         state["_21_val"] = 0x5F if no_dist else arrow.get("dir", 0x00)
         state["25_FunctionSynchronisation"] = list(FUNC_SYNC_IDLE)
         state["26_InfoStates"] = 0x00
+
+        variant = self.EXITVIEW_VARIANT_CODES.get(
+            self._cfg.get("exitview_variant", "EU"), 0x00
+        )
+        exit_id = max(0, min(65535, int(self._cfg.get("exitview_id", 0))))
+        state["31_Exitview"] = [variant, exit_id & 0xFF, (exit_id >> 8) & 0xFF]
+        ms = self.MANEUVER_STATE_CODES.get(self._cfg.get("maneuver_state", "CallForAction"), 0x04)
+        state["37_ManeuverState"] = [ms, 0x00, 0x00, 0x00]
 
     def _destination_distance_payload(self):
         dist_m = self._nav_state["15_DistanceToDestination_m"]
@@ -822,26 +857,39 @@ class InfotainmentECU(ECUModule):
         return lanes
 
     def _lane_guidance_records(self, rec_addr, lanes):
-        """Build lane records for RecordAddress 0 or 2. lanes: list of dicts with direction, sidestreets_len, lane_type, marking_left, marking_right, lane_description, guidance."""
+        """Build lane records for RecordAddress 0 or 2. lanes: list of dicts with direction, sidestreets_len, sidestreets (list of bytes), lane_type, marking_left, marking_right, lane_description, guidance.
+        LaneSidestreets format (BAP-FC-NAV-SD p.72): Byte1=length, Byte2..ByteN=sidestreet bytes.
+        RecordAddress 0: LaneDirection, LaneSidestreets, LaneType, LaneMarking_left|right, LaneDescription|GuidanceInfo (no Pos per p.69)."""
         records = []
         for L in lanes:
             direction = int(L.get("direction", 0)) & 0xFF
-            sidestreets_len = int(L.get("sidestreets_len", 0)) & 0xFF
+            sidestreets = L.get("sidestreets", [])
+            if isinstance(sidestreets, (str, bytes)):
+                sidestreets = list(sidestreets) if isinstance(sidestreets, bytes) else []
+            sidestreets = [int(b) & 0xFF for b in sidestreets[:17]]
+            sidestreets_len = min(len(sidestreets), 17)
             lane_type = int(L.get("lane_type", 0)) & 0xFF
             mark_l = int(L.get("marking_left", 0)) & 0x0F
             mark_r = int(L.get("marking_right", 0)) & 0x0F
             desc = int(L.get("lane_description", 0)) & 0x0F
             guidance = int(L.get("guidance", 0)) & 0x0F
             if rec_addr == 0:
-                records.extend([direction, sidestreets_len, lane_type, (mark_l << 4) | mark_r, (desc << 4) | guidance])
+                records.extend([direction, sidestreets_len])
+                records.extend(sidestreets[:sidestreets_len])
+                records.extend([lane_type, (mark_l << 4) | mark_r, (desc << 4) | guidance])
+            elif rec_addr == 1:
+                records.extend([direction, sidestreets_len])
+                records.extend(sidestreets[:sidestreets_len])
+                records.extend([lane_type, (desc << 4) | guidance])
             else:
                 records.extend([direction, (desc << 4) | guidance])
         return records
 
-    def _lane_guidance_payload(self, asg_taid, mode_ra=0x00):
+    def _lane_guidance_payload(self, asg_taid, mode_ra=0x00, req_start=0, req_elements=0):
         """Build LaneGuidance (0x18) StatusArray. BAP-FC-NAV-SD p.66–76.
         asg_taid: 0x00 for spontaneous (no preceding GetArray); otherwise mirror from GetArray (ASG|TAID).
         mode_ra: Mode|RecordAddress from GetArray byte 1 (0x00=full record); mirror in response.
+        req_start, req_elements: from GetArray (unused; send only configured lanes).
         """
         rec_addr = mode_ra & 0x0F
         nav_on = bool(self._cfg.get("hud_nav_enabled", False))
@@ -882,12 +930,17 @@ class InfotainmentECU(ECUModule):
             # GetArray: ASG_ID|TAID, Mode|RecordAddress, Start, Elements — mirror in StatusArray
             asg_taid = payload[0]
             mode_ra = payload[1]
+            req_start = payload[2]
+            req_elements = payload[3]
             self._lane_guidance_last_asg_taid = asg_taid
-            self._log(f"[HUD] LaneGuidance GetArray ASG=0x{asg_taid >> 4:X} TAID={asg_taid & 0xF} -> {'lanes' if self._cfg.get('hud_lane_guidance_enabled') else 'off'}")
+            self._lane_guidance_last_req_elements = req_elements
+            self._log(f"[HUD] LaneGuidance GetArray ASG=0x{asg_taid >> 4:X} TAID={asg_taid & 0xF} req={req_elements} -> {'lanes' if self._cfg.get('hud_lane_guidance_enabled') else 'off'}")
         else:
             asg_taid = payload[0] if payload else self._lane_guidance_last_asg_taid
             mode_ra = 0x00
-        reply = self._lane_guidance_payload(asg_taid, mode_ra)
+            req_start = 0
+            req_elements = 0
+        reply = self._lane_guidance_payload(asg_taid, mode_ra, req_start=req_start, req_elements=req_elements)
         self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x18, reply, atomic=True, force_long=True)
 
     def _push_lane_guidance(self, use_changed=False):
@@ -947,7 +1000,10 @@ class InfotainmentECU(ECUModule):
         """DistanceToNextManeuver (0x12). BAP-FC-NAV-SD p.34–38.
         Payload: Distance(Long), Unit, BargraphOnOff, Bargraph, ValidityInformation.
         Unit: 0x00=m, 0x01=km, 0xFF=not supported. Validity bit0: 1=display, 0=invalid.
+        BargraphOnOff: 0=off, 1=on. When distance_valid=False, send FF FF to hide.
         """
+        if not bool(self._cfg.get("hud_distance_valid", True)):
+            return [0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]
         dist_m = self._nav_state["12_DistanceToNextManeuver_m"]
         if not self._nav_state["12_DistanceToNextManeuver_visible"] or dist_m is None:
             return [0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00]
@@ -957,13 +1013,16 @@ class InfotainmentECU(ECUModule):
             dist_raw = int(dist_m) * 10 // 1000  # km: 500m=0.5km → 5
         else:
             dist_raw = int(dist_m) * 10  # m: value = displayed*10, 500m → 5000
+        bargraph_enabled = bool(self._cfg.get("hud_distance_enabled", True))
         graph = int(self._cfg.get("hud_distance_graph", 0x64)) & 0xFF
+        bargraph_on = 0x01 if bargraph_enabled else 0x00
+        bargraph_pct = graph if bargraph_enabled else 0x00
         return [
             dist_raw & 0xFF,
             (dist_raw >> 8) & 0xFF,
             (dist_raw >> 16) & 0xFF,
             (dist_raw >> 24) & 0xFF,
-            unit, 0x01, graph, 0x01,
+            unit, bargraph_on, bargraph_pct, 0x01,
         ]
 
     def _send_active_visual_keepalive(self):

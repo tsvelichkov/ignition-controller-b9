@@ -109,12 +109,12 @@ MANEUVER_NAMES = {
 
 BUSMASTER_LINE_RE = re.compile(
     r"^(?P<timestamp>\d{2}:\d{2}:\d{2}:\d{3})\s+"
-    r"(?P<direction>Tx|Rx)\s+"
+    r"(?P<direction>[TtRr][xX])\s+"
     r"(?P<channel>\d+)\s+"
     r"(?P<canid>0x[0-9A-Fa-f]+)\s+"
     r"(?P<frame_type>\S+)\s+"
-    r"(?P<dlc>\d+)\s*"
-    r"(?P<data>(?:[0-9A-Fa-f]{2}\s*)*)$"
+    r"(?P<dlc>\d+)\s+"
+    r"(?P<data>(?:[0-9A-Fa-f]{2}\s*)*)\s*$"
 )
 
 
@@ -327,21 +327,26 @@ def describe_bap_message(can_id: int, opcode: int, lsg_id: int, fct_id: int, pay
         # RG_Status: RG_Status enum (BAP-FC-NAV-SD p.32)
         states = {0x00: "inactive", 0x01: "active", 0x02: "suspended", 0xFF: "n/a"}
         return f"RG_Status {states.get(payload[0], f'0x{payload[0]:02X}')}"
-    if fct_id == 0x12 and len(payload) >= 8:
-        # DistanceToNextManeuver: Distance(Long), Unit, BargraphOnOff, Bargraph, ValidityInformation (BAP-FC-NAV-SD p.34)
-        dist_raw = _payload_u32_le(payload)
-        unit = payload[4]
-        bargraph_on = payload[5]
-        bargraph_pct = payload[6]
-        validity = payload[7] if len(payload) > 7 else 0
-        dist_valid = bool(validity & 1)
-        unit_names = {0x00: "m", 0x01: "km", 0x02: "yd", 0x03: "ft", 0x04: "mi", 0x05: "1/4mi", 0xFF: "n/a"}
-        unit_str = unit_names.get(unit, f"0x{unit:02X}")
-        if not dist_valid or unit == 0xFF:
-            bargraph_str = "bargraph=off" if bargraph_on == 0 else (f"bargraph={bargraph_pct}%" if bargraph_on == 1 else "bargraph=n/a")
-            return f"DistanceToNextManeuver invalid {bargraph_str}"
-        bg_str = f" bargraph={bargraph_pct}%" if bargraph_on == 1 else " bargraph=off"
-        return f"DistanceToNextManeuver dist={dist_raw / 10:.1f}{unit_str}{bg_str}"
+    if fct_id == 0x12 and len(payload) >= 2:
+        # DistanceToNextManeuver: full Status (8B) or HeartbeatStatus (2B: distance in 0.1m, LE)
+        if len(payload) >= 8:
+            # Full Status (opcode 4) — BAP-FC-NAV-SD p.34
+            dist_raw = _payload_u32_le(payload)
+            unit = payload[4]
+            bargraph_on = payload[5]
+            bargraph_pct = payload[6]
+            validity = payload[7] if len(payload) > 7 else 0
+            dist_valid = bool(validity & 1)
+            unit_names = {0x00: "m", 0x01: "km", 0x02: "yd", 0x03: "ft", 0x04: "mi", 0x05: "1/4mi", 0xFF: "n/a"}
+            unit_str = unit_names.get(unit, f"0x{unit:02X}")
+            if not dist_valid or unit == 0xFF:
+                bargraph_str = "bargraph=off" if bargraph_on == 0 else (f"bargraph={bargraph_pct}%" if bargraph_on == 1 else "bargraph=n/a")
+                return f"DistanceToNextManeuver invalid {bargraph_str}"
+            bg_str = f" bargraph={bargraph_pct}%" if bargraph_on == 1 else " bargraph=off"
+            return f"DistanceToNextManeuver dist={dist_raw / 10:.1f}{unit_str}{bg_str}"
+        # HeartbeatStatus (2B): distance in 0.1m, little-endian
+        dist_raw = payload[0] | (payload[1] << 8)
+        return f"DistanceToNextManeuver dist={dist_raw / 10:.1f}m"
     if fct_id == 0x13 and len(payload) >= 1:
         # CurrentPositionInfo: PositionInfo string (len+UTF8) (BAP-FC-NAV-SD p.39)
         n = payload[0]
@@ -434,8 +439,62 @@ def describe_bap_message(can_id: int, opcode: int, lsg_id: int, fct_id: int, pay
             rec_addr = payload[2] & 0x0F
             start, elements = payload[3], payload[4]
             on_off_str = "on" if on_off == 0x01 else "off"
-            arr_info = f" elements={elements}" if elements else ""
-            return f"LaneGuidance ASG={asg_names.get(asg_id, asg_id)} TAID={taid} OnOff={on_off_str}{arr_info}"
+            base = f"LaneGuidance ASG={asg_names.get(asg_id, asg_id)} TAID={taid} OnOff={on_off_str} elements={elements}"
+            if elements == 0:
+                return base
+            arr = payload[5:]
+            lane_parts = []
+            if rec_addr == 0:
+                # Full: direction, sidestreets_len, [sidestreets_len bytes], lane_type, (mark_l<<4)|mark_r, (desc<<4)|guidance (BAP-FC-NAV-SD p.72)
+                pos = 0
+                for i in range(elements):
+                    if pos + 3 > len(arr):
+                        break
+                    direction, sidestreets_len = arr[pos], arr[pos + 1]
+                    pos += 2 + sidestreets_len
+                    if pos + 3 > len(arr):
+                        break
+                    lane_type = arr[pos]
+                    mark_lr = arr[pos + 1]
+                    desc_guid = arr[pos + 2]
+                    pos += 3
+                    mark_l, mark_r = (mark_lr >> 4) & 0x0F, mark_lr & 0x0F
+                    desc, guidance = (desc_guid >> 4) & 0x0F, desc_guid & 0x0F
+                    guid_str = {0: "", 1: "prefer", 2: "rec"}.get(guidance, f"g{guidance}")
+                    ss_str = f" ss={sidestreets_len}" if sidestreets_len else ""
+                    lane_parts.append(f"L{i}:dir=0x{direction:02X} type=0x{lane_type:02X} L={mark_l} R={mark_r} desc=0x{desc:X}{ss_str}{' '+guid_str if guid_str else ''}")
+            elif rec_addr == 1:
+                # No LaneMarking: direction, sidestreets_len, [sidestreets_len bytes], lane_type, (desc<<4)|guidance
+                pos = 0
+                for i in range(elements):
+                    if pos + 3 > len(arr):
+                        break
+                    direction, sidestreets_len = arr[pos], arr[pos + 1]
+                    pos += 2 + sidestreets_len
+                    if pos + 2 > len(arr):
+                        break
+                    lane_type = arr[pos]
+                    desc_guid = arr[pos + 1]
+                    pos += 2
+                    desc, guidance = (desc_guid >> 4) & 0x0F, desc_guid & 0x0F
+                    guid_str = {0: "", 1: "prefer", 2: "rec"}.get(guidance, f"g{guidance}")
+                    ss_str = f" ss={sidestreets_len}" if sidestreets_len else ""
+                    lane_parts.append(f"L{i}:dir=0x{direction:02X} type=0x{lane_type:02X} desc=0x{desc:X}{ss_str}{' '+guid_str if guid_str else ''}")
+            else:
+                # Reduced: direction, (desc<<4)|guidance
+                bytes_per_lane = 2
+                for i in range(min(elements, len(arr) // bytes_per_lane)):
+                    pos = i * bytes_per_lane
+                    if pos + bytes_per_lane > len(arr):
+                        break
+                    direction = arr[pos]
+                    desc_guid = arr[pos + 1]
+                    desc, guidance = (desc_guid >> 4) & 0x0F, desc_guid & 0x0F
+                    guid_str = {0: "", 1: "prefer", 2: "rec"}.get(guidance, f"g{guidance}")
+                    lane_parts.append(f"L{i}:dir=0x{direction:02X} desc=0x{desc:X}{' '+guid_str if guid_str else ''}")
+            if lane_parts:
+                return base + " lanes=[" + "; ".join(lane_parts) + "]"
+            return base
     if fct_id == 0x1D and payload:
         # ManeuverSupplement: HUD-specific, e.g. roundabout exit / supplement value (Word) + validity
         if len(payload) >= 3:

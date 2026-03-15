@@ -14,7 +14,7 @@ Audi MLB CAN bus emulator for testing navigation and infotainment systems. Emula
 - **Python 3.8+**
 - **python-can** — CAN bus abstraction
 - **python-can-csscan-serial** — CSS Electronics USB adapter (default interface)
-- **tkinter** — GUI (included with most Python installs)
+- **PyQt6** — Modern GUI framework
 - **CAN hardware** — Adapter to connect to the vehicle or MIB unit (see [CAN Connection](#can-connection))
 
 ## Setup

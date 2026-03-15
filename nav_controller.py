@@ -15,23 +15,61 @@ Needs:  pip install python-can
 import argparse
 import can, threading, time, importlib.util, os, sys, queue
 
+try:
+    from serial.serialutil import SerialException
+except ImportError:
+    SerialException = type("SerialException", (Exception,), {})
+
 # ── Serial throughput (csscan_serial) ─────────────────────────────────────────
 # At 115200 baud a CAN frame takes ~2–3ms → ~300–400 fps max. Queue backs up.
-# Use baudrate=921600 (8×) for ~2400+ fps. IFG prevents adapter buffer overrun.
-IFG_SECS = 0.0005   # 0.5ms min gap between sends (2000 fps max at higher baud)
-SERIAL_BAUDRATE = 115200  # 115200 if adapter unstable; 921600 if supported
+# Use baudrate=921600 (8×) for ~4000+ fps. IFG prevents adapter buffer overrun.
+IFG_SECS = 0.00025  # 0.25ms min gap between sends (~4000 fps max at higher baud)
+SERIAL_BAUDRATE = 921600  # 8× throughput; use 115200 if adapter unstable
 
 # ── CAN CONNECTION CONFIG ─────────────────────────────────────────────────────
 # Set CAN_INTERFACE to one of the options below. Config is detected at startup.
 #
-# Option 1: Auto-detect (csscan_serial) — CS-Scan serial adapter
-CAN_INTERFACE = "csscan_serial"
-CAN_AVAILABLE_CONFIGS = can.detect_available_configs(CAN_INTERFACE)
+# Multi-interface auto-detect: try csscan_serial, slcan, lawicel (COM ports), virtual
+# Set CSS_SCAN_CHANNEL to force a specific port (e.g. "COM8"); None = auto-detect
+CSS_SCAN_CHANNEL = "COM8"
 
-# Inject baudrate for csscan_serial (921600 = 8× throughput; use 115200 if unstable)
-for c in CAN_AVAILABLE_CONFIGS:
-    if c.get("interface") == "csscan_serial" and "baudrate" not in c:
-        c["baudrate"] = SERIAL_BAUDRATE
+def _detect_can_configs():
+    configs = []
+    seen = set()
+    # 1. CSS Electronics (csscan_serial)
+    css_configs = can.detect_available_configs("csscan_serial")
+    if CSS_SCAN_CHANNEL and not any(str(c.get("channel")) == str(CSS_SCAN_CHANNEL) for c in css_configs):
+        css_configs.insert(0, {"interface": "csscan_serial", "channel": CSS_SCAN_CHANNEL, "baudrate": SERIAL_BAUDRATE})
+    for c in css_configs:
+        if c.get("interface") == "csscan_serial" and "baudrate" not in c:
+            c["baudrate"] = SERIAL_BAUDRATE
+        key = (c.get("interface"), str(c.get("channel", "")))
+        if key not in seen:
+            seen.add(key)
+            configs.append(c)
+    # 2. SLCAN (python-can built-in)
+    for c in can.detect_available_configs("slcan"):
+        c.setdefault("bitrate", 500000)
+        c.setdefault("tty_baudrate", 115200)
+        key = ("slcan", str(c.get("channel", "")))
+        if key not in seen:
+            seen.add(key)
+            configs.append(c)
+    # 3. Lawicel/SLCAN on serial ports (COM3+, /dev/ttyUSB*, /dev/ttyACM*)
+    try:
+        import serial.tools.list_ports
+        for port in serial.tools.list_ports.comports():
+            ch = port.device
+            if ch not in [str(c.get("channel")) for c in configs]:
+                cfg = {"interface": "lawicel", "channel": ch, "bitrate": 500000, "tty_baudrate": 115200}
+                configs.append(cfg)
+    except Exception:
+        pass
+    # 4. Virtual (always available for testing)
+    configs.append({"interface": "virtual", "channel": None})
+    return configs
+
+CAN_AVAILABLE_CONFIGS = _detect_can_configs()
 #
 # Option 2: SocketCAN (Linux) — native kernel CAN, vcan0 for virtual
 #   CAN_INTERFACE = "socketcan"
@@ -67,17 +105,19 @@ for c in CAN_AVAILABLE_CONFIGS:
 #   CAN_INTERFACE = "gs_usb"
 #   CAN_AVAILABLE_CONFIGS = can.detect_available_configs("gs_usb")
 
-import tkinter as tk
-from tkinter import filedialog, font as tkfont, ttk
 from datetime import datetime
 
-from bap import HudBapSession, load_hud_bap_messages
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QFrame, QLabel, QPushButton, QCheckBox, QLineEdit, QPlainTextEdit, QSlider,
+    QTabWidget, QScrollArea, QTableWidget, QTableWidgetItem, QHeaderView,
+    QFileDialog, QComboBox, QSizePolicy, QSplitter, QGroupBox, QSpinBox,
+    QAbstractItemView,
+)
+from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSignal, QPoint
+from PyQt6.QtGui import QFont, QColor, QPalette, QIcon, QAction, QTextCursor, QCursor
 
-try:
-    from tksheet import Sheet
-    TKSHEET_AVAILABLE = True
-except ImportError:
-    TKSHEET_AVAILABLE = False
+from bap import HudBapSession, load_hud_bap_messages, HUD_TRACE_IDS
 
 # ── IGN CRC LUTs (0x3C0 Klemmen_Status_01) ───────────────────────────────────
 # b2=0x23: Kl_S=1, Kl_15=1, Kl_Infotainment=1  (ignition ON)
@@ -116,16 +156,18 @@ MFL_LAYOUT = [
     ("WHEEL_D", 2, 2),
 ]
 
-# ── Palette ───────────────────────────────────────────────────────────────────
+# ── Palette (dark theme) ─────────────────────────────────────────────────────
 C = {
-    "bg":     "#0e1014", "panel":  "#15171c", "border": "#252830",
-    "accent": "#d97706", "on":     "#22c55e", "off":    "#ef4444",
-    "text":   "#e2e8f0", "sub":    "#64748b",
-    "log_bg": "#0a0b0d", "log_fg": "#4ade80",
-    "btn":    "#1c1f27", "btn_hov":"#252933", "btn_act":"#d97706",
-    "ehdr":   "#191c23", "mrow":   "#111318", "mrow2":  "#13151c",
-    "flash":  "#16a34a",
+    "bg":     "#1e293b", "panel":  "#334155", "border": "#475569",
+    "accent": "#f59e0b", "on":     "#22c55e", "off":    "#ef4444",
+    "text":   "#f1f5f9", "sub":    "#94a3b8",
+    "log_bg": "#0f172a", "log_fg": "#94a3b8",
+    "btn":    "#475569", "btn_hov":"#64748b", "btn_act":"#f59e0b",
+    "ehdr":   "#334155", "mrow":   "#334155", "mrow2":  "#475569",
+    "flash":  "#22c55e", "hud_source": "#fef3c7",
 }
+INPUT_MIN_H = 28  # min height for QLineEdit, QSpinBox, QComboBox in tabs
+ICONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icons")
 
 MODULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modules")
 # 0x3C0 byte 2: 0x23 = KL15/Infotainment on, 0x00/0x21 = off
@@ -151,12 +193,7 @@ DEFAULT_APP_CONFIG = {
     "auto_open_hud": False,
 }
 
-HUD_SOURCE_IDS = {
-    0x17330400,  # HUD_BOOT
-    0x17330410,  # HUD_RX
-    0x17333200,  # HUD_GET
-    0x17333202,  # HUD_ASG
-}
+HUD_SENDER_IDS = {0x17333210, 0x17333211}  # HUD_S, HUD_D — frames sent from 5F to HUD
 
 
 def parse_args(argv=None):
@@ -190,13 +227,14 @@ def make_app_config(args):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BusManager:
-    def __init__(self, log_cb, status_cb, frame_cb=None, ign_from_bus_cb=None):
+    def __init__(self, log_cb, status_cb, frame_cb=None, ign_from_bus_cb=None, configs=None):
         self._log    = log_cb
         self._status = status_cb
         self._frame  = frame_cb or (lambda *_args, **_kwargs: None)
         self._ign_from_bus_cb = ign_from_bus_cb  # called when 0x3C0 RX updates ignition (from another device)
         self._bus    = None
         self._stop   = threading.Event()
+        self._configs = list(configs) if configs else list(CAN_AVAILABLE_CONFIGS)
         self.send_ignition_updates = True  # when False, do not send periodic 0x3C0 (another device may send it)
 
         # Shared send queues.
@@ -260,6 +298,10 @@ class BusManager:
         if self._tick_thread:
             self._tick_thread.join(timeout=2)
 
+    def set_configs(self, configs):
+        """Set CAN configs for next connection attempt (used by Reconnect)."""
+        self._configs = list(configs)
+
     def set_send_ignition_updates(self, on: bool):
         """When False, stop sending periodic 0x3C0; ignition state can still be updated from bus RX."""
         self.send_ignition_updates = bool(on)
@@ -294,7 +336,7 @@ class BusManager:
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def _run(self):
-        cfgs = CAN_AVAILABLE_CONFIGS
+        cfgs = self._configs
         if not cfgs:
             self._status("error", "No adapter found")
             return
@@ -414,36 +456,48 @@ class BusManager:
         _prio_q is checked first so MFL button presses are never delayed by
         a backlog of periodic ECU frames.
         Enforces IFG_SECS between consecutive sends to prevent adapter overrun.
+        Batches up to 8 frames per iteration to reduce loop overhead when backlogged.
         """
         last_send = 0.0
+        batch = []
+        batch_size = 8
         while not self._stop.is_set():
             # Priority queue first (non-blocking)
             try:
                 arb_id, data = self._prio_q.get_nowait()
+                batch.append((arb_id, data))
             except queue.Empty:
-                # Fall back to normal queue (blocking with timeout)
-                try:
-                    arb_id, data = self._tx_q.get(timeout=0.05)
-                except queue.Empty:
-                    continue
+                # Drain normal queue into batch (non-blocking up to batch_size)
+                for _ in range(batch_size - len(batch)):
+                    try:
+                        batch.append(self._tx_q.get_nowait())
+                    except queue.Empty:
+                        break
+                if not batch:
+                    try:
+                        arb_id, data = self._tx_q.get(timeout=0.05)
+                        batch.append((arb_id, data))
+                    except queue.Empty:
+                        continue
 
-            if self._bus:
-                # Enforce inter-frame gap so serial buffer doesn't overrun
-                now = time.monotonic()
-                elapsed = now - last_send
-                if elapsed < IFG_SECS:
-                    time.sleep(IFG_SECS - elapsed)
-                try:
-                    with self._bus_lock:
-                        self._bus.send(can.Message(
-                            arbitration_id=arb_id,
-                            data=data,
-                            is_extended_id=arb_id > 0x7FF
-                        ))
-                    self._emit_frame("tx", arb_id, data)
-                except can.CanError as e:
-                    self._log(f"TX err {hex(arb_id)}: {e}")
-                last_send = time.monotonic()
+            if self._bus and batch:
+                for arb_id, data in batch:
+                    now = time.monotonic()
+                    elapsed = now - last_send
+                    if elapsed < IFG_SECS:
+                        time.sleep(IFG_SECS - elapsed)
+                    try:
+                        with self._bus_lock:
+                            self._bus.send(can.Message(
+                                arbitration_id=arb_id,
+                                data=data,
+                                is_extended_id=arb_id > 0x7FF
+                            ))
+                        self._emit_frame("tx", arb_id, data)
+                    except (can.CanError, SerialException) as e:
+                        self._log(f"TX err {hex(arb_id)}: {e}")
+                    last_send = time.monotonic()
+                batch.clear()
 
 
 
@@ -531,55 +585,62 @@ def load_modules(log_cb=None, config=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WIDGETS
+# WIDGETS (PyQt6)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class MFLBtn(tk.Frame):
+def _load_icon(name: str) -> QIcon:
+    path = os.path.join(ICONS_DIR, f"{name}.svg")
+    if os.path.exists(path):
+        return QIcon(path)
+    return QIcon()
+
+
+class MFLBtn(QPushButton):
     def __init__(self, parent, key, cmd=None):
         b = MFL[key]
-        super().__init__(parent, bg=C["btn"], cursor="hand2",
-                         highlightbackground=C["border"], highlightthickness=1)
-        self._cmd = cmd; self._af = None; self._pressing = False
-        fi = tkfont.Font(family="Segoe UI", size=14)
-        fl = tkfont.Font(family="Segoe UI", size=7)
-        self._il = tk.Label(self, text=b["icon"], font=fi, bg=C["btn"], fg=C["accent"])
-        self._il.pack(padx=10, pady=(7, 1))
-        self._nl = tk.Label(self, text=b["label"], font=fl, bg=C["btn"], fg=C["sub"])
-        self._nl.pack(pady=(0, 7))
+        super().__init__(parent)
+        self._cmd = cmd
+        self._key = key
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFlat(True)
+        self.setCheckable(False)
+        self.setFixedHeight(56)
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background: {C["btn"]};
+                border: 1px solid {C["border"]};
+                border-radius: 6px;
+                color: {C["accent"]};
+                font-size: 18px;
+            }}
+            QPushButton:hover {{ background: {C["btn_hov"]}; }}
+            QPushButton:pressed {{ background: {C["btn_act"]}; }}
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(2)
+        icon_lbl = QLabel(b["icon"])
+        icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_lbl.setStyleSheet(f"color: {C['accent']}; font-size: 16px; background: transparent; border: none;")
+        layout.addWidget(icon_lbl)
+        lbl = QLabel(b["label"])
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet(f"color: {C['sub']}; font-size: 10px; background: transparent; border: none;")
+        layout.addWidget(lbl)
+        self._icon_lbl = icon_lbl
+        self._lbl = lbl
+        self.clicked.connect(self._on_click)
 
-        # Forward child events to the Frame so all clicks are handled here,
-        # and Enter/Leave crossing into a child label doesn't reset the colour.
-        for child in (self._il, self._nl):
-            child.bindtags((str(self),) + child.bindtags())
-
-        # Bind only on the Frame — children now forward to us via bindtags above.
-        self.bind("<Enter>",           lambda e: self._bg(C["btn_hov"]))
-        self.bind("<Leave>",           self._on_leave)
-        self.bind("<ButtonPress-1>",   lambda e: self._on_press())
-        self.bind("<ButtonRelease-1>", lambda e: self._on_release())
-
-    def _bg(self, c):
-        self.configure(bg=c); self._il.configure(bg=c); self._nl.configure(bg=c)
-
-    def _on_leave(self, e):
-        # Ignore Leave if pointer moved onto a child — only reset on true exit
-        if not self._pressing:
-            self._bg(C["btn"])
-
-    def _on_press(self):
-        self._pressing = True
-        self._bg(C["btn_act"])
-
-    def _on_release(self):
-        self._pressing = False
-        self._bg(C["btn_hov"])
+    def _on_click(self):
         if self._cmd:
             self._cmd()
 
     def flash(self):
-        if self._af: self.after_cancel(self._af)
-        self._bg(C["btn_act"])
-        self._af = self.after(160, lambda: self._bg(C["btn"]))
+        self.setStyleSheet(f"QPushButton {{ background: {C['btn_act']}; border: 1px solid {C['border']}; border-radius: 6px; }}")
+        QTimer.singleShot(160, lambda: self.setStyleSheet(f"""
+            QPushButton {{ background: {C["btn"]}; border: 1px solid {C["border"]}; border-radius: 6px; }}
+            QPushButton:hover {{ background: {C["btn_hov"]}; }}
+        """))
 
 
 def _hex(data):
@@ -589,78 +650,94 @@ def _hex(data):
     return " ".join(f"{b:02X}" for b in data[:8])
 
 
-class ECUCard(tk.Frame):
+class ECUCard(QFrame):
     def __init__(self, parent, ecu):
-        super().__init__(parent, bg=C["panel"],
-                         highlightbackground=C["border"], highlightthickness=1)
-        self._ecu = ecu; self._rows = {}
-        fh = tkfont.Font(family="Consolas", size=9, weight="bold")
-        fi = tkfont.Font(family="Consolas", size=8)
-        fd = tkfont.Font(family="Consolas", size=8)
-        fc = tkfont.Font(family="Consolas", size=7)
-
-        hdr = tk.Frame(self, bg=C["ehdr"]); hdr.pack(fill="x")
-        tk.Label(hdr, text=f" {ecu.ECU_ID}  {ecu.ECU_NAME}",
-                 font=fh, bg=C["ehdr"], fg=C["text"], anchor="w"
-                 ).pack(side="left", padx=8, pady=5)
-        self._sdot = tk.Label(hdr, text="●", font=fi, bg=C["ehdr"], fg=C["sub"])
-        self._sdot.pack(side="right", padx=8)
+        super().__init__(parent)
+        self._ecu = ecu
+        self._rows = {}
         self._enabled = True
-        self._tog = tk.Label(hdr, text="ON ", font=fi, bg=C["ehdr"], fg=C["on"],
-                             cursor="hand2")
-        self._tog.pack(side="right", padx=(0, 4))
-        self._tog.bind("<Button-1>", self._toggle)
+        self.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
+        self.setStyleSheet(f"ECUCard {{ background: {C['panel']}; border: 1px solid {C['border']}; border-radius: 6px; }}")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(4)
 
-        ch = tk.Frame(self, bg=C["panel"]); ch.pack(fill="x", padx=2, pady=(2, 0))
-        for txt, w, side in [("MSG-ID",7,"left"),("NAME",17,"left"),
-                              ("LAST DATA",22,"left"),("TX#",5,"right")]:
-            tk.Label(ch, text=txt, font=fc, bg=C["panel"], fg=C["sub"],
-                     width=w, anchor="w" if side=="left" else "e"
-                     ).pack(side=side, padx=2)
+        hdr = QWidget()
+        hdr_layout = QHBoxLayout(hdr)
+        hdr_layout.setContentsMargins(0, 0, 0, 0)
+        title = QLabel(f" {ecu.ECU_ID}  {ecu.ECU_NAME}")
+        title.setStyleSheet(f"font-weight: bold; color: {C['text']};")
+        hdr_layout.addWidget(title)
+        hdr_layout.addStretch()
+        self._sdot = QLabel("●")
+        self._sdot.setStyleSheet(f"color: {C['sub']};")
+        hdr_layout.addWidget(self._sdot)
+        self._tog = QPushButton("ON ")
+        self._tog.setFlat(True)
+        self._tog.setStyleSheet(f"color: {C['on']}; border: none; background: transparent; min-width: 0;")
+        self._tog.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tog.clicked.connect(self._toggle)
+        hdr_layout.addWidget(self._tog)
+        layout.addWidget(hdr)
 
+        grid = QGridLayout()
+        grid.addWidget(QLabel("MSG-ID"), 0, 0)
+        grid.addWidget(QLabel("NAME"), 0, 1)
+        grid.addWidget(QLabel("LAST DATA"), 0, 2)
+        grid.addWidget(QLabel("TX#"), 0, 3)
+        for col, lbl in enumerate(["MSG-ID", "NAME", "LAST DATA", "TX#"]):
+            w = grid.itemAtPosition(0, col).widget()
+            w.setStyleSheet(f"color: {C['sub']}; font-size: 11px;")
         for i, s in enumerate(ecu.get_states()):
-            bg = C["mrow"] if i % 2 == 0 else C["mrow2"]
-            row = tk.Frame(self, bg=bg); row.pack(fill="x")
-            tk.Label(row, text=f"0x{s.arb_id:X}", font=fi, bg=bg, fg=C["accent"],
-                     width=7, anchor="w").pack(side="left", padx=(6,2), pady=2)
-            tk.Label(row, text=s.name[:17], font=fi, bg=bg, fg=C["sub"],
-                     width=17, anchor="w").pack(side="left")
-            dl = tk.Label(row, text=_hex(s.current_display()), font=fd, bg=bg, fg=C["text"],
-                          width=22, anchor="w")
-            dl.pack(side="left", padx=3)
-            cl = tk.Label(row, text="0", font=fc, bg=bg, fg=C["sub"], width=5, anchor="e")
-            cl.pack(side="right", padx=6)
-            self._rows[s.arb_id] = (dl, cl, bg)
+            row = i + 1
+            grid.addWidget(QLabel(f"0x{s.arb_id:X}"), row, 0)
+            grid.addWidget(QLabel(s.name[:17]), row, 1)
+            dl = QLabel(_hex(s.current_display()))
+            cl = QLabel("0")
+            grid.addWidget(dl, row, 2)
+            grid.addWidget(cl, row, 3)
+            self._rows[s.arb_id] = (dl, cl)
+        layout.addLayout(grid)
 
     def refresh(self):
         active = False
         for s in self._ecu.get_states():
-            if s.arb_id not in self._rows: continue
-            dl, cl, bg = self._rows[s.arb_id]
-            cl.configure(text=str(s.tx_count))
-            dl.configure(text=_hex(s.current_display()))
+            if s.arb_id not in self._rows:
+                continue
+            dl, cl = self._rows[s.arb_id]
+            cl.setText(str(s.tx_count))
+            dl.setText(_hex(s.current_display()))
             if s.tx_count and (time.monotonic() - s.last_tx) < 0.25:
-                dl.configure(fg=C["on"]); active = True
+                dl.setStyleSheet(f"color: {C['on']};")
+                active = True
             else:
-                dl.configure(fg=C["text"])
-        self._sdot.configure(fg=C["flash"] if active else C["sub"])
+                dl.setStyleSheet(f"color: {C['text']};")
+        self._sdot.setStyleSheet(f"color: {C['flash'] if active else C['sub']};")
 
-    def _toggle(self, _event=None):
+    def _toggle(self):
         self._enabled = not self._enabled
         if self._enabled:
-            self._tog.configure(text="ON ", fg=C["on"])
+            self._tog.setText("ON ")
+            self._tog.setStyleSheet(f"color: {C['on']};")
             self._ecu.set_enabled(True)
         else:
-            self._tog.configure(text="OFF", fg=C["off"])
+            self._tog.setText("OFF")
+            self._tog.setStyleSheet(f"color: {C['off']};")
             self._ecu.set_enabled(False)
 
 
-def _panel(parent, title):
-    o = tk.Frame(parent, bg=C["panel"],
-                 highlightbackground=C["border"], highlightthickness=1)
-    tk.Label(o, text=title, font=tkfont.Font(family="Segoe UI", size=7),
-             bg=C["panel"], fg=C["sub"]).pack(anchor="w", padx=10, pady=(7, 2))
-    return o
+def _panel(parent, title: str) -> QGroupBox:
+    g = QGroupBox(title)
+    g.setStyleSheet(f"""
+        QGroupBox {{
+            font-size: 11px; color: {C['sub']}; background-color: {C['bg']}; border: 1px solid {C['border']};
+            border-radius: 6px; margin-top: 8px; padding-top: 8px;
+        }}
+        QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; background-color: {C['bg']}; }}
+        QGroupBox QLabel {{ color: {C['text']}; }}
+    """)
+    g.setAutoFillBackground(True)
+    return g
 
 
 def _message_to_row(message) -> list:
@@ -676,185 +753,200 @@ def _message_to_row(message) -> list:
     ]
 
 
-class BapTableWindow(tk.Toplevel):
-    COLS = ("direction", "timestamp", "canid", "opcode", "lsgid", "fctid", "data", "text")
+class _CellDetailPopup(QFrame):
+    """Floating panel showing full cell content on hover."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(4)
+        self._header = QLabel()
+        self._header.setStyleSheet(f"color: {C['accent']}; font-weight: bold; font-size: 11px;")
+        layout.addWidget(self._header)
+        self._content = QLabel()
+        self._content.setWordWrap(True)
+        self._content.setStyleSheet(f"color: {C['text']}; font-family: Consolas; font-size: 12px; max-width: 480px;")
+        self._content.setMaximumWidth(480)
+        layout.addWidget(self._content)
+        self.setStyleSheet(f"""
+            QFrame {{
+                background: {C['panel']};
+                border: 1px solid {C['border']};
+                border-radius: 6px;
+            }}
+        """)
+        self.hide()
+
+    def show_at(self, col_name: str, text: str, global_pos: QPoint):
+        if not text:
+            self.hide()
+            return
+        self._header.setText(col_name)
+        self._content.setText(text)
+        self.adjustSize()
+        # Position below cursor, offset so it doesn't cover the cell
+        x, y = global_pos.x() + 12, global_pos.y() + 16
+        screen = QApplication.primaryScreen().availableGeometry()
+        if x + self.width() > screen.right():
+            x = global_pos.x() - self.width() - 8
+        if y + self.height() > screen.bottom():
+            y = global_pos.y() - self.height() - 8
+        if x < screen.left():
+            x = screen.left()
+        if y < screen.top():
+            y = screen.top()
+        self.move(x, y)
+        self.show()
+
+
+class BapTableWindow(QWidget):
     HEADERS = ["Direction", "Timestamp", "CAN ID", "Opcode", "LSG ID", "Function", "Data", "Text"]
     WIDTHS = [70, 110, 120, 140, 150, 220, 320, 360]
 
-    def __init__(self, parent, title):
-        super().__init__(parent)
-        self.title(title)
-        self.configure(bg=C["bg"])
-        self.geometry("1320x620")
-        self.minsize(960, 360)
+    def __init__(self, parent, title: str):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle(title)
+        self.setMinimumSize(960, 360)
+        self.resize(1320, 620)
         self._messages = []
-        self._use_sheet = TKSHEET_AVAILABLE
+        self.setStyleSheet(f"background: {C['bg']};")
 
-        top = tk.Frame(self, bg=C["panel"])
-        top.pack(fill="x", padx=8, pady=(8, 4))
-        tk.Button(
-            top,
-            text="Copy Selected",
-            font=tkfont.Font(family="Segoe UI", size=8),
-            bg=C["btn"],
-            fg=C["text"],
-            activebackground=C["btn_hov"],
-            activeforeground=C["text"],
-            relief="flat",
-            bd=0,
-            cursor="hand2",
-            command=self.copy_selected_rows,
-        ).pack(side="right", padx=10, pady=6)
-        self._status = tk.Label(
-            top,
-            text="",
-            font=tkfont.Font(family="Consolas", size=8),
-            bg=C["panel"],
-            fg=C["sub"],
-            anchor="w",
-        )
-        self._status.pack(fill="x", padx=10, pady=8)
+        layout = QVBoxLayout(self)
+        top = QWidget()
+        top.setStyleSheet(f"background: {C['bg']};")
+        top_layout = QHBoxLayout(top)
+        top_layout.setContentsMargins(8, 8, 8, 4)
+        copy_btn = QPushButton("Copy Selected")
+        copy_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']};
+                border-radius: 4px; padding: 6px 12px; }}
+            QPushButton:hover {{ background: {C['btn_hov']}; }}
+        """)
+        copy_btn.clicked.connect(self.copy_selected_rows)
+        top_layout.addStretch()
+        top_layout.addWidget(copy_btn)
+        self._status = QLabel("")
+        self._status.setStyleSheet(f"color: {C['sub']}; font-family: Consolas;")
+        top_layout.insertWidget(0, self._status, 1)
+        layout.addWidget(top)
 
-        body = tk.Frame(self, bg=C["bg"])
-        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        body.rowconfigure(0, weight=1)
-        body.columnconfigure(0, weight=1)
+        self._table = QTableWidget()
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self._table.setWordWrap(True)
+        self._table.setColumnCount(len(self.HEADERS))
+        self._table.setHorizontalHeaderLabels(self.HEADERS)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        for i, w in enumerate(self.WIDTHS):
+            self._table.setColumnWidth(i, w)
+        self._table.setAlternatingRowColors(True)
+        pal = self._table.palette()
+        pal.setColor(QPalette.ColorRole.Base, QColor(C['bg']))
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor(C['bg']))
+        self._table.setPalette(pal)
+        self._table.setStyleSheet(f"""
+            QTableWidget {{ background: {C['bg']}; gridline-color: {C['border']}; }}
+            QTableWidget::item {{ padding: 4px; color: {C['text']}; }}
+            QHeaderView::section {{ background: {C['bg']}; color: {C['text']}; padding: 6px; border: none; }}
+        """)
+        self._auto_scroll = True
+        vsb = self._table.verticalScrollBar()
+        vsb.valueChanged.connect(self._on_scroll_changed)
+        layout.addWidget(self._table)
 
-        if self._use_sheet:
-            self._sheet = Sheet(
-                body,
-                headers=self.HEADERS,
-                data=[],
-                show_row_index=True,
-                height=520,
-                theme="dark",
-                table_wrap="w",
-                max_column_width=400,
-            )
-            self._sheet.enable_bindings(
-                "single_select", "drag_select", "select_all",
-                "copy", "arrowkeys", "row_select",
-            )
-            self._sheet.disable_bindings("edit_cell", "edit_header", "edit_index")
-            self._sheet.grid(row=0, column=0, sticky="nsew")
-            self.bind("<Control-c>", lambda _e: self.copy_selected_rows())
-            self.bind("<Control-C>", lambda _e: self.copy_selected_rows())
-            self._tree = None
-        else:
-            style = ttk.Style()
-            style.configure("HudBap.Treeview", rowheight=72)
-            self._tree = ttk.Treeview(body, columns=self.COLS, show="headings", style="HudBap.Treeview")
-            self._tree.grid(row=0, column=0, sticky="nsew")
-            self._tree.tag_configure("hud_source", background="#4a2f0b", foreground=C["text"])
-            self._tree.bind("<Control-c>", lambda _e: self.copy_selected_rows())
-            self._tree.bind("<Control-C>", lambda _e: self.copy_selected_rows())
-            self.bind("<Control-c>", lambda _e: self.copy_selected_rows())
-            self.bind("<Control-C>", lambda _e: self.copy_selected_rows())
-            ysb = ttk.Scrollbar(body, orient="vertical", command=self._tree.yview)
-            xsb = ttk.Scrollbar(body, orient="horizontal", command=self._tree.xview)
-            ysb.grid(row=0, column=1, sticky="ns")
-            xsb.grid(row=1, column=0, sticky="ew")
-            self._tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
-            for col, width in zip(self.COLS, self.WIDTHS):
-                self._tree.heading(col, text=dict(zip(self.COLS, self.HEADERS))[col])
-                self._tree.column(col, width=width, stretch=True)
-            self._sheet = None
+        self._cell_popup = _CellDetailPopup(self)
+        self._table.cellClicked.connect(self._on_cell_clicked)
+        copy_action = QAction(self)
+        copy_action.setShortcut("Ctrl+C")
+        copy_action.triggered.connect(self.copy_selected_rows)
+        self.addAction(copy_action)
+
+    def _on_scroll_changed(self, value: int):
+        vsb = self._table.verticalScrollBar()
+        self._auto_scroll = (value >= vsb.maximum() - 2)
+
+    def _on_cell_clicked(self, row: int, col: int):
+        item = self._table.item(row, col)
+        text = item.text() if item else ""
+        if not text:
+            self._cell_popup.hide()
+            return
+        col_name = self.HEADERS[col] if col < len(self.HEADERS) else ""
+        self._cell_popup.show_at(col_name, text, QCursor.pos())
 
     def set_status(self, text: str):
-        self._status.configure(text=text)
+        self._status.setText(text)
 
     def clear(self):
         self._messages = []
-        if self._use_sheet:
-            self._sheet.set_sheet_data([], reset_col_positions=False)
-        else:
-            for item in self._tree.get_children():
-                self._tree.delete(item)
+        self._table.setRowCount(0)
 
     def load_messages(self, messages):
         self.clear()
-        self._messages = list(messages)
-        if self._use_sheet:
-            self._refresh_sheet()
-        else:
-            for message in messages:
-                self._tree.insert(
-                    "",
-                    "end",
-                    values=_message_to_row(message),
-                    tags=("hud_source",) if message.can_id in HUD_SOURCE_IDS else (),
-                )
-        self.set_status(f"{len(messages)} decoded messages")
-
-    def _refresh_sheet(self):
-        if not self._use_sheet:
+        self._auto_scroll = True
+        msgs = list(messages)
+        self._messages = msgs
+        if not msgs:
+            self.set_status("No messages")
             return
-        self._sheet.set_sheet_data([_message_to_row(m) for m in self._messages])
-        self._sheet.set_all_cell_sizes_to_text()
-        for r, m in enumerate(self._messages):
-            if m.can_id in HUD_SOURCE_IDS:
-                for c in range(len(self.HEADERS)):
-                    self._sheet[(r, c)].bg = "#4a2f0b"
-        self._sheet.refresh()
+        self._table.setRowCount(len(msgs))
+        for row, message in enumerate(msgs):
+            row_data = _message_to_row(message)
+            for col, val in enumerate(row_data):
+                s = str(val)
+                item = QTableWidgetItem(s)
+                if message.can_id in HUD_SENDER_IDS:
+                    item.setBackground(QColor("#7f1d1d"))
+                    item.setForeground(QColor("#fecaca"))
+                self._table.setItem(row, col, item)
+        if self._auto_scroll:
+            self._table.scrollToBottom()
+        self.set_status(f"{len(msgs)} decoded messages")
+
+    def _append_row(self, message):
+        row_data = _message_to_row(message)
+        row = self._table.rowCount()
+        self._table.insertRow(row)
+        for col, val in enumerate(row_data):
+            s = str(val)
+            item = QTableWidgetItem(s)
+            if message.can_id in HUD_SENDER_IDS:
+                item.setBackground(QColor("#7f1d1d"))
+                item.setForeground(QColor("#fecaca"))
+            self._table.setItem(row, col, item)
+        if self._auto_scroll:
+            self._table.scrollToBottom()
 
     def append_message(self, message):
         self._messages.append(message)
-        row = _message_to_row(message)
-        if self._use_sheet:
-            self._refresh_sheet()
-        else:
-            self._tree.insert(
-                "",
-                "end",
-                values=row,
-                tags=("hud_source",) if message.can_id in HUD_SOURCE_IDS else (),
-            )
-        if not self._use_sheet:
-            self._tree.yview_moveto(1.0)
+        self._append_row(message)
 
     def append_messages(self, messages):
         if not messages:
             return
         self._messages.extend(messages)
-        if self._use_sheet:
-            self._refresh_sheet()
-        else:
-            for message in messages:
-                self._tree.insert(
-                    "",
-                    "end",
-                    values=_message_to_row(message),
-                    tags=("hud_source",) if message.can_id in HUD_SOURCE_IDS else (),
-                )
-            self._tree.yview_moveto(1.0)
+        for message in messages:
+            self._append_row(message)
+        if self._auto_scroll:
+            self._table.scrollToBottom()
 
     def copy_selected_rows(self):
-        if self._use_sheet:
-            boxes = self._sheet.get_all_selection_boxes()
-            if not boxes:
-                self.set_status("No rows selected")
-                return
-            lines = []
-            for (r1, c1, r2, c2) in boxes:
-                data = self._sheet[(r1, c1):(r2, c2)].data
-                for row in data:
-                    lines.append("\t".join(str(v) for v in row))
-            if not lines:
-                self.set_status("No rows selected")
-                return
-            self.clipboard_clear()
-            self.clipboard_append("\n".join(lines))
-        else:
-            items = self._tree.selection()
-            if not items:
-                self.set_status("No rows selected")
-                return
-            lines = []
-            for item in items:
-                values = self._tree.item(item, "values")
-                lines.append("\t".join(str(v) for v in values))
-            self.clipboard_clear()
-            self.clipboard_append("\n".join(lines))
+        items = self._table.selectedItems()
+        if not items:
+            self.set_status("No rows selected")
+            return
+        rows = sorted(set(item.row() for item in items))
+        lines = []
+        for r in rows:
+            row_vals = []
+            for c in range(self._table.columnCount()):
+                it = self._table.item(r, c)
+                row_vals.append(it.text() if it else "")
+            lines.append("\t".join(row_vals))
+        QApplication.clipboard().setText("\n".join(lines))
         noun = "row" if len(lines) == 1 else "rows"
         self.set_status(f"Copied {len(lines)} {noun} to clipboard")
 
@@ -863,222 +955,307 @@ class BapTableWindow(tk.Toplevel):
 # MAIN APP
 # ─────────────────────────────────────────────────────────────────────────────
 
-class App(tk.Tk):
-    REFRESH = 200
-    HUD_FRAME_REFRESH = 20
+class App(QMainWindow):
+    REFRESH = 250
+    HUD_FRAME_REFRESH = 25
+    status_updated = pyqtSignal(str, str)  # thread-safe: (state, detail)
 
     def __init__(self, config=None):
         super().__init__()
         self._cfg = dict(DEFAULT_APP_CONFIG)
         if config:
             self._cfg.update(config)
-        self.title("CAN Nav Controller"); self.configure(bg=C["bg"])
-        self.geometry("1560x920")
-        self.minsize(1320, 820); self.resizable(True, True)
-        self.protocol("WM_DELETE_WINDOW", self._close)
-        self._ign = False; self._cards = []
+        self.setWindowTitle("CAN Nav Controller")
+        self.setMinimumSize(1320, 950)
+        self.resize(1560, 1080)
+        self.setStyleSheet(f"background: {C['bg']};")
+        self._ign = False
+        self._cards = []
         self._hud_logs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "hud_bap")
         self._hud_session = HudBapSession(self._hud_logs_dir)
         self._hud_live_win = None
         self._hud_frame_q = queue.Queue()
-        self._setup_bus(); self._build(); self._start_refresh(); self._start_hud_frame_drain()
-        self.after(50, lambda: self._log(
+        self.status_updated.connect(self._setstatus)
+        self._setup_bus()   # Create manager (needed by _build for stalk/ECU lookups)
+        self._build()
+        self._mgr.start()   # Start after UI exists so status callbacks can update labels
+        self._start_refresh()
+        self._start_hud_frame_drain()
+        QTimer.singleShot(50, lambda: self._log(
             f"Startup config: ignition={'on' if self._cfg.get('start_ignition') else 'off'}"
             f" send_ignition_updates={'on' if self._cfg.get('send_ignition_updates') else 'off'}"
             f" hud_mode={self._cfg.get('hud_mode')}"
             f" verbose_bap={'on' if self._cfg.get('verbose_bap') else 'off'}"
         ))
         if self._cfg.get("auto_open_hud"):
-            self.after(200, self._open_hud_bap_window)
+            QTimer.singleShot(200, self._open_hud_bap_window)
         if self._cfg.get("start_ignition"):
-            self.after(300, self._apply_initial_ignition)
+            QTimer.singleShot(300, self._apply_initial_ignition)
+
+    def _schedule(self, fn, *args):
+        QTimer.singleShot(0, lambda: fn(*args))
 
     def _setup_bus(self):
         self._mgr = BusManager(
-            log_cb=    lambda m: self.after(0, self._log, m),
-            status_cb= lambda s, d: self.after(0, self._setstatus, s, d),
-            frame_cb=  lambda d, a, data: self._hud_frame_q.put((d, a, list(data))),
-            ign_from_bus_cb=lambda on: self.after(0, self._on_ignition_from_bus, on),
+            log_cb=    lambda m: self._schedule(self._log, m),
+            status_cb= lambda s, d: self.status_updated.emit(s, d),  # Qt signal = thread-safe
+            frame_cb=  lambda d, a, data: self._hud_frame_q.put((d, a, list(data))) if a in HUD_TRACE_IDS else None,
+            ign_from_bus_cb=lambda on: self._schedule(self._on_ignition_from_bus, on),
+            configs=CAN_AVAILABLE_CONFIGS,
         )
-        for ecu in load_modules(log_cb=lambda m: self.after(0, self._log, m), config=self._cfg):
+        for ecu in load_modules(log_cb=lambda m: self._schedule(self._log, m), config=self._cfg):
             self._mgr.register_ecu(ecu)
-        self._mgr.start()
         self._mgr.set_send_ignition_updates(bool(self._cfg.get("send_ignition_updates", True)))
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build(self):
-        self.columnconfigure(0, minsize=360, weight=0)
-        self.columnconfigure(2, weight=1)
-        self.rowconfigure(2, weight=1)
+        central = QWidget()
+        self.setCentralWidget(central)
+        main = QVBoxLayout(central)
+        main.setSpacing(0)
+        main.setContentsMargins(0, 0, 0, 0)
 
-        bar = tk.Frame(self, bg=C["panel"]); bar.grid(row=0,column=0,columnspan=3,sticky="ew")
-        bar.columnconfigure(1, weight=1)
-        tk.Label(bar, text="  ◈  CAN NAV CONTROLLER",
-                 font=tkfont.Font(family="Segoe UI",size=11,weight="bold"),
-                 bg=C["panel"], fg=C["accent"]).grid(row=0,column=0,sticky="w",pady=8)
-        self._dot = tk.Label(bar, text="●",
-                              font=tkfont.Font(family="Segoe UI",size=9),
-                              bg=C["panel"], fg=C["off"])
-        self._dot.grid(row=0, column=1, sticky="e", padx=4)
-        self._slbl = tk.Label(bar, text="DISCONNECTED",
-                               font=tkfont.Font(family="Consolas",size=8),
-                               bg=C["panel"], fg=C["sub"])
-        self._slbl.grid(row=0, column=2, sticky="e", padx=12)
-        self._qlbl = tk.Label(bar, text="Q:0",
-                               font=tkfont.Font(family="Consolas",size=8),
-                               bg=C["panel"], fg=C["sub"])
-        self._qlbl.grid(row=0, column=3, sticky="e", padx=12)
+        bar = QFrame()
+        bar.setStyleSheet(f"background: {C['panel']}; border-bottom: 1px solid {C['border']};")
+        bar.setFixedHeight(44)
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(12, 8, 12, 8)
+        title = QLabel("  CAN NAV CONTROLLER")
+        title.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {C['accent']};")
+        bar_layout.addWidget(title)
+        bar_layout.addStretch()
+        self._can_combo = QComboBox()
+        self._can_combo.setMinimumWidth(180)
+        self._can_combo.setStyleSheet(f"""
+            QComboBox {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']};
+                border-radius: 4px; padding: 4px 8px; }}
+        """)
+        for cfg in CAN_AVAILABLE_CONFIGS:
+            iface = cfg.get("interface", "?")
+            ch = cfg.get("channel")
+            ch_str = ch if ch else "(no hardware)"
+            self._can_combo.addItem(f"{iface} / {ch_str}", cfg)
+        reconnect_btn = QPushButton("Reconnect")
+        reconnect_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']};
+                border-radius: 4px; padding: 4px 10px; }}
+            QPushButton:hover {{ background: {C['btn_hov']}; }}
+        """)
+        reconnect_btn.clicked.connect(self._reconnect_can)
+        bar_layout.addWidget(QLabel("Interface:"))
+        bar_layout.addWidget(self._can_combo)
+        bar_layout.addWidget(reconnect_btn)
+        self._dot = QLabel("●")
+        self._dot.setStyleSheet(f"color: {C['off']};")
+        bar_layout.addWidget(self._dot)
+        self._slbl = QLabel("DISCONNECTED")
+        self._slbl.setStyleSheet(f"color: {C['sub']}; font-family: Consolas; font-size: 11px;")
+        bar_layout.addWidget(self._slbl)
+        self._qlbl = QLabel("Q:0")
+        self._qlbl.setStyleSheet(f"color: {C['sub']}; font-family: Consolas; font-size: 11px;")
+        bar_layout.addWidget(self._qlbl)
 
-        tk.Frame(self, bg=C["border"], height=1).grid(row=1,column=0,columnspan=3,sticky="ew")
+        content = QWidget()
+        content_layout = QHBoxLayout(content)
+        content_layout.setContentsMargins(10, 10, 10, 10)
+        content_layout.setSpacing(10)
 
-        left = tk.Frame(self, bg=C["bg"])
-        left.grid(row=2,column=0,sticky="nsew",padx=(10,5),pady=10)
-        # Ignition + MFL/stalk stay narrow; notebook (col 2) gets remaining width
-        left.columnconfigure(0, weight=0, minsize=130)
-        left.columnconfigure(1, weight=0, minsize=130)
-        left.columnconfigure(2, weight=1)
-        left.rowconfigure(0, weight=0)
-        left.rowconfigure(1, weight=0)
-        left.rowconfigure(2, weight=1, minsize=320)
-        left.rowconfigure(3, weight=0)
+        left = QWidget()
+        left.setMinimumWidth(360)
+        left_layout = QVBoxLayout(left)
+        left_layout.setSpacing(6)
         ign = self._build_ign(left)
-        ign.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, 3), pady=(0, 3))
+        left_layout.addWidget(ign)
+        ctrl_row = QWidget()
+        ctrl_layout = QHBoxLayout(ctrl_row)
+        ctrl_layout.setContentsMargins(0, 0, 0, 0)
+        ctrl_layout.setSpacing(6)
         mfl = self._build_mfl(left)
-        mfl.grid(row=1, column=0, sticky="nsew", padx=(0, 3), pady=3)
         stalk = self._build_stalk(left)
-        stalk.grid(row=1, column=1, sticky="nsew", padx=3, pady=3)
-        # Tabs in place of former nav panel (col 2): NAV HUD = nav controls + HUD BAP, VZE = traffic signs
-        self._left_notebook = ttk.Notebook(left)
-        self._left_notebook.grid(row=0, column=2, rowspan=3, sticky="nsew", padx=(3, 0), pady=(0, 6))
-        tab_nav = tk.Frame(self._left_notebook, bg=C["bg"])
-        tab_vze = tk.Frame(self._left_notebook, bg=C["bg"])
-        self._left_notebook.add(tab_nav, text="NAV HUD")
-        self._left_notebook.add(tab_vze, text="VZE")
-        tab_nav.columnconfigure(0, weight=1)
-        tab_nav.rowconfigure(1, weight=1)
-        self._build_nav_controls(tab_nav).grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
-        self._build_hud_bap(tab_nav).grid(row=1, column=0, sticky="nsew", padx=4, pady=2)
-        self._build_vze_tab(tab_vze).pack(fill="both", expand=True)
-        self._build_log(left).grid(row=3, column=0, columnspan=3, sticky="nsew")
+        ctrl_layout.addWidget(mfl)
+        ctrl_layout.addWidget(stalk)
+        left_layout.addWidget(ctrl_row)
+        self._left_notebook = QTabWidget()
+        self._left_notebook.setMinimumHeight(420)
+        # NAV HUD tab — scrollable
+        tab_nav = QWidget()
+        tab_nav_layout = QVBoxLayout(tab_nav)
+        tab_nav_layout.setContentsMargins(4, 4, 4, 4)
+        nav_scroll = QScrollArea()
+        nav_scroll.setWidgetResizable(True)
+        nav_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        nav_scroll.setStyleSheet(f"QScrollArea {{ background: {C['bg']}; border: none; }}")
+        nav_content = QWidget()
+        nav_content.setStyleSheet(f"background: {C['bg']};")
+        nav_content_layout = QVBoxLayout(nav_content)
+        nav_content_layout.setContentsMargins(0, 0, 0, 0)
+        nav_scroll_part, nav_apply_btn = self._build_nav_controls(tab_nav)
+        nav_hud_part, nav_open_live_btn, nav_load_log_btn = self._build_hud_bap(tab_nav)
+        nav_content_layout.addWidget(nav_scroll_part)
+        nav_content_layout.addWidget(nav_hud_part)
+        nav_content_layout.addStretch()
+        nav_scroll.setWidget(nav_content)
+        tab_nav_layout.addWidget(nav_scroll, 1)
+        nav_footer = QWidget()
+        nav_footer.setStyleSheet(f"background: {C['bg']};")
+        nav_footer_layout = QHBoxLayout(nav_footer)
+        nav_footer_layout.setContentsMargins(0, 8, 0, 0)
+        nav_footer_layout.addWidget(nav_apply_btn)
+        nav_footer_layout.addWidget(nav_open_live_btn)
+        nav_footer_layout.addWidget(nav_load_log_btn)
+        nav_footer_layout.addStretch()
+        tab_nav_layout.addWidget(nav_footer)
+        self._left_notebook.addTab(tab_nav, "NAV HUD")
+        # VZE tab — scrollable
+        tab_vze = QWidget()
+        tab_vze_layout = QVBoxLayout(tab_vze)
+        tab_vze_layout.setContentsMargins(4, 4, 4, 4)
+        vze_scroll = QScrollArea()
+        vze_scroll.setWidgetResizable(True)
+        vze_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        vze_scroll.setStyleSheet(f"QScrollArea {{ background: {C['bg']}; border: none; }}")
+        vze_content = QWidget()
+        vze_content.setStyleSheet(f"background: {C['bg']};")
+        vze_content_layout = QVBoxLayout(vze_content)
+        vze_content_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_part, footer_part = self._build_vze_tab(tab_vze)
+        vze_content_layout.addWidget(scroll_part)
+        vze_scroll.setWidget(vze_content)
+        tab_vze_layout.addWidget(vze_scroll, 1)
+        tab_vze_layout.addWidget(footer_part)
+        self._left_notebook.addTab(tab_vze, "VZE")
+        left_layout.addWidget(self._left_notebook, 1)
+        content_layout.addWidget(left)
 
-        tk.Frame(self, bg=C["border"], width=1).grid(row=2,column=1,sticky="ns")
+        splitter = QFrame()
+        splitter.setFrameShape(QFrame.Shape.VLine)
+        splitter.setStyleSheet(f"background: {C['border']}; max-width: 1px;")
+        content_layout.addWidget(splitter)
 
-        right = tk.Frame(self, bg=C["bg"])
-        right.grid(row=2,column=2,sticky="nsew",padx=(5,10),pady=10)
-        right.columnconfigure(0,weight=1); right.rowconfigure(1,weight=1)
-        tk.Label(right, text="ATTACHED ECUs",
-                 font=tkfont.Font(family="Segoe UI",size=8),
-                 bg=C["bg"], fg=C["sub"]).grid(row=0,column=0,sticky="w",pady=(0,4))
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        ecu_lbl = QLabel("ATTACHED ECUs")
+        ecu_lbl.setStyleSheet(f"color: {C['sub']}; font-size: 11px;")
+        right_layout.addWidget(ecu_lbl)
+        self._ecu_scroll = QScrollArea()
+        self._ecu_scroll.setWidgetResizable(True)
+        self._ecu_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._ecu_scroll.setStyleSheet(f"background: {C['bg']}; border: none;")
+        self._ecu_frame = QWidget()
+        self._ecu_frame.setStyleSheet(f"background: {C['bg']};")
+        self._ecu_frame_layout = QVBoxLayout(self._ecu_frame)
+        self._ecu_frame_layout.setContentsMargins(0, 0, 0, 0)
+        self._ecu_frame_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self._ecu_scroll.setWidget(self._ecu_frame)
+        right_layout.addWidget(self._ecu_scroll, 1)
+        right_layout.addWidget(self._build_log(right))
+        content_layout.addWidget(right, 1)
 
-        cvs = tk.Canvas(right, bg=C["bg"], highlightthickness=0)
-        cvs.grid(row=1,column=0,sticky="nsew")
-        sb = tk.Scrollbar(right, orient="vertical", command=cvs.yview,
-                           bg=C["panel"], troughcolor=C["bg"], width=8)
-        sb.grid(row=1,column=1,sticky="ns")
-        cvs.configure(yscrollcommand=sb.set)
-        self._ecu_frame = tk.Frame(cvs, bg=C["bg"])
-        win = cvs.create_window((0,0), window=self._ecu_frame, anchor="nw")
-        cvs.bind("<Configure>", lambda e: cvs.itemconfig(win, width=e.width))
-        self._ecu_frame.bind("<Configure>", lambda e: cvs.configure(scrollregion=cvs.bbox("all")))
-        cvs.bind_all("<MouseWheel>", lambda e: cvs.yview_scroll(int(-e.delta/120), "units"))
+        main.addWidget(bar)
+        main.addWidget(content, 1)
 
         self._build_ecu_cards()
 
     def _build_ign(self, parent):
         pnl = _panel(parent, "IGNITION")
-        self._ign_btn = tk.Button(pnl, text="OFF",
-            font=tkfont.Font(family="Segoe UI",size=14,weight="bold"),
-            width=9, bg=C["btn"], fg=C["off"], activebackground=C["btn_hov"],
-            activeforeground=C["text"], relief="flat", bd=0, cursor="hand2",
-            command=self._toggle_ign)
-        self._ign_btn.pack(padx=20, pady=(8,4))
-        self._ign_hint = tk.Label(pnl, text="Click to enable ignition",
-            font=tkfont.Font(family="Segoe UI",size=8), bg=C["panel"], fg=C["sub"])
-        self._ign_hint.pack(pady=(0,2))
-        self._send_ign_var = tk.BooleanVar(value=bool(self._cfg.get("send_ignition_updates", True)))
-        def _on_send_ign_toggle():
-            on = bool(self._send_ign_var.get())
-            self._cfg["send_ignition_updates"] = on
-            if hasattr(self, "_mgr") and self._mgr:
-                self._mgr.set_send_ignition_updates(on)
-        tk.Checkbutton(
-            pnl, text="Send ignition updates (0x3C0)",
-            variable=self._send_ign_var,
-            command=_on_send_ign_toggle,
-            bg=C["panel"], fg=C["text"], activebackground=C["panel"], activeforeground=C["text"],
-            selectcolor=C["panel"], highlightthickness=0,
-            font=tkfont.Font(family="Segoe UI", size=8),
-        ).pack(pady=(0, 6))
+        layout = QVBoxLayout(pnl)
+        layout.setContentsMargins(10, 12, 10, 10)
+        self._ign_btn = QPushButton("OFF")
+        self._ign_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C['btn']}; color: {C['off']}; font-weight: bold; font-size: 14px;
+                border: 1px solid {C['border']}; border-radius: 6px; padding: 10px 24px; }}
+            QPushButton:hover {{ background: {C['btn_hov']}; }}
+        """)
+        self._ign_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._ign_btn.clicked.connect(self._toggle_ign)
+        layout.addWidget(self._ign_btn)
+        self._ign_hint = QLabel("Click to enable ignition")
+        self._ign_hint.setStyleSheet(f"color: {C['sub']}; font-size: 11px;")
+        layout.addWidget(self._ign_hint)
+        self._send_ign_cb = QCheckBox("Send ignition updates (0x3C0)")
+        self._send_ign_cb.setChecked(bool(self._cfg.get("send_ignition_updates", True)))
+        self._send_ign_cb.setStyleSheet(f"color: {C['text']};")
+        self._send_ign_cb.stateChanged.connect(lambda s: self._on_send_ign_toggle())
+        layout.addWidget(self._send_ign_cb)
         self._inds = {}
-        for name, tag in [("0x3C0  Ignition","[CORE]"),("0x6B2  Diagnose","[19]"),
-                           ("0x331  MFL hb","[5F]"),("NM     Keepalive","[5F]")]:
-            r = tk.Frame(pnl, bg=C["panel"]); r.pack(fill="x", padx=8, pady=1)
-            d = tk.Label(r, text="●", font=tkfont.Font(family="Consolas",size=8),
-                         bg=C["panel"], fg=C["border"])
-            d.pack(side="left")
-            tk.Label(r, text=f" {name}", font=tkfont.Font(family="Consolas",size=8),
-                     bg=C["panel"], fg=C["sub"]).pack(side="left")
-            tk.Label(r, text=tag, font=tkfont.Font(family="Consolas",size=7),
-                     bg=C["panel"], fg=C["border"]).pack(side="right")
-            self._inds[name] = d
-        tk.Frame(pnl, bg=C["panel"], height=6).pack()
         return pnl
 
-    def _build_controls(self, parent):
-        row = tk.Frame(parent, bg=C["bg"])
-        row.pack(fill="x", pady=(0,6))
-        row.columnconfigure(0, weight=1, uniform="ctrl")
-        row.columnconfigure(1, weight=1, uniform="ctrl")
-        row.columnconfigure(2, weight=1, uniform="ctrl")
-        self._build_mfl(row).grid(row=0, column=0, sticky="nsew", padx=(0,3))
-        self._build_stalk(row).grid(row=0, column=1, sticky="nsew", padx=3)
-        self._build_nav_controls(row).grid(row=0, column=2, sticky="nsew", padx=(3,0))
+    def _on_send_ign_toggle(self):
+        on = self._send_ign_cb.isChecked()
+        self._cfg["send_ignition_updates"] = on
+        if hasattr(self, "_mgr") and self._mgr:
+            self._mgr.set_send_ignition_updates(on)
+
+    def _reconnect_can(self):
+        idx = self._can_combo.currentIndex()
+        cfg = self._can_combo.itemData(idx)
+        if not cfg:
+            return
+        self._log("Reconnecting with selected interface...")
+        self._mgr.set_configs([cfg])
+        self._mgr.stop()
+        self._mgr.start()
 
     def _build_mfl(self, parent):
         pnl = _panel(parent, "MFL  (0x5BF)")
-        g = tk.Frame(pnl, bg=C["panel"]); g.pack(fill="x", padx=12, pady=(8,12))
-        for c in range(3): g.columnconfigure(c, weight=1, minsize=78)
+        layout = QVBoxLayout(pnl)
+        g = QWidget()
+        g_layout = QGridLayout(g)
+        g_layout.setSpacing(6)
         self._btns = {}
         for key, row, col in MFL_LAYOUT:
             b = MFLBtn(g, key, cmd=lambda k=key: self._mfl(k))
-            b.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
+            g_layout.addWidget(b, row, col)
             self._btns[key] = b
+        layout.addWidget(g)
         return pnl
 
     def _build_stalk(self, parent):
         pnl = _panel(parent, "STALK / BLINKERS  (16)")
+        layout = QVBoxLayout(pnl)
         BTNS = [
             ("blink_left",  "blink_left",  "<",  "LEFT"),
             ("blink_off",   "blink_off",   "X",  "OFF"),
             ("blink_right", "blink_right", ">",  "RIGHT"),
         ]
-        g = tk.Frame(pnl, bg=C["panel"]); g.pack(padx=10, pady=(8,4), fill="x")
-        for c in range(3): g.columnconfigure(c, weight=1, minsize=64)
+        g = QWidget()
+        g_layout = QHBoxLayout(g)
+        g_layout.setSpacing(4)
         self._stalk_btns = {}
-        fi = tkfont.Font(family="Segoe UI", size=11)
-        fl = tkfont.Font(family="Segoe UI", size=6)
-        for col, (key, cmd, icon, lbl) in enumerate(BTNS):
-            frm = tk.Frame(g, bg=C["btn"], cursor="hand2",
-                           highlightbackground=C["border"], highlightthickness=1)
-            frm.grid(row=0, column=col, padx=2, pady=2, sticky="nsew")
-            il = tk.Label(frm, text=icon, font=fi, bg=C["btn"], fg=C["accent"])
-            il.pack(padx=6, pady=(5,1))
-            nl = tk.Label(frm, text=lbl, font=fl, bg=C["btn"], fg=C["sub"])
-            nl.pack(pady=(0,5))
-            self._stalk_btns[key] = (frm, il, nl)
-            for w in (frm, il, nl):
-                w.bind("<ButtonPress-1>",   lambda e,b=(frm,il,nl):      self._stalk_press(b))
-                w.bind("<ButtonRelease-1>", lambda e,b=(frm,il,nl),c=cmd: self._stalk_release(b,c))
-                w.bind("<Enter>",  lambda e,b=(frm,il,nl): self._stalk_bg(b, C["btn_hov"]))
-                w.bind("<Leave>",  lambda e,b=(frm,il,nl): self._stalk_bg(b, C["btn"]))
+        for key, cmd, icon, lbl in BTNS:
+            btn = QPushButton(f"{icon}\n{lbl}")
+            btn.setStyleSheet(f"""
+                QPushButton {{ background: {C['btn']}; color: {C['accent']}; border: 1px solid {C['border']};
+                    border-radius: 6px; padding: 8px; font-size: 11px; }}
+                QPushButton:hover {{ background: {C['btn_hov']}; }}
+                QPushButton:pressed {{ background: {C['btn_act']}; }}
+            """)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFixedHeight(48)
+            btn.clicked.connect(lambda checked, c=cmd: self._stalk_click(c))
+            g_layout.addWidget(btn)
+            self._stalk_btns[key] = (btn, cmd)
+        layout.addWidget(g)
         self._stalk_enabled = False
         self._update_stalk_buttons()
         return pnl
 
+    def _stalk_click(self, cmd):
+        if not self._stalk_enabled:
+            return
+        ecu = self._find_stalk_ecu()
+        if ecu:
+            ecu.send_command(cmd)
+            self._log("Stalk -> " + cmd)
+        else:
+            self._log("Stalk: module 16 not attached")
+
     def _nav_settings(self):
         settings = {
             "enabled": bool(self._cfg.get("hud_nav_enabled", False)),
+            "distance_valid": bool(self._cfg.get("hud_distance_valid", True)),
             "distance_enabled": bool(self._cfg.get("hud_distance_enabled", True)),
             "distance_m": max(0, int(self._cfg.get("hud_distance_m", 500))),
             "distance_graph": int(self._cfg.get("hud_distance_graph", 0x64)) & 0xFF,
@@ -1089,27 +1266,42 @@ class App(tk.Tk):
             "lane_guidance_enabled": bool(self._cfg.get("hud_lane_guidance_enabled", False)),
             "lane_num_lanes": max(2, min(8, int(self._cfg.get("hud_lane_num_lanes", 3)))),
             "lane_recommended": max(0, min(7, int(self._cfg.get("hud_lane_recommended", 2)))),
+            "exitview_variant": self._cfg.get("exitview_variant", "EU"),
+            "exitview_id": max(0, min(65535, int(self._cfg.get("exitview_id", 0)))),
+            "maneuver_state": self._cfg.get("maneuver_state", "CallForAction"),
         }
         ecu = self._find_infotainment_ecu()
         if ecu is not None and hasattr(ecu, "get_nav_settings"):
             settings.update(ecu.get_nav_settings())
         return settings
 
+    def _parse_sidestreets(self, s):
+        """Parse hex bytes from string like '40 80' or '40' -> [0x40, 0x80]. Max 17 bytes."""
+        out = []
+        for part in (s or "").split():
+            try:
+                out.append(int(part.strip(), 16) & 0xFF)
+            except ValueError:
+                pass
+        return out[:17]
+
     def _current_lanes_from_vars(self):
         """Build list of lane dicts from current _nav_lane_vars (for passing to _rebuild_lane_rows)."""
         lanes = []
         for v in self._nav_lane_vars:
             try:
-                direction = int(v["direction"].get().strip() or "0", 16) & 0xFF
-                lane_type = int(v["lane_type"].get().strip() or "1", 16) & 0xFF
-                mark_l = int(v["mark_l"].get().strip() or "0") & 0x0F
-                mark_r = int(v["mark_r"].get().strip() or "0") & 0x0F
-                lane_desc = int(v["lane_desc"].get().strip() or "0", 16) & 0x0F
-                guidance = 0x02 if v["preferred"].get() else 0x00
+                direction = int((v["direction"].text() or "0").strip(), 16) & 0xFF
+                lane_type = int((v["lane_type"].text() or "1").strip(), 16) & 0xFF
+                mark_l = int((v["mark_l"].text() or "0").strip()) & 0x0F
+                mark_r = int((v["mark_r"].text() or "0").strip()) & 0x0F
+                lane_desc = int((v["lane_desc"].text() or "0").strip(), 16) & 0x0F
+                guidance = 0x02 if v["preferred"].isChecked() else 0x00
+                sidestreets = self._parse_sidestreets(v.get("sidestr") and v["sidestr"].text())
             except ValueError:
                 direction, lane_type, mark_l, mark_r, lane_desc, guidance = 0, 1, 0, 0, 0, 0
+                sidestreets = []
             lanes.append({
-                "direction": direction, "sidestreets_len": 0, "lane_type": lane_type,
+                "direction": direction, "sidestreets": sidestreets, "lane_type": lane_type,
                 "marking_left": mark_l, "marking_right": mark_r,
                 "lane_description": lane_desc, "guidance": guidance,
             })
@@ -1117,23 +1309,35 @@ class App(tk.Tk):
 
     def _rebuild_lane_rows(self, initial_lanes=None):
         """Rebuild lane rows in _nav_lane_rows_frame from _nav_lane_num_var; optionally seed from initial_lanes."""
-        for w in self._nav_lane_rows_frame.winfo_children():
-            w.destroy()
+        while self._nav_lane_rows_layout.count():
+            item = self._nav_lane_rows_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
         self._nav_lane_vars.clear()
         try:
-            n = max(2, min(8, int(self._nav_lane_num_var.get().strip() or "3")))
-        except ValueError:
+            n = max(2, min(8, self._nav_lane_spin.value()))
+        except (ValueError, AttributeError):
             n = 3
-        self._nav_lane_num_var.set(str(n))
-        small = tkfont.Font(family="Segoe UI", size=7)
-        entry_font = tkfont.Font(family="Consolas", size=8)
-        # Header
-        tk.Label(self._nav_lane_rows_frame, text="Preferred", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=0, padx=(0, 4), pady=(0, 2))
-        tk.Label(self._nav_lane_rows_frame, text="Dir", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=1, padx=(0, 4))
-        tk.Label(self._nav_lane_rows_frame, text="Type", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=2, padx=(0, 4))
-        tk.Label(self._nav_lane_rows_frame, text="ML", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=3, padx=(0, 4))
-        tk.Label(self._nav_lane_rows_frame, text="MR", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=4, padx=(0, 4))
-        tk.Label(self._nav_lane_rows_frame, text="Desc", bg=C["panel"], fg=C["sub"], font=small).grid(row=0, column=5, padx=(0, 4))
+        if hasattr(self, "_nav_lane_spin"):
+            self._nav_lane_spin.setValue(n)
+        entry_style = f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;"
+        header_style = f"color: {C['sub']}; font-size: 10px;"
+        header_row = QWidget()
+        header_layout = QHBoxLayout(header_row)
+        header_layout.setContentsMargins(0, 0, 0, 4)
+        rec_lbl = QLabel("Rec")
+        rec_lbl.setStyleSheet(header_style)
+        rec_lbl.setFixedWidth(24)
+        header_layout.addWidget(rec_lbl)
+        for lbl, w in [("Dir", 32), ("Sidestr", 56), ("Type", 32), ("L", 24), ("R", 24), ("Desc", 24)]:
+            h = QLabel(lbl)
+            h.setStyleSheet(header_style)
+            h.setFixedWidth(w)
+            if lbl in ("L", "R"):
+                h.setToolTip("0=no line, 1=solid, 2=dashed (LaneMarking per BAP)")
+            header_layout.addWidget(h)
+        header_layout.addStretch()
+        self._nav_lane_rows_layout.addWidget(header_row)
         preferred_set = False
         if initial_lanes:
             for L in initial_lanes:
@@ -1148,132 +1352,185 @@ class App(tk.Tk):
                 mark_l = str(int(L.get("marking_left", 0)) & 0x0F)
                 mark_r = str(int(L.get("marking_right", 0)) & 0x0F)
                 lane_desc = f"{int(L.get('lane_description', 0)) & 0x0F:X}"
+                ss = L.get("sidestreets", [])
+                sidestr = " ".join(f"{b:02X}" for b in ss) if ss else ""
                 preferred = int(L.get("guidance", 0)) == 0x02
                 if preferred:
                     preferred_set = True
             else:
-                direction = "00"
-                lane_type = "01"
-                mark_l = "0"
-                mark_r = "0"
-                lane_desc = "0"
+                direction, lane_type, mark_l, mark_r, lane_desc, sidestr = "00", "01", "0", "0", "0", ""
                 preferred = not preferred_set and (i == n - 1 or i == n // 2)
                 if preferred:
                     preferred_set = True
-            var_pref = tk.BooleanVar(value=preferred)
-            var_dir = tk.StringVar(value=direction)
-            var_type = tk.StringVar(value=lane_type)
-            var_ml = tk.StringVar(value=mark_l)
-            var_mr = tk.StringVar(value=mark_r)
-            var_desc = tk.StringVar(value=lane_desc)
-            row = i + 1
-            tk.Checkbutton(
-                self._nav_lane_rows_frame, variable=var_pref,
-                bg=C["panel"], fg=C["text"], activebackground=C["panel"], activeforeground=C["text"],
-                selectcolor=C["panel"], highlightthickness=0, font=small,
-            ).grid(row=row, column=0, padx=(0, 4), pady=1)
-            def _entry(parent, var, w=2):
-                return tk.Entry(parent, textvariable=var, width=w, font=entry_font, bg=C["bg"], fg=C["text"], insertbackground=C["text"], relief="flat")
-            _entry(self._nav_lane_rows_frame, var_dir, 2).grid(row=row, column=1, padx=(0, 4), pady=1)
-            _entry(self._nav_lane_rows_frame, var_type, 2).grid(row=row, column=2, padx=(0, 4), pady=1)
-            _entry(self._nav_lane_rows_frame, var_ml, 1).grid(row=row, column=3, padx=(0, 4), pady=1)
-            _entry(self._nav_lane_rows_frame, var_mr, 1).grid(row=row, column=4, padx=(0, 4), pady=1)
-            _entry(self._nav_lane_rows_frame, var_desc, 1).grid(row=row, column=5, padx=(0, 4), pady=1)
+            row_w = QWidget()
+            row_layout = QHBoxLayout(row_w)
+            row_layout.setContentsMargins(0, 2, 0, 2)
+            pref_cb = QCheckBox()
+            pref_cb.setChecked(preferred)
+            pref_cb.setStyleSheet(f"color: {C['text']};")
+            row_layout.addWidget(pref_cb)
+            le_dir = QLineEdit(direction)
+            le_sidestr = QLineEdit(sidestr)
+            le_type = QLineEdit(lane_type)
+            le_ml = QLineEdit(mark_l)
+            le_mr = QLineEdit(mark_r)
+            le_ml.setPlaceholderText("0-2")
+            le_mr.setPlaceholderText("0-2")
+            le_desc = QLineEdit(lane_desc)
+            le_sidestr.setPlaceholderText("40 80")
+            for le, w in [(le_dir, 32), (le_sidestr, 56), (le_type, 32), (le_ml, 24), (le_mr, 24), (le_desc, 24)]:
+                le.setMaxLength(64 if le is le_sidestr else 4)
+                le.setFixedWidth(w)
+                le.setStyleSheet(entry_style)
+                row_layout.addWidget(le)
+            row_layout.addStretch()
+            self._nav_lane_rows_layout.addWidget(row_w)
             self._nav_lane_vars.append({
-                "direction": var_dir, "lane_type": var_type, "mark_l": var_ml, "mark_r": var_mr,
-                "lane_desc": var_desc, "preferred": var_pref,
+                "direction": le_dir, "sidestr": le_sidestr, "lane_type": le_type, "mark_l": le_ml, "mark_r": le_mr,
+                "lane_desc": le_desc, "preferred": pref_cb,
             })
         if not preferred_set and self._nav_lane_vars:
-            self._nav_lane_vars[0]["preferred"].set(True)
+            self._nav_lane_vars[0]["preferred"].setChecked(True)
 
     def _build_nav_controls(self, parent):
-        pnl = _panel(parent, "NAV HUD  (5F)")
+        pnl = QWidget(parent)
+        pnl.setStyleSheet(f"background: {C['bg']};")
         settings = self._nav_settings()
-        body = tk.Frame(pnl, bg=C["panel"])
-        body.pack(fill="x", padx=10, pady=(8, 10))
+        layout = QVBoxLayout(pnl)
+        layout.setContentsMargins(10, 12, 10, 10)
 
-        self._nav_enabled_var = tk.BooleanVar(value=bool(settings["enabled"]))
-        self._nav_distance_enabled_var = tk.BooleanVar(value=bool(settings["distance_enabled"]))
-        self._nav_lane_guidance_var = tk.BooleanVar(value=bool(settings["lane_guidance_enabled"]))
-        self._nav_distance_var = tk.StringVar(value=str(settings["distance_m"]))
-        self._nav_distance_graph_var = tk.IntVar(value=min(100, max(0, int(settings['distance_graph']) & 0xFF)))
-        self._nav_distance_unit_var = tk.StringVar(value=str(settings.get("distance_unit", "m")))
-        self._nav_street_var = tk.StringVar(value=str(settings["street_name"]))
-        self._nav_arrow_main_var = tk.StringVar(value=f"{int(settings.get('arrow_main') or 0) & 0xFF:02X}")
-        self._nav_arrow_dir_var = tk.StringVar(value=f"{int(settings.get('arrow_dir') or 0) & 0xFF:02X}")
-        self._nav_lane_num_var = tk.StringVar(value=str(settings["lane_num_lanes"]))
-        self._nav_lane_vars = []  # list of {direction, lane_type, mark_l, mark_r, lane_desc, preferred} per lane
-        tk.Checkbutton(
-            body,
-            text="Navigation enabled",
-            variable=self._nav_enabled_var,
-            bg=C["panel"],
-            fg=C["text"],
-            activebackground=C["panel"],
-            activeforeground=C["text"],
-            selectcolor=C["panel"],
-            highlightthickness=0,
-            font=tkfont.Font(family="Segoe UI", size=8),
-        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 2))
-        tk.Checkbutton(
-            body,
-            text="Distance visible",
-            variable=self._nav_distance_enabled_var,
-            bg=C["panel"],
-            fg=C["text"],
-            activebackground=C["panel"],
-            activeforeground=C["text"],
-            selectcolor=C["panel"],
-            highlightthickness=0,
-            font=tkfont.Font(family="Segoe UI", size=8),
-        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 2))
-        tk.Checkbutton(
-            body,
-            text="Lane guidance",
-            variable=self._nav_lane_guidance_var,
-            bg=C["panel"],
-            fg=C["text"],
-            activebackground=C["panel"],
-            activeforeground=C["text"],
-            selectcolor=C["panel"],
-            highlightthickness=0,
-            font=tkfont.Font(family="Segoe UI", size=8),
-        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(0, 2))
-        lane_top = tk.Frame(body, bg=C["panel"])
-        lane_top.grid(row=3, column=0, columnspan=5, sticky="w", pady=(0, 4))
-        tk.Label(lane_top, text="Lanes:", font=tkfont.Font(family="Segoe UI", size=7),
-                 bg=C["panel"], fg=C["sub"]).pack(side="left", padx=(0, 4))
-        lane_num_label = tk.Label(lane_top, textvariable=self._nav_lane_num_var, width=2,
-                 font=tkfont.Font(family="Consolas", size=9), bg=C["panel"], fg=C["text"])
-        lane_num_label.pack(side="left", padx=(0, 4))
-        def _lane_minus():
+        self._nav_enabled_cb = QCheckBox("Navigation enabled")
+        self._nav_enabled_cb.setChecked(bool(settings["enabled"]))
+        self._nav_enabled_cb.setStyleSheet(f"color: {C['text']};")
+        layout.addWidget(self._nav_enabled_cb)
+
+        dist_grp = _panel(pnl, "Distance")
+        dist_layout = QVBoxLayout(dist_grp)
+        self._nav_distance_valid_cb = QCheckBox("Distance valid")
+        self._nav_distance_valid_cb.setChecked(bool(settings.get("distance_valid", True)))
+        self._nav_distance_valid_cb.setStyleSheet(f"color: {C['text']};")
+        dist_layout.addWidget(self._nav_distance_valid_cb)
+        dist_row = QWidget()
+        dist_row_layout = QHBoxLayout(dist_row)
+        dist_row_layout.setContentsMargins(0, 4, 0, 4)
+        unit = str(settings.get("distance_unit", "m")).lower()
+        dist_m = int(settings.get("distance_m", 0))
+        dist_display = dist_m // 1000 if unit == "km" else dist_m
+        self._nav_distance_var = QLineEdit(str(dist_display))
+        self._nav_distance_unit_combo = QComboBox()
+        self._nav_distance_unit_combo.addItems(["m", "km"])
+        idx = self._nav_distance_unit_combo.findText("km" if unit == "km" else "m")
+        if idx >= 0:
+            self._nav_distance_unit_combo.setCurrentIndex(idx)
+        _input_style = f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;"
+        self._nav_distance_var.setMinimumHeight(INPUT_MIN_H)
+        self._nav_distance_var.setStyleSheet(_input_style)
+        self._nav_distance_unit_combo.setMinimumHeight(INPUT_MIN_H)
+        self._nav_distance_unit_combo.setStyleSheet(f"QComboBox {{ background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px; }}")
+        dist_row_layout.addWidget(QLabel("Value:"))
+        dist_row_layout.addWidget(self._nav_distance_var)
+        dist_row_layout.addWidget(QLabel("Unit:"))
+        dist_row_layout.addWidget(self._nav_distance_unit_combo)
+        dist_layout.addWidget(dist_row)
+        self._nav_distance_enabled_cb = QCheckBox("Bargraph")
+        self._nav_distance_enabled_cb.setChecked(bool(settings.get("distance_enabled", True)))
+        self._nav_distance_enabled_cb.setStyleSheet(f"color: {C['text']};")
+        dist_layout.addWidget(self._nav_distance_enabled_cb)
+        graph_row = QWidget()
+        graph_row_layout = QHBoxLayout(graph_row)
+        graph_row_layout.setContentsMargins(0, 2, 0, 2)
+        graph_row_layout.addWidget(QLabel("Graph %:"))
+        self._nav_distance_graph_var = QSlider(Qt.Orientation.Horizontal)
+        self._nav_distance_graph_var.setRange(0, 100)
+        self._nav_distance_graph_var.setValue(min(100, max(0, int(settings.get('distance_graph', 0x64)) & 0xFF)))
+        graph_row_layout.addWidget(self._nav_distance_graph_var)
+        dist_layout.addWidget(graph_row)
+
+        maneuver_grp = _panel(pnl, "Next maneuver")
+        maneuver_grp_layout = QVBoxLayout(maneuver_grp)
+        maneuver_row = QWidget()
+        maneuver_row_layout = QHBoxLayout(maneuver_row)
+        maneuver_row_layout.setContentsMargins(0, 4, 0, 4)
+        self._nav_arrow_main_var = QLineEdit(f"{int(settings.get('arrow_main') or 0) & 0xFF:02X}")
+        self._nav_arrow_dir_var = QLineEdit(f"{int(settings.get('arrow_dir') or 0) & 0xFF:02X}")
+        for le in (self._nav_arrow_main_var, self._nav_arrow_dir_var):
+            le.setMinimumHeight(INPUT_MIN_H)
+            le.setStyleSheet(_input_style)
+        maneuver_row_layout.addWidget(QLabel("Arrow main:"))
+        maneuver_row_layout.addWidget(self._nav_arrow_main_var)
+        def _arrow_main_minus():
             try:
-                n = max(2, min(8, int(self._nav_lane_num_var.get().strip() or "3")))
+                v = int((self._nav_arrow_main_var.text() or "0").strip(), 16) & 0xFF
             except ValueError:
-                n = 3
-            if n <= 2:
-                return
-            self._nav_lane_num_var.set(str(n - 1))
-            initial = self._current_lanes_from_vars()[: n - 1]
-            self._rebuild_lane_rows(initial_lanes=initial)
-        def _lane_plus():
+                v = 0
+            self._nav_arrow_main_var.setText(f"{(v - 1) & 0xFF:02X}")
+            self._apply_nav_settings()
+        def _arrow_main_plus():
             try:
-                n = max(2, min(8, int(self._nav_lane_num_var.get().strip() or "3")))
+                v = int((self._nav_arrow_main_var.text() or "0").strip(), 16) & 0xFF
             except ValueError:
-                n = 3
-            if n >= 8:
-                return
-            self._nav_lane_num_var.set(str(n + 1))
-            initial = self._current_lanes_from_vars()
-            initial.append({"direction": 0, "sidestreets_len": 0, "lane_type": 1, "marking_left": 0, "marking_right": 0, "lane_description": 0, "guidance": 0})
-            self._rebuild_lane_rows(initial_lanes=initial)
-        btn_style = dict(font=tkfont.Font(family="Segoe UI", size=9), width=2, relief="flat", bd=0, cursor="hand2",
-                        bg=C["btn"], fg=C["text"], activebackground=C["btn_hov"], activeforeground=C["text"])
-        tk.Button(lane_top, text="−", command=_lane_minus, **btn_style).pack(side="left", padx=(0, 2))
-        tk.Button(lane_top, text="+", command=_lane_plus, **btn_style).pack(side="left", padx=(0, 8))
-        self._nav_lane_rows_frame = tk.Frame(body, bg=C["panel"])
-        self._nav_lane_rows_frame.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(0, 6))
-        body.columnconfigure(0, weight=1)
+                v = 0
+            self._nav_arrow_main_var.setText(f"{(v + 1) & 0xFF:02X}")
+            self._apply_nav_settings()
+        arrow_main_minus_btn = QPushButton("−")
+        arrow_main_minus_btn.setFixedWidth(28)
+        arrow_main_minus_btn.clicked.connect(_arrow_main_minus)
+        arrow_main_plus_btn = QPushButton("+")
+        arrow_main_plus_btn.setFixedWidth(28)
+        arrow_main_plus_btn.clicked.connect(_arrow_main_plus)
+        maneuver_row_layout.addWidget(arrow_main_minus_btn)
+        maneuver_row_layout.addWidget(arrow_main_plus_btn)
+        maneuver_row_layout.addWidget(QLabel("Arrow dir:"))
+        maneuver_row_layout.addWidget(self._nav_arrow_dir_var)
+        maneuver_row_layout.addStretch()
+        maneuver_grp_layout.addWidget(maneuver_row)
+        maneuver_grp_layout.addWidget(QLabel("Street name:"))
+        self._nav_street_var = QLineEdit(str(settings["street_name"]))
+        self._nav_street_var.setMinimumHeight(INPUT_MIN_H)
+        self._nav_street_var.setStyleSheet(_input_style)
+        maneuver_grp_layout.addWidget(self._nav_street_var)
+
+        dist_maneuver_row = QWidget()
+        dist_maneuver_layout = QHBoxLayout(dist_maneuver_row)
+        dist_maneuver_layout.setContentsMargins(0, 0, 0, 0)
+        dist_maneuver_layout.addWidget(dist_grp)
+        dist_maneuver_layout.addWidget(maneuver_grp)
+        layout.addWidget(dist_maneuver_row)
+
+        lane_grp = _panel(pnl, "Lane guidance")
+        lane_grp_layout = QVBoxLayout(lane_grp)
+        self._nav_lane_guidance_cb = QCheckBox("Enabled")
+        self._nav_lane_guidance_cb.setChecked(bool(settings.get("lane_guidance_enabled", False)))
+        self._nav_lane_guidance_cb.setStyleSheet(f"color: {C['text']};")
+        lane_grp_layout.addWidget(self._nav_lane_guidance_cb)
+        lane_top = QWidget()
+        lane_top_layout = QHBoxLayout(lane_top)
+        lane_top_layout.setContentsMargins(0, 4, 0, 4)
+        lane_top_layout.addWidget(QLabel("Lanes:"))
+        self._nav_lane_spin = QSpinBox()
+        self._nav_lane_spin.setMinimumHeight(INPUT_MIN_H)
+        self._nav_lane_spin.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
+        self._nav_lane_spin.setRange(2, 8)
+        self._nav_lane_spin.setValue(max(2, min(8, int(settings.get("lane_num_lanes", 3)))))
+        self._nav_lane_spin.setFixedWidth(50)
+        lane_top_layout.addWidget(self._nav_lane_spin)
+        minus_btn = QPushButton("−")
+        minus_btn.setFixedWidth(28)
+        minus_btn.clicked.connect(lambda: self._nav_lane_spin.setValue(max(2, self._nav_lane_spin.value() - 1)) or self._rebuild_lane_rows(initial_lanes=self._current_lanes_from_vars()[:self._nav_lane_spin.value() - 1]))
+        plus_btn = QPushButton("+")
+        plus_btn.setFixedWidth(28)
+        plus_btn.clicked.connect(lambda: self._nav_lane_spin.setValue(min(8, self._nav_lane_spin.value() + 1)) or self._rebuild_lane_rows(initial_lanes=self._current_lanes_from_vars() + [{"direction": 0, "sidestreets": [], "lane_type": 1, "marking_left": 0, "marking_right": 0, "lane_description": 0, "guidance": 0}]))
+        lane_top_layout.addWidget(minus_btn)
+        lane_top_layout.addWidget(plus_btn)
+        lane_top_layout.addStretch()
+        lane_grp_layout.addWidget(lane_top)
+
+        self._nav_lane_rows_frame = QWidget()
+        self._nav_lane_rows_layout = QVBoxLayout(self._nav_lane_rows_frame)
+        self._nav_lane_rows_layout.setContentsMargins(0, 0, 0, 0)
+        lane_grp_layout.addWidget(self._nav_lane_rows_frame)
+
+        self._nav_lane_vars = []
         initial_lanes = settings.get("lanes")
         if not initial_lanes:
             n = max(2, min(8, int(settings.get("lane_num_lanes", 3))))
@@ -1284,90 +1541,108 @@ class App(tk.Tk):
             ]
         self._rebuild_lane_rows(initial_lanes=initial_lanes)
 
-        labels = [
-            ("Arrow main", self._nav_arrow_main_var),
-            ("Arrow dir", self._nav_arrow_dir_var),
-            ("Distance", self._nav_distance_var),
-            ("Unit", self._nav_distance_unit_var),
-        ]
-        for col, (label, var) in enumerate(labels):
-            tk.Label(body, text=label, font=tkfont.Font(family="Segoe UI", size=7),
-                     bg=C["panel"], fg=C["sub"]).grid(row=5, column=col, sticky="w", padx=(0, 4))
-            tk.Entry(
-                body,
-                textvariable=var,
-                width=6 if label == "Unit" else 8,
-                font=tkfont.Font(family="Consolas", size=8),
-                bg=C["bg"],
-                fg=C["text"],
-                insertbackground=C["text"],
-                relief="flat",
-            ).grid(row=6, column=col, sticky="ew", padx=(0, 6), pady=(0, 6))
-            body.columnconfigure(col, weight=1)
-        tk.Label(body, text="Graph %", font=tkfont.Font(family="Segoe UI", size=7),
-                 bg=C["panel"], fg=C["sub"]).grid(row=5, column=4, sticky="w", padx=(0, 4))
-        graph_scale = tk.Scale(
-            body,
-            from_=0,
-            to=100,
-            variable=self._nav_distance_graph_var,
-            orient="horizontal",
-            length=120,
-            showvalue=True,
-            bg=C["panel"],
-            fg=C["text"],
-            troughcolor=C["bg"],
-            activebackground=C["panel"],
-            highlightthickness=0,
-            font=tkfont.Font(family="Segoe UI", size=7),
-        )
-        graph_scale.grid(row=6, column=4, sticky="ew", padx=(0, 6), pady=(0, 6))
-        body.columnconfigure(4, weight=1)
+        def _lane_minus():
+            n = self._nav_lane_spin.value()
+            if n <= 2:
+                return
+            self._nav_lane_spin.setValue(n - 1)
+            self._rebuild_lane_rows(initial_lanes=self._current_lanes_from_vars()[: n - 1])
+        def _lane_plus():
+            n = self._nav_lane_spin.value()
+            if n >= 8:
+                return
+            self._nav_lane_spin.setValue(n + 1)
+            initial = self._current_lanes_from_vars()
+            initial.append({"direction": 0, "sidestreets_len": 0, "lane_type": 1, "marking_left": 0, "marking_right": 0, "lane_description": 0, "guidance": 0})
+            self._rebuild_lane_rows(initial_lanes=initial)
+        minus_btn.clicked.disconnect()
+        plus_btn.clicked.disconnect()
+        minus_btn.clicked.connect(_lane_minus)
+        plus_btn.clicked.connect(_lane_plus)
 
-        tk.Label(body, text="Street name", font=tkfont.Font(family="Segoe UI", size=7),
-                 bg=C["panel"], fg=C["sub"]).grid(row=7, column=0, columnspan=5, sticky="w")
-        tk.Entry(
-            body,
-            textvariable=self._nav_street_var,
-            font=tkfont.Font(family="Consolas", size=8),
-            bg=C["bg"],
-            fg=C["text"],
-            insertbackground=C["text"],
-            relief="flat",
-        ).grid(row=8, column=0, columnspan=5, sticky="ew", pady=(0, 8))
+        maneuver_state_grp = _panel(pnl, "ManeuverState (0x37)")
+        maneuver_state_layout = QVBoxLayout(maneuver_state_grp)
+        maneuver_state_layout.addWidget(QLabel("State:"))
+        self._nav_maneuver_state_combo = QComboBox()
+        self._nav_maneuver_state_combo.addItems([
+            "init/unknown", "Follow", "Prepare", "Distance", "CallForAction",
+        ])
+        self._nav_maneuver_state_combo.setStyleSheet(f"""
+            QComboBox {{ background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px; }}
+        """)
+        maneuver_state_layout.addWidget(self._nav_maneuver_state_combo)
 
-        tk.Button(
-            body,
-            text="Apply Nav Settings",
-            font=tkfont.Font(family="Segoe UI", size=8),
-            bg=C["btn"],
-            fg=C["text"],
-            activebackground=C["btn_hov"],
-            activeforeground=C["text"],
-            relief="flat",
-            bd=0,
-            cursor="hand2",
-            command=self._apply_nav_settings,
-        ).grid(row=9, column=0, columnspan=5, sticky="ew")
-        return pnl
+        exitview_grp = _panel(pnl, "Exit view")
+        exitview_layout = QVBoxLayout(exitview_grp)
+        exitview_layout.setContentsMargins(0, 4, 0, 4)
+        variant_row = QWidget()
+        variant_row_layout = QHBoxLayout(variant_row)
+        variant_row_layout.setContentsMargins(0, 0, 0, 0)
+        variant_row_layout.addWidget(QLabel("Variant:"))
+        self._nav_exitview_variant_combo = QComboBox()
+        self._nav_exitview_variant_combo.addItems(["EU", "NAR", "ROW", "ASIA", "Unknown"])
+        self._nav_exitview_variant_combo.setStyleSheet(f"""
+            QComboBox {{ background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px; }}
+        """)
+        variant_row_layout.addWidget(self._nav_exitview_variant_combo)
+        variant_row_layout.addStretch()
+        exitview_layout.addWidget(variant_row)
+        id_row = QWidget()
+        id_row_layout = QHBoxLayout(id_row)
+        id_row_layout.setContentsMargins(0, 4, 0, 0)
+        exitview_id_lbl = QLabel("ID (0=off):")
+        exitview_id_lbl.setToolTip("Exit number shown on HUD (e.g. 42 = Exit 42). 0 disables exit view.")
+        id_row_layout.addWidget(exitview_id_lbl)
+        self._nav_exitview_id_spin = QSpinBox()
+        self._nav_exitview_id_spin.setRange(0, 65535)
+        self._nav_exitview_id_spin.setValue(max(0, min(65535, int(settings.get("exitview_id", 0)))))
+        self._nav_exitview_id_spin.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
+        self._nav_exitview_id_spin.setFixedWidth(80)
+        id_row_layout.addWidget(self._nav_exitview_id_spin)
+        exitview_minus_btn = QPushButton("−")
+        exitview_minus_btn.setFixedWidth(28)
+        exitview_minus_btn.clicked.connect(lambda: (
+            self._nav_exitview_id_spin.setValue(65535 if self._nav_exitview_id_spin.value() <= 0 else self._nav_exitview_id_spin.value() - 1),
+            self._apply_nav_settings()
+        ))
+        exitview_plus_btn = QPushButton("+")
+        exitview_plus_btn.setFixedWidth(28)
+        exitview_plus_btn.clicked.connect(lambda: (
+            self._nav_exitview_id_spin.setValue(0 if self._nav_exitview_id_spin.value() >= 65535 else self._nav_exitview_id_spin.value() + 1),
+            self._apply_nav_settings()
+        ))
+        id_row_layout.addWidget(exitview_minus_btn)
+        id_row_layout.addWidget(exitview_plus_btn)
+        id_row_layout.addStretch()
+        exitview_layout.addWidget(id_row)
+        idx = self._nav_exitview_variant_combo.findText(settings.get("exitview_variant", "EU"))
+        if idx >= 0:
+            self._nav_exitview_variant_combo.setCurrentIndex(idx)
 
-    def _stalk_bg(self, trio, colour):
-        frm, il, nl = trio
-        frm.configure(bg=colour); il.configure(bg=colour)
-        if nl: nl.configure(bg=colour)
+        idx = self._nav_maneuver_state_combo.findText(settings.get("maneuver_state", "CallForAction"))
+        if idx >= 0:
+            self._nav_maneuver_state_combo.setCurrentIndex(idx)
 
-    def _stalk_press(self, trio):
-        if self._stalk_enabled: self._stalk_bg(trio, C["btn_act"])
+        maneuver_exit_col = QWidget()
+        maneuver_exit_col_layout = QVBoxLayout(maneuver_exit_col)
+        maneuver_exit_col_layout.setContentsMargins(0, 0, 0, 0)
+        maneuver_exit_col_layout.addWidget(maneuver_state_grp)
+        maneuver_exit_col_layout.addWidget(exitview_grp)
+        lane_maneuver_exit_row = QWidget()
+        lane_maneuver_exit_layout = QHBoxLayout(lane_maneuver_exit_row)
+        lane_maneuver_exit_layout.setContentsMargins(0, 0, 0, 0)
+        lane_maneuver_exit_layout.addWidget(lane_grp)
+        lane_maneuver_exit_layout.addWidget(maneuver_exit_col)
+        layout.addWidget(lane_maneuver_exit_row)
 
-    def _stalk_release(self, trio, cmd):
-        if not self._stalk_enabled: return
-        self._stalk_bg(trio, C["btn_hov"])
-        ecu = self._find_stalk_ecu()
-        if ecu:
-            ecu.send_command(cmd)
-            self._log("Stalk -> " + cmd)
-        else:
-            self._log("Stalk: module 16 not attached")
+        apply_btn = QPushButton("Apply Nav Settings")
+        apply_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']};
+                border-radius: 4px; padding: 8px; }}
+            QPushButton:hover {{ background: {C['btn_hov']}; }}
+        """)
+        apply_btn.clicked.connect(self._apply_nav_settings)
+        return pnl, apply_btn
 
     def _find_stalk_ecu(self):
         for e in self._mgr.get_ecus():
@@ -1389,233 +1664,204 @@ class App(tk.Tk):
     def _update_stalk_buttons(self):
         ecu = self._find_stalk_ecu()
         self._stalk_enabled = self._ign and (ecu is not None)
-        for key, trio in self._stalk_btns.items():
-            frm, il, nl = trio
+        for key, (btn, cmd) in self._stalk_btns.items():
+            btn.setEnabled(self._stalk_enabled)
             if self._stalk_enabled:
-                frm.configure(cursor="hand2", highlightbackground=C["border"])
-                il.configure(fg=C["accent"] if key != "blink_off" else C["sub"])
-                if nl: nl.configure(fg=C["sub"])
+                btn.setStyleSheet(f"""
+                    QPushButton {{ background: {C['btn']}; color: {C['accent'] if key != 'blink_off' else C['sub']};
+                        border: 1px solid {C['border']}; border-radius: 6px; padding: 8px; }}
+                    QPushButton:hover {{ background: {C['btn_hov']}; }}
+                    QPushButton:pressed {{ background: {C['btn_act']}; }}
+                """)
             else:
-                frm.configure(cursor="", highlightbackground=C["bg"])
-                il.configure(fg=C["border"])
-                if nl: nl.configure(fg=C["border"])
-                self._stalk_bg(trio, C["btn"])
+                btn.setStyleSheet(f"""
+                    QPushButton {{ background: {C['btn']}; color: {C['border']}; border: 1px solid {C['border']};
+                        border-radius: 6px; padding: 8px; }}
+                    QPushButton:disabled {{ color: {C['border']}; }}
+                """)
 
     def _build_log(self, parent):
         pnl = _panel(parent, "LOG")
-        hdr = tk.Frame(pnl, bg=C["panel"]); hdr.pack(fill="x", padx=6, pady=(2,0))
-        tk.Button(
-            hdr,
-            text="Copy",
-            font=tkfont.Font(family="Segoe UI",size=8),
-            bg=C["btn"],
-            fg=C["text"],
-            activebackground=C["btn_hov"],
-            activeforeground=C["text"],
-            relief="flat",
-            bd=0,
-            cursor="hand2",
-            command=self._copy_log,
-        ).pack(side="right", pady=4)
-        self._log_w = tk.Text(pnl, bg=C["log_bg"], fg=C["log_fg"],
-            font=tkfont.Font(family="Consolas",size=8),
-            relief="flat", bd=0, state="disabled", wrap="none", height=20)
-        self._log_w.pack(fill="both", expand=True, padx=2, pady=2)
+        layout = QVBoxLayout(pnl)
+        hdr = QWidget()
+        hdr_layout = QHBoxLayout(hdr)
+        hdr_layout.setContentsMargins(0, 0, 0, 0)
+        copy_btn = QPushButton("Copy")
+        copy_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']};
+                border-radius: 4px; padding: 4px 10px; }}
+            QPushButton:hover {{ background: {C['btn_hov']}; }}
+        """)
+        copy_btn.clicked.connect(self._copy_log)
+        hdr_layout.addStretch()
+        hdr_layout.addWidget(copy_btn)
+        layout.addWidget(hdr)
+        self._log_w = QPlainTextEdit()
+        self._log_w.setReadOnly(True)
+        self._log_w.setStyleSheet(f"""
+            QPlainTextEdit {{ background: {C['log_bg']}; color: {C['log_fg']};
+                font-family: Consolas; font-size: 11px; border: 1px solid {C['border']}; border-radius: 4px; }}
+        """)
+        self._log_w.setMinimumHeight(120)
+        layout.addWidget(self._log_w)
         return pnl
 
     def _build_hud_bap(self, parent):
         pnl = _panel(parent, "HUD BAP")
-        row = tk.Frame(pnl, bg=C["panel"]); row.pack(fill="x", padx=8, pady=(4, 4))
-        tk.Button(
-            row,
-            text="Open Live Window",
-            font=tkfont.Font(family="Segoe UI", size=8),
-            bg=C["btn"],
-            fg=C["text"],
-            activebackground=C["btn_hov"],
-            activeforeground=C["text"],
-            relief="flat",
-            bd=0,
-            cursor="hand2",
-            command=self._open_hud_bap_window,
-        ).pack(side="left", padx=(0, 6), pady=4)
-        tk.Button(
-            row,
-            text="Start Nav",
-            font=tkfont.Font(family="Segoe UI", size=8),
-            bg=C["btn"],
-            fg=C["text"],
-            activebackground=C["btn_hov"],
-            activeforeground=C["text"],
-            relief="flat",
-            bd=0,
-            cursor="hand2",
-            command=self._start_nav_demo,
-        ).pack(side="left", padx=(0, 6), pady=4)
-        tk.Button(
-            row,
-            text="Load Log",
-            font=tkfont.Font(family="Segoe UI", size=8),
-            bg=C["btn"],
-            fg=C["text"],
-            activebackground=C["btn_hov"],
-            activeforeground=C["text"],
-            relief="flat",
-            bd=0,
-            cursor="hand2",
-            command=self._load_hud_bap_log,
-        ).pack(side="left", pady=4)
-        self._hud_log_lbl = tk.Label(
-            pnl,
-            text=f"Session log: {os.path.basename(str(self._hud_session.path))}",
-            font=tkfont.Font(family="Consolas", size=7),
-            bg=C["panel"],
-            fg=C["sub"],
-            justify="left",
-            anchor="w",
-            wraplength=260,
-        )
-        self._hud_log_lbl.pack(fill="x", padx=10, pady=(0, 8))
-        return pnl
+        layout = QVBoxLayout(pnl)
+        self._hud_log_lbl = QLabel(f"Session log: {os.path.basename(str(self._hud_session.path))}")
+        self._hud_log_lbl.setStyleSheet(f"color: {C['sub']}; font-size: 11px;")
+        self._hud_log_lbl.setWordWrap(True)
+        layout.addWidget(self._hud_log_lbl)
+        open_live_btn = QPushButton("Open Live Window")
+        open_live_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']};
+                border-radius: 4px; padding: 6px 12px; }}
+            QPushButton:hover {{ background: {C['btn_hov']}; }}
+        """)
+        open_live_btn.clicked.connect(self._open_hud_bap_window)
+        load_log_btn = QPushButton("Load Log")
+        load_log_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']};
+                border-radius: 4px; padding: 6px 12px; }}
+            QPushButton:hover {{ background: {C['btn_hov']}; }}
+        """)
+        load_log_btn.clicked.connect(self._load_hud_bap_log)
+        return pnl, open_live_btn, load_log_btn
 
     def _build_vze_tab(self, parent):
-        """VZE tab: A5 loaded check + sign type + first sign (decimal) for testing."""
-        pnl = _panel(parent, "VZE  (0x181)")
-        small = tkfont.Font(family="Segoe UI", size=8)
-        entry_font = tkfont.Font(family="Consolas", size=9)
-        row = tk.Frame(pnl, bg=C["panel"])
-        row.pack(fill="x", padx=8, pady=(4, 4))
-        self._vze_a5_status_lbl = tk.Label(
-            row, text="Module A5: checking…",
-            font=small, bg=C["panel"], fg=C["sub"])
-        self._vze_a5_status_lbl.pack(side="left")
-        self.after(100, self._update_vze_a5_status)
+        """VZE tab: A5 loaded check + sign type + First sign groupbox (speed + bits)."""
+        pnl = QWidget(parent)
+        layout = QVBoxLayout(pnl)
+        layout.setContentsMargins(10, 12, 10, 10)
+        self._vze_a5_status_lbl = QLabel("Module A5: checking…")
+        self._vze_a5_status_lbl.setStyleSheet(f"color: {C['sub']};")
+        layout.addWidget(self._vze_a5_status_lbl)
+        QTimer.singleShot(100, self._update_vze_a5_status)
 
         a5_mod = sys.modules.get("a5_drvassist")
         if not a5_mod or not getattr(a5_mod, "pack_vze_01", None):
-            tk.Label(pnl, text="VZE pack/unpack not available (a5_drvassist).",
-                     font=small, bg=C["panel"], fg=C["sub"]).pack(pady=8)
-            return pnl
+            layout.addWidget(QLabel("VZE pack/unpack not available (a5_drvassist)."))
+            return pnl, QWidget()
 
-        body = tk.Frame(pnl, bg=C["panel"])
-        body.pack(fill="x", padx=8, pady=(4, 8))
-        body.columnconfigure(1, weight=1)
+        body = QGridLayout()
+        body.addWidget(QLabel("Sign type"), 0, 0)
+        self._vze_sign_type_combo = QComboBox()
+        self._vze_sign_type_combo.setMinimumHeight(INPUT_MIN_H)
+        self._vze_sign_type_combo.setStyleSheet(f"""
+            QComboBox {{ background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px; }}
+            QComboBox::drop-down {{ border: none; }}
+        """)
+        self._vze_sign_type_combo.addItems(["EU_RDW (0)", "USA (1)", "Canada (2)", "China (3)"])
+        self._vze_sign_type_combo.currentIndexChanged.connect(self._apply_vze_settings)
+        body.addWidget(self._vze_sign_type_combo, 0, 1)
+        layout.addLayout(body)
 
-        # Sign type: 0=EU_RDW, 1=USA, 2=Canada, 3=China (DBC value table)
-        tk.Label(body, text="Sign type", font=small, bg=C["panel"], fg=C["sub"]).grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self._vze_anzeigemodus_var = tk.StringVar(value="0")
-        sign_type_combo = ttk.Combobox(
-            body, textvariable=self._vze_anzeigemodus_var,
-            values=["EU_RDW (0)", "USA (1)", "Canada (2)", "China (3)"],
-            width=14, state="readonly", font=entry_font
-        )
-        sign_type_combo.grid(row=0, column=1, sticky="w", pady=2)
-        sign_type_combo.current(0)
-        self._vze_sign_type_combo = sign_type_combo
+        first_sign_gb = _panel(parent, "First sign")
+        first_layout = QVBoxLayout(first_sign_gb)
+        first_layout.setContentsMargins(10, 10, 10, 10)
+        speed_row = QWidget()
+        speed_row_layout = QHBoxLayout(speed_row)
+        speed_row_layout.setContentsMargins(0, 0, 0, 0)
+        speed_row_layout.addWidget(QLabel("Speed (km/h):"))
+        self._vze_vz1_var = QLineEdit("90")
+        self._vze_vz1_var.setMinimumHeight(INPUT_MIN_H)
+        self._vze_vz1_var.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
+        self._vze_vz1_var.setFixedWidth(60)
+        self._vze_vz1_var.editingFinished.connect(self._apply_vze_settings)
+        speed_row_layout.addWidget(self._vze_vz1_var)
+        speed_row_layout.addSpacing(16)
+        self._vze_bit_blink = QCheckBox("Blink")
+        self._vze_bit_weather = QCheckBox("Weather")
+        self._vze_bit_rain = QCheckBox("Rain")
+        self._vze_bit_warning = QCheckBox("Warning clock")
+        for cb in (self._vze_bit_blink, self._vze_bit_weather, self._vze_bit_rain, self._vze_bit_warning):
+            cb.setStyleSheet(f"color: {C['text']};")
+            cb.stateChanged.connect(self._apply_vze_settings)
+            speed_row_layout.addWidget(cb)
+        speed_row_layout.addStretch()
+        first_layout.addWidget(speed_row)
+        layout.addWidget(first_sign_gb)
 
-        tk.Label(body, text="First sign (km/h, decimal)", font=small, bg=C["panel"], fg=C["sub"]).grid(row=1, column=0, sticky="w", padx=(0, 8))
-        self._vze_vz1_var = tk.StringVar(value="90")
-        vze_entry = tk.Entry(body, textvariable=self._vze_vz1_var, width=6, font=entry_font, bg=C["bg"], fg=C["text"], insertbackground=C["text"])
-        vze_entry.grid(row=1, column=1, sticky="w", pady=2)
-        vze_entry.bind("<FocusOut>", lambda e: self._apply_vze_settings())
-        vze_entry.bind("<Return>", lambda e: self._apply_vze_settings())
-        sign_type_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_vze_settings())
-
-        # Bytes 4, 5, 6, 7: one checkbox per bit (0=LSB .. 7=MSB). Build vars first so First sign row can reference them.
-        self._vze_byte_vars = []  # [ [b4_0..b4_7], [b5_0..b5_7], [b6_0..b6_7], [b7_0..b7_7] ]
-        bit_frame = tk.Frame(pnl, bg=C["panel"])
+        other_bits_gb = _panel(parent, "Other bits (Bytes 4–7)")
+        bit_layout = QGridLayout(other_bits_gb)
+        bit_layout.setContentsMargins(10, 10, 10, 10)
+        self._vze_byte_vars = []
         for byteno in range(4):
             row_vars = []
+            bit_layout.addWidget(QLabel(["Byte 4", "Byte 5", "Byte 6", "Byte 7"][byteno]), byteno, 0)
             for bit in range(8):
-                var = tk.BooleanVar(value=False)
-                var.trace_add("write", lambda *_: self._apply_vze_settings())
-                row_vars.append(var)
-                cb = tk.Checkbutton(
-                    bit_frame, variable=var, text=str(bit),
-                    bg=C["panel"], fg=C["text"], activebackground=C["panel"], activeforeground=C["text"],
-                    selectcolor=C["panel"], highlightthickness=0, font=small,
-                )
-                cb.grid(row=byteno, column=bit + 1, padx=1, pady=1)
+                cb = QCheckBox(str(bit))
+                cb.setStyleSheet(f"color: {C['text']};")
+                cb.stateChanged.connect(self._apply_vze_settings)
+                bit_layout.addWidget(cb, byteno, bit + 1)
+                row_vars.append(cb)
             self._vze_byte_vars.append(row_vars)
-        for row_lbl, row_no in [("Byte 4", 0), ("Byte 5", 1), ("Byte 6", 2), ("Byte 7", 3)]:
-            tk.Label(bit_frame, text=row_lbl, font=small, bg=C["panel"], fg=C["sub"], width=6, anchor="w").grid(row=row_no, column=0, sticky="w", padx=(0, 4))
-        # First sign related (under speed): B4.3=blink, B4.6=weather plain, B4.7=weather rain, B5.0=warning clock
-        first_sign_frame = tk.Frame(pnl, bg=C["panel"])
-        first_sign_frame.pack(fill="x", padx=8, pady=(2, 4))
-        tk.Label(first_sign_frame, text="First sign:", font=small, bg=C["panel"], fg=C["sub"]).pack(side="left", padx=(0, 8))
-        for lbl, var in [
-            ("Sign warning (blink)", self._vze_byte_vars[0][3]),
-            ("Weather plain", self._vze_byte_vars[0][6]),
-            ("Weather rain", self._vze_byte_vars[0][7]),
-            ("Warning clock", self._vze_byte_vars[1][0]),
-        ]:
-            cb = tk.Checkbutton(
-                first_sign_frame, variable=var, text=lbl,
-                bg=C["panel"], fg=C["text"], activebackground=C["panel"], activeforeground=C["text"],
-                selectcolor=C["panel"], highlightthickness=0, font=small,
-            )
-            cb.pack(side="left", padx=(0, 12))
-        bit_frame.pack(fill="x", padx=8, pady=(2, 4))
+        layout.addWidget(other_bits_gb)
 
-        btn_row = tk.Frame(pnl, bg=C["panel"])
-        btn_row.pack(pady=(4, 8))
-        tk.Button(
-            btn_row, text="Apply VZE (0x181)",
-            font=tkfont.Font(family="Segoe UI", size=9), bg=C["btn"], fg=C["text"],
-            activebackground=C["btn_hov"], activeforeground=C["text"], relief="flat", bd=0, cursor="hand2",
-            command=self._apply_vze_settings,
-        ).pack(side="left", padx=(0, 6))
-        tk.Button(
-            btn_row, text="Load from A5",
-            font=tkfont.Font(family="Segoe UI", size=8), bg=C["btn"], fg=C["text"],
-            activebackground=C["btn_hov"], activeforeground=C["text"], relief="flat", bd=0, cursor="hand2",
-            command=self._load_vze_from_a5,
-        ).pack(side="left")
-        tk.Frame(pnl, bg=C["panel"], height=4).pack()
-        self._vze_bytes_lbl = tk.Label(
-            pnl,
-            text="0x181 payload: -- -- -- -- -- -- -- --",
-            font=tkfont.Font(family="Consolas", size=9),
-            bg=C["panel"],
-            fg=C["sub"],
-            justify="left",
-        )
-        self._vze_bytes_lbl.pack(fill="x", padx=8, pady=(0, 8))
-        self.after(50, self._update_vze_bytes_display)
-        return pnl
+        footer = QWidget()
+        footer.setStyleSheet(f"background: {C['bg']};")
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 8, 0, 0)
+        btn_row = QWidget()
+        btn_layout = QHBoxLayout(btn_row)
+        apply_btn = QPushButton("Apply VZE (0x181)")
+        apply_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 6px 12px; }}")
+        apply_btn.clicked.connect(self._apply_vze_settings)
+        load_btn = QPushButton("Load from A5")
+        load_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 6px 12px; }}")
+        load_btn.clicked.connect(self._load_vze_from_a5)
+        btn_layout.addWidget(apply_btn)
+        btn_layout.addWidget(load_btn)
+        footer_layout.addWidget(btn_row)
+        self._vze_bytes_lbl = QLabel("0x181 payload: -- -- -- -- -- -- -- --")
+        self._vze_bytes_lbl.setStyleSheet(f"color: {C['sub']}; font-family: Consolas; font-size: 11px;")
+        footer_layout.addWidget(self._vze_bytes_lbl)
+        QTimer.singleShot(50, self._update_vze_bytes_display)
+        return pnl, footer
 
     def _update_vze_a5_status(self):
         ecu = self._find_a5_ecu()
-        if hasattr(self, "_vze_a5_status_lbl") and self._vze_a5_status_lbl.winfo_exists():
+        if hasattr(self, "_vze_a5_status_lbl") and self._vze_a5_status_lbl:
             if ecu is not None:
-                self._vze_a5_status_lbl.configure(text="Module A5: loaded", fg=C["on"])
+                self._vze_a5_status_lbl.setText("Module A5: loaded")
+                self._vze_a5_status_lbl.setStyleSheet(f"color: {C['on']};")
             else:
-                self._vze_a5_status_lbl.configure(text="Module A5: not loaded", fg=C["off"])
+                self._vze_a5_status_lbl.setText("Module A5: not loaded")
+                self._vze_a5_status_lbl.setStyleSheet(f"color: {C['off']};")
+
+    def _vze_bits_to_bytes(self):
+        """Build bytes 4–7 from First sign checkboxes (B4.3,4.6,4.7, B5.0) + other bits grid."""
+        def row_to_byte(vars_row):
+            return sum(2**i for i in range(8) if vars_row[i].isChecked()) & 0xFF if vars_row else 0
+        bv = getattr(self, "_vze_byte_vars", [])
+        g4 = row_to_byte(bv[0]) if len(bv) > 0 else 0
+        g5 = row_to_byte(bv[1]) if len(bv) > 1 else 0
+        g6 = row_to_byte(bv[2]) if len(bv) > 2 else 0
+        g7 = row_to_byte(bv[3]) if len(bv) > 3 else 0
+        if hasattr(self, "_vze_bit_blink") and self._vze_bit_blink:
+            g4 = (g4 & ~0xC8) | (int(self._vze_bit_blink.isChecked()) << 3) | (int(self._vze_bit_weather.isChecked()) << 6) | (int(self._vze_bit_rain.isChecked()) << 7)
+            g5 = (g5 & ~0x01) | int(self._vze_bit_warning.isChecked())
+        return g4, g5, g6, g7
 
     def _update_vze_bytes_display(self):
         """Show the current form values packed as 0x181 payload (hex bytes) at the bottom."""
-        if not hasattr(self, "_vze_bytes_lbl") or not self._vze_bytes_lbl.winfo_exists():
+        if not hasattr(self, "_vze_bytes_lbl") or not self._vze_bytes_lbl:
             return
         a5_mod = sys.modules.get("a5_drvassist")
         if not a5_mod or not getattr(a5_mod, "pack_vze_01", None):
             return
         try:
-            idx = self._vze_sign_type_combo.current() if hasattr(self, "_vze_sign_type_combo") and self._vze_sign_type_combo.winfo_exists() else 0
+            idx = self._vze_sign_type_combo.currentIndex() if hasattr(self, "_vze_sign_type_combo") else 0
             anzeigemodus = max(0, min(3, idx))
-            vz1 = max(0, min(255, int(self._vze_vz1_var.get().strip() or "0")))
-            def bits_to_byte(vars_row):
-                return sum(2**i for i in range(8) if vars_row[i].get()) if vars_row else 0
-            bv = self._vze_byte_vars if getattr(self, "_vze_byte_vars", None) and len(getattr(self, "_vze_byte_vars", [])) >= 4 else []
-            b4 = bits_to_byte(bv[0]) if len(bv) > 0 else 0
-            b5 = bits_to_byte(bv[1]) if len(bv) > 1 else 0
-            b6 = bits_to_byte(bv[2]) if len(bv) > 2 else 0
-            b7 = bits_to_byte(bv[3]) if len(bv) > 3 else 0
+            vz1 = max(0, min(255, int((self._vze_vz1_var.text() or "0").strip())))
+            b4, b5, b6, b7 = self._vze_bits_to_bytes()
         except (ValueError, AttributeError):
-            self._vze_bytes_lbl.configure(text="0x181 payload: (invalid values)")
+            self._vze_bytes_lbl.setText("0x181 payload: (invalid values)")
             return
         payload = a5_mod.pack_vze_01(anzeigemodus=anzeigemodus, verkehrszeichen_1=vz1, byte_4=b4, byte_5=b5, byte_6=b6, byte_7=b7)
         hex_str = " ".join(f"{b:02X}" for b in payload[:8])
-        self._vze_bytes_lbl.configure(text=f"0x181 payload: {hex_str}")
+        self._vze_bytes_lbl.setText(f"0x181 payload: {hex_str}")
 
     def _load_vze_from_a5(self):
         ecu = self._find_a5_ecu()
@@ -1637,17 +1883,19 @@ class App(tk.Tk):
             return
         self._vze_loading = True
         try:
-            self._vze_sign_type_combo.current(max(0, min(3, params.get("anzeigemodus", 0))))
-            self._vze_vz1_var.set(str(max(0, min(255, params.get("verkehrszeichen_1", 0)))))
-            # Bits we don't read on load (First sign group): B4.3, B4.6, B4.7, B5.0 — leave checkboxes unchanged
-            skip_bits = {(0, 3), (0, 6), (0, 7), (1, 0)}
+            self._vze_sign_type_combo.setCurrentIndex(max(0, min(3, params.get("anzeigemodus", 0))))
+            self._vze_vz1_var.setText(str(max(0, min(255, params.get("verkehrszeichen_1", 0)))))
+            b4 = params.get("byte_4", 0) & 0xFF
+            b5 = params.get("byte_5", 0) & 0xFF
+            self._vze_bit_blink.setChecked(bool((b4 >> 3) & 1))
+            self._vze_bit_weather.setChecked(bool((b4 >> 6) & 1))
+            self._vze_bit_rain.setChecked(bool((b4 >> 7) & 1))
+            self._vze_bit_warning.setChecked(bool((b5 >> 0) & 1))
             for byteno, key in enumerate(("byte_4", "byte_5", "byte_6", "byte_7")):
                 b = params.get(key, 0) & 0xFF
                 if getattr(self, "_vze_byte_vars", None) and len(self._vze_byte_vars) > byteno:
                     for i in range(8):
-                        if (byteno, i) in skip_bits:
-                            continue
-                        self._vze_byte_vars[byteno][i].set(bool((b >> i) & 1))
+                        self._vze_byte_vars[byteno][i].setChecked(bool((b >> i) & 1))
         finally:
             self._vze_loading = False
         self._update_vze_bytes_display()
@@ -1665,17 +1913,11 @@ class App(tk.Tk):
             self._log("Apply VZE: pack_vze_01 not available")
             return
         try:
-            idx = self._vze_sign_type_combo.current() if hasattr(self, "_vze_sign_type_combo") and self._vze_sign_type_combo.winfo_exists() else 0
+            idx = self._vze_sign_type_combo.currentIndex() if hasattr(self, "_vze_sign_type_combo") else 0
             anzeigemodus = max(0, min(3, idx))
-            vz1 = max(0, min(255, int(self._vze_vz1_var.get().strip() or "0")))
-            def bits_to_byte(vars_row):
-                return sum(2**i for i in range(8) if vars_row[i].get()) if vars_row else 0
-            bv = self._vze_byte_vars if getattr(self, "_vze_byte_vars", None) and len(self._vze_byte_vars) >= 4 else []
-            b4 = bits_to_byte(bv[0]) if len(bv) > 0 else 0
-            b5 = bits_to_byte(bv[1]) if len(bv) > 1 else 0
-            b6 = bits_to_byte(bv[2]) if len(bv) > 2 else 0
-            b7 = bits_to_byte(bv[3]) if len(bv) > 3 else 0
-        except ValueError as e:
+            vz1 = max(0, min(255, int((self._vze_vz1_var.text() or "0").strip())))
+            b4, b5, b6, b7 = self._vze_bits_to_bytes()
+        except (ValueError, AttributeError) as e:
             self._log(f"Apply VZE: invalid number — {e}")
             return
         payload = a5_mod.pack_vze_01(anzeigemodus=anzeigemodus, verkehrszeichen_1=vz1, byte_4=b4, byte_5=b5, byte_6=b6, byte_7=b7)
@@ -1686,11 +1928,12 @@ class App(tk.Tk):
     def _build_ecu_cards(self):
         for ecu in self._mgr.get_ecus():
             card = ECUCard(self._ecu_frame, ecu)
-            card.pack(fill="x", pady=(0,8)); self._cards.append(card)
+            self._ecu_frame_layout.addWidget(card)
+            self._cards.append(card)
         if not self._cards:
-            tk.Label(self._ecu_frame, text="No ECU modules found in modules/",
-                     font=tkfont.Font(family="Segoe UI",size=9),
-                     bg=C["bg"], fg=C["sub"]).pack(pady=20)
+            lbl = QLabel("No ECU modules found in modules/")
+            lbl.setStyleSheet(f"color: {C['sub']};")
+            self._ecu_frame_layout.addWidget(lbl)
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
@@ -1700,28 +1943,36 @@ class App(tk.Tk):
             return
         self._ign = on
         if on:
-            self._ign_btn.configure(text="ON ", fg=C["on"])
-            self._ign_hint.configure(text="KL15 active (from bus)")
-            for d in self._inds.values(): d.configure(fg=C["accent"])
+            self._ign_btn.setText("ON")
+            self._ign_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['on']}; font-weight: bold; }}")
+            self._ign_hint.setText("KL15 active (from bus)")
+            for d in self._inds.values():
+                d.setStyleSheet(f"color: {C['accent']};")
             self._log("Ignition ON (from bus 0x3C0)")
         else:
-            self._ign_btn.configure(text="OFF", fg=C["off"])
-            self._ign_hint.configure(text="Click to enable ignition")
-            for d in self._inds.values(): d.configure(fg=C["border"])
+            self._ign_btn.setText("OFF")
+            self._ign_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['off']}; font-weight: bold; }}")
+            self._ign_hint.setText("Click to enable ignition")
+            for d in self._inds.values():
+                d.setStyleSheet(f"color: {C['border']};")
             self._log("Ignition OFF (from bus 0x3C0)")
         self._update_stalk_buttons()
 
     def _toggle_ign(self):
         self._ign = not self._ign; self._mgr.set_ignition(self._ign)
         if self._ign:
-            self._ign_btn.configure(text="ON ", fg=C["on"])
-            self._ign_hint.configure(text="KL15 active — click to disable")
-            for d in self._inds.values(): d.configure(fg=C["accent"])
+            self._ign_btn.setText("ON")
+            self._ign_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['on']}; font-weight: bold; }}")
+            self._ign_hint.setText("KL15 active — click to disable")
+            for d in self._inds.values():
+                d.setStyleSheet(f"color: {C['accent']};")
             self._log("Ignition ON")
         else:
-            self._ign_btn.configure(text="OFF", fg=C["off"])
-            self._ign_hint.configure(text="Click to enable ignition")
-            for d in self._inds.values(): d.configure(fg=C["border"])
+            self._ign_btn.setText("OFF")
+            self._ign_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['off']}; font-weight: bold; }}")
+            self._ign_hint.setText("Click to enable ignition")
+            for d in self._inds.values():
+                d.setStyleSheet(f"color: {C['border']};")
             self._log("Ignition OFF")
         self._update_stalk_buttons()
 
@@ -1755,40 +2006,42 @@ class App(tk.Tk):
             self._log("Apply Nav: infotainment module 5F not attached")
             return
         try:
-            distance_m = max(0, int(self._nav_distance_var.get().strip() or "0"))
-            distance_graph = max(0, min(0x64, int(self._nav_distance_graph_var.get())))
-            distance_unit = (self._nav_distance_unit_var.get() or "m").strip().lower() or "m"
-            if distance_unit not in ("m", "km"):
-                distance_unit = "m"
-            arrow_main = self._parse_hex_byte(self._nav_arrow_main_var.get(), "Arrow main")
-            arrow_dir = self._parse_hex_byte(self._nav_arrow_dir_var.get(), "Arrow dir")
+            distance_val = max(0, int((self._nav_distance_var.text() or "0").strip()))
+            distance_graph = max(0, min(0x64, self._nav_distance_graph_var.value()))
+            distance_unit = self._nav_distance_unit_combo.currentText().lower()
+            distance_m = distance_val * 1000 if distance_unit == "km" else distance_val
+            arrow_main = self._parse_hex_byte(self._nav_arrow_main_var.text(), "Arrow main")
+            arrow_dir = self._parse_hex_byte(self._nav_arrow_dir_var.text(), "Arrow dir")
         except ValueError as exc:
             self._log(f"Apply Nav: {exc}")
             return
 
-        street_name = (self._nav_street_var.get() or "").strip() or "Offroad"
-        enabled = bool(self._nav_enabled_var.get())
-        distance_enabled = bool(self._nav_distance_enabled_var.get())
-        lane_guidance_enabled = bool(self._nav_lane_guidance_var.get())
+        street_name = (self._nav_street_var.text() or "").strip() or "Offroad"
+        enabled = self._nav_enabled_cb.isChecked()
+        distance_valid = self._nav_distance_valid_cb.isChecked()
+        distance_enabled = self._nav_distance_enabled_cb.isChecked()
+        lane_guidance_enabled = self._nav_lane_guidance_cb.isChecked()
 
         lanes = []
         preferred_index = None
         for i, v in enumerate(self._nav_lane_vars):
             try:
-                direction = int(v["direction"].get().strip() or "0", 16) & 0xFF
-                lane_type = int(v["lane_type"].get().strip() or "1", 16) & 0xFF
-                mark_l = int(v["mark_l"].get().strip() or "0") & 0x0F
-                mark_r = int(v["mark_r"].get().strip() or "0") & 0x0F
-                lane_desc = int(v["lane_desc"].get().strip() or "0", 16) & 0x0F
-                preferred = bool(v["preferred"].get())
+                direction = int((v["direction"].text() or "0").strip(), 16) & 0xFF
+                lane_type = int((v["lane_type"].text() or "1").strip(), 16) & 0xFF
+                mark_l = int((v["mark_l"].text() or "0").strip()) & 0x0F
+                mark_r = int((v["mark_r"].text() or "0").strip()) & 0x0F
+                lane_desc = int((v["lane_desc"].text() or "0").strip(), 16) & 0x0F
+                preferred = v["preferred"].isChecked()
+                sidestreets = self._parse_sidestreets(v.get("sidestr") and v["sidestr"].text())
             except ValueError:
                 direction, lane_type, mark_l, mark_r, lane_desc = 0, 1, 0, 0, 0
+                sidestreets = []
                 preferred = i == 0
             guidance = 0x02 if preferred else 0x00
             if preferred:
                 preferred_index = i
             lanes.append({
-                "direction": direction, "sidestreets_len": 0, "lane_type": lane_type,
+                "direction": direction, "sidestreets": sidestreets, "lane_type": lane_type,
                 "marking_left": mark_l, "marking_right": mark_r,
                 "lane_description": lane_desc, "guidance": guidance,
             })
@@ -1796,6 +2049,7 @@ class App(tk.Tk):
             lanes[0]["guidance"] = 0x02
 
         self._cfg["hud_nav_enabled"] = enabled
+        self._cfg["hud_distance_valid"] = distance_valid
         self._cfg["hud_distance_enabled"] = distance_enabled
         self._cfg["hud_distance_m"] = distance_m
         self._cfg["hud_distance_graph"] = distance_graph
@@ -1807,9 +2061,18 @@ class App(tk.Tk):
         self._cfg["hud_lanes"] = lanes
         self._cfg["hud_lane_num_lanes"] = len(lanes)
         self._cfg["hud_lane_recommended"] = preferred_index if preferred_index is not None else 0
+
+        exitview_variant = self._nav_exitview_variant_combo.currentText()
+        exitview_id = max(0, min(65535, self._nav_exitview_id_spin.value()))
+        maneuver_state = self._nav_maneuver_state_combo.currentText()
+        self._cfg["exitview_variant"] = exitview_variant
+        self._cfg["exitview_id"] = exitview_id
+        self._cfg["maneuver_state"] = maneuver_state
+
         if hasattr(ecu, "configure_nav"):
             ecu.configure_nav(
                 enabled=enabled,
+                distance_valid=distance_valid,
                 distance_enabled=distance_enabled,
                 distance_m=distance_m,
                 distance_graph=distance_graph,
@@ -1819,16 +2082,22 @@ class App(tk.Tk):
                 arrow_dir=arrow_dir,
                 lane_guidance_enabled=lane_guidance_enabled,
                 lanes=lanes,
+                exitview_variant=exitview_variant,
+                exitview_id=exitview_id,
+                maneuver_state=maneuver_state,
             )
             self._log(
                 f"Apply Nav: enabled={'yes' if enabled else 'no'}"
-                f" distance_visible={'yes' if distance_enabled else 'no'}"
+                f" distance_valid={'yes' if distance_valid else 'no'}"
+                f" distance_bargraph={'on' if distance_enabled else 'off'}"
                 f" lane_guidance={'yes' if lane_guidance_enabled else 'no'}"
                 f" main=0x{arrow_main:02X}"
                 f" dir=0x{arrow_dir:02X}"
                 f" distance={distance_m}m"
                 f" graph=0x{distance_graph:02X}"
                 f" street={street_name}"
+                f" exitview={exitview_variant} id={exitview_id}"
+                f" maneuver_state={maneuver_state}"
             )
         else:
             self._log("Apply Nav: infotainment module does not support live nav updates")
@@ -1841,41 +2110,41 @@ class App(tk.Tk):
         self._mgr.queue_mfl(key)
 
     def _open_hud_bap_window(self):
-        if self._hud_live_win is not None and self._hud_live_win.winfo_exists():
-            self._hud_live_win.focus_force()
+        if self._hud_live_win is not None and self._hud_live_win.isVisible():
+            self._hud_live_win.raise_()
+            self._hud_live_win.activateWindow()
             return
         self._hud_live_win = BapTableWindow(self, "HUD Bap")
+        self._hud_live_win.destroyed.connect(lambda: setattr(self, "_hud_live_win", None))
         self._hud_live_win.load_messages(self._hud_session.messages)
         self._hud_live_win.set_status(f"Live session log: {self._hud_session.path}")
+        self._hud_live_win.show()
 
     def _load_hud_bap_log(self):
-        path = filedialog.askopenfilename(
-            title="Load HUD BAP Log",
-            initialdir=self._hud_logs_dir,
-            filetypes=[("Log files", "*.log"), ("All files", "*.*")],
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load HUD BAP Log",
+            self._hud_logs_dir,
+            "Log files (*.log);;All files (*.*)",
         )
         if not path:
             return
         win = BapTableWindow(self, f"HUD Bap Log - {os.path.basename(path)}")
         win.set_status(f"Loading {path} ...")
+        win.show()
+        win.raise_()
+        win.activateWindow()
+        QApplication.processEvents()
 
-        def _worker():
-            try:
-                messages = load_hud_bap_messages(path)
-                error = None
-            except Exception as exc:
-                messages = []
-                error = str(exc)
-            self.after(0, self._finish_load_hud_bap_log, win, path, messages, error)
-
-        threading.Thread(target=_worker, daemon=True, name="HudBapLogLoad").start()
-
-    def _finish_load_hud_bap_log(self, win, path, messages, error):
-        if error:
-            win.set_status(f"Failed to load {path}: {error}")
-            return
-        win.load_messages(messages)
-        win.set_status(f"{len(messages)} decoded messages from {path}")
+        try:
+            messages = load_hud_bap_messages(path)
+            win.load_messages(messages)
+            if messages:
+                win.set_status(f"{len(messages)} decoded messages from {path}")
+            else:
+                win.set_status(f"No BAP messages found in {path} (check Busmaster format)")
+        except Exception as exc:
+            win.set_status(f"Failed to load {path}: {exc}")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1883,7 +2152,7 @@ class App(tk.Tk):
         message = self._hud_session.handle_frame(direction, arb_id, data)
         if message is None:
             return
-        if self._hud_live_win is not None and self._hud_live_win.winfo_exists():
+        if self._hud_live_win is not None and self._hud_live_win.isVisible():
             self._hud_live_win.append_message(message)
 
     def _drain_hud_frames(self, batch_limit=250):
@@ -1898,7 +2167,7 @@ class App(tk.Tk):
             if message is not None:
                 messages.append(message)
             drained += 1
-        if self._hud_live_win is not None and self._hud_live_win.winfo_exists():
+        if self._hud_live_win is not None and self._hud_live_win.isVisible():
             if messages:
                 self._hud_live_win.append_messages(messages)
             self._hud_live_win.set_status(
@@ -1908,30 +2177,37 @@ class App(tk.Tk):
 
     def _copy_log(self):
         try:
-            text = self._log_w.get("1.0", "end-1c")
-            self.clipboard_clear()
-            self.clipboard_append(text)
+            text = self._log_w.toPlainText()
+            QApplication.clipboard().setText(text)
             self._log("Log copied to clipboard")
         except Exception as exc:
             self._log(f"Copy log failed: {exc}")
 
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        _, bottom = self._log_w.yview()
-        stick_to_bottom = bottom >= 0.999
-        self._log_w.configure(state="normal")
-        self._log_w.insert("end", f"[{ts}] {msg}\n")
-        if int(self._log_w.index("end-1c").split(".")[0]) > 600:
-            self._log_w.delete("1.0", "80.0")
+        sb = self._log_w.verticalScrollBar()
+        stick_to_bottom = sb.value() >= sb.maximum() - 4
+        self._log_w.setReadOnly(False)
+        self._log_w.appendPlainText(f"[{ts}] {msg}")
+        lines = self._log_w.document().lineCount()
+        if lines > 600:
+            cursor = QTextCursor(self._log_w.document())
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.movePosition(QTextCursor.MoveOperation.Down, QTextCursor.MoveMode.KeepAnchor, 80)
+            cursor.removeSelectedText()
         if stick_to_bottom:
-            self._log_w.see("end")
-        self._log_w.configure(state="disabled")
+            sb.setValue(sb.maximum())
+        self._log_w.setReadOnly(True)
 
     def _setstatus(self, state: str, detail: str):
+        if not hasattr(self, "_slbl") or not self._slbl:
+            return
         col = {"ok":C["on"],"error":C["off"],"off":C["sub"]}.get(state, C["sub"])
         lbl = {"ok":f"CONNECTED  {detail}","error":f"ERROR  {detail}",
                "off":"DISCONNECTED"}.get(state, state)
-        self._dot.configure(fg=col); self._slbl.configure(text=lbl, fg=col)
+        self._dot.setStyleSheet(f"color: {col};")
+        self._slbl.setText(lbl)
+        self._slbl.setStyleSheet(f"color: {col};")
 
     def _start_refresh(self):
         def _r():
@@ -1942,25 +2218,32 @@ class App(tk.Tk):
                 q  = self._mgr._tx_q.qsize()
                 pq = self._mgr._prio_q.qsize()
                 txt = f"Q:{q}" if pq == 0 else f"Q:{q}  P:{pq}"
-                self._qlbl.configure(text=txt,
-                                     fg=C["off"] if q > 50 else C["sub"])
+                self._qlbl.setText(txt)
+                self._qlbl.setStyleSheet(f"color: {C['off'] if q > 50 else C['sub']};")
             except Exception:
                 pass
-            self.after(self.REFRESH, _r)
-        self.after(self.REFRESH, _r)
+            QTimer.singleShot(self.REFRESH, _r)
+        QTimer.singleShot(self.REFRESH, _r)
 
     def _start_hud_frame_drain(self):
         def _r():
             self._drain_hud_frames(batch_limit=1000)
-            self.after(self.HUD_FRAME_REFRESH, _r)
-        self.after(self.HUD_FRAME_REFRESH, _r)
+            QTimer.singleShot(self.HUD_FRAME_REFRESH, _r)
+        QTimer.singleShot(self.HUD_FRAME_REFRESH, _r)
 
     def _close(self):
         self._mgr.stop()
         self._hud_session.close()
-        self.destroy()
+
+    def closeEvent(self, event):
+        self._close()
+        event.accept()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    App(config=make_app_config(args)).mainloop()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = App(config=make_app_config(args))
+    window.show()
+    sys.exit(app.exec())
