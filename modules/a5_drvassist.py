@@ -6,6 +6,7 @@ Sends:
   0x29C  VZE_02  — Traffic sign display 2 (signs 4-5),        100ms  [static]
   0x1F0  EA_02   — Front Assist / object detection / eCall,    50ms  [replay]
   0x30F  SWA_01  — Lane keep / lane change assist (SWA/LKA),  100ms  [replay]
+  0x397  HC_01   — (placeholder),                              80ms  [replay]
 
 VZE_01 (0x181) layout from DBC MLBevo_Gen2: BO_ 385 VZE_01: 8 Gateway.
 Intel (@1+) bit layout: start_bit|length.
@@ -60,340 +61,68 @@ def unpack_vze_01(data):
     }
 
 
+# EA_02 (0x1F0): byte0=CRC, byte1=rolling counter 0–15, bytes 2–7=payload.
+# CRC LUT from log replay; MQB uses per-message CRC-8 with unknown padding.
+_EA_02_CRC = [0xD1, 0x6A, 0xDD, 0x01, 0x7E, 0xB3, 0xAB, 0xF2,
+              0xFF, 0x6F, 0x3B, 0x7B, 0xB7, 0x0E, 0xBF, 0x24]
+_EA_02_PAYLOAD = bytes.fromhex("400000000000")
+
+# SWA_01 (0x30F): byte0=CRC, byte1=counter (0,4,8,12), bytes 2–7=payload.
+_SWA_01_CRC = [0x5B, 0xE4, 0x0A, 0xB5]  # counter 0,4,8,12
+_SWA_01_PAYLOAD = bytes.fromhex("720000000100")
+
+# HC_01 (0x397): 3-frame base, byte 5 editable from UI.
+_HC_01_BASE = [
+    [0x00, 0x40, 0x00, 0x00, 0x50, 0xFA, 0x1F, 0x00],
+    [0x00, 0x40, 0x10, 0x00, 0x50, 0xFA, 0x1E, 0x00],
+    [0x00, 0x40, 0x00, 0x00, 0x50, 0xFA, 0x1F, 0x00],
+]
+
+
 class VzeECU(ECUModule):
     ECU_ID   = "A5"
     ECU_NAME = "Driver Assistance"
 
-    _SEQ_1F0 = [
-        bytes.fromhex("b70c400000000000"),
-        bytes.fromhex("240f400000000000"),
-        bytes.fromhex("6a01400000000000"),
-        bytes.fromhex("7e04400000000000"),
-        bytes.fromhex("ab06400000000000"),
-        bytes.fromhex("6f09400000000000"),
-        bytes.fromhex("7b0b400000000000"),
-        bytes.fromhex("bf0e400000000000"),
-        bytes.fromhex("d100400000000000"),
-        bytes.fromhex("0103400000000000"),
-        bytes.fromhex("b305400000000000"),
-        bytes.fromhex("ff08400000000000"),
-        bytes.fromhex("3b0a400000000000"),
-        bytes.fromhex("0e0d400000000000"),
-        bytes.fromhex("240f400000000000"),
-        bytes.fromhex("dd02400000000000"),
-        bytes.fromhex("7e04400000000000"),
-        bytes.fromhex("f207400000000000"),
-        bytes.fromhex("6f09400000000000"),
-        bytes.fromhex("b70c400000000000"),
-        bytes.fromhex("bf0e400000000000"),
-        bytes.fromhex("6a01400000000000"),
-        bytes.fromhex("0103400000000000"),
-        bytes.fromhex("ab06400000000000"),
-        bytes.fromhex("ff08400000000000"),
-        bytes.fromhex("7b0b400000000000"),
-        bytes.fromhex("0e0d400000000000"),
-        bytes.fromhex("d100400000000000"),
-        bytes.fromhex("dd02400000000000"),
-        bytes.fromhex("b305400000000000"),
-        bytes.fromhex("f207400000000000"),
-        bytes.fromhex("3b0a400000000000"),
-        bytes.fromhex("b70c400000000000"),
-        bytes.fromhex("240f400000000000"),
-        bytes.fromhex("6a01400000000000"),
-        bytes.fromhex("7e04400000000000"),
-        bytes.fromhex("ab06400000000000"),
-        bytes.fromhex("6f09400000000000"),
-        bytes.fromhex("7b0b400000000000"),
-        bytes.fromhex("bf0e400000000000"),
-        bytes.fromhex("d100400000000000"),
-        bytes.fromhex("0103400000000000"),
-        bytes.fromhex("b305400000000000"),
-        bytes.fromhex("ff08400000000000"),
-        bytes.fromhex("3b0a400000000000"),
-        bytes.fromhex("0e0d400000000000"),
-        bytes.fromhex("240f400000000000"),
-        bytes.fromhex("dd02400000000000"),
-        bytes.fromhex("7e04400000000000"),
-        bytes.fromhex("f207400000000000"),
-        bytes.fromhex("6f09400000000000"),
-        bytes.fromhex("b70c400000000000"),
-        bytes.fromhex("bf0e400000000000"),
-        bytes.fromhex("6a01400000000000"),
-        bytes.fromhex("0103400000000000"),
-        bytes.fromhex("ab06400000000000"),
-        bytes.fromhex("ff08400000000000"),
-        bytes.fromhex("7b0b400000000000"),
-        bytes.fromhex("0e0d400000000000"),
-        bytes.fromhex("d100400000000000"),
-        bytes.fromhex("dd02400000000000"),
-        bytes.fromhex("b305400000000000"),
-        bytes.fromhex("f207400000000000"),
-        bytes.fromhex("3b0a400000000000"),
-        bytes.fromhex("b70c400000000000"),
-        bytes.fromhex("240f400000000000"),
-        bytes.fromhex("6a01400000000000"),
-        bytes.fromhex("7e04400000000000"),
-        bytes.fromhex("ab06400000000000"),
-        bytes.fromhex("6f09400000000000"),
-        bytes.fromhex("7b0b400000000000"),
-        bytes.fromhex("bf0e400000000000"),
-        bytes.fromhex("d100400000000000"),
-        bytes.fromhex("0103400000000000"),
-        bytes.fromhex("b305400000000000"),
-        bytes.fromhex("ff08400000000000"),
-        bytes.fromhex("3b0a400000000000"),
-        bytes.fromhex("0e0d400000000000"),
-        bytes.fromhex("240f400000000000"),
-        bytes.fromhex("dd02400000000000"),
-        bytes.fromhex("7e04400000000000"),
-        bytes.fromhex("f207400000000000"),
-        bytes.fromhex("6f09400000000000"),
-        bytes.fromhex("b70c400000000000"),
-        bytes.fromhex("bf0e400000000000"),
-        bytes.fromhex("6a01400000000000"),
-        bytes.fromhex("0103400000000000"),
-        bytes.fromhex("ab06400000000000"),
-        bytes.fromhex("ff08400000000000"),
-        bytes.fromhex("7b0b400000000000"),
-        bytes.fromhex("0e0d400000000000"),
-        bytes.fromhex("d100400000000000"),
-        bytes.fromhex("dd02400000000000"),
-        bytes.fromhex("b305400000000000"),
-        bytes.fromhex("f207400000000000"),
-        bytes.fromhex("3b0a400000000000"),
-        bytes.fromhex("b70c400000000000"),
-        bytes.fromhex("240f400000000000"),
-        bytes.fromhex("6a01400000000000"),
-        bytes.fromhex("7e04400000000000"),
-        bytes.fromhex("ab06400000000000"),
-        bytes.fromhex("6f09400000000000"),
-        bytes.fromhex("7b0b400000000000"),
-        bytes.fromhex("bf0e400000000000"),
-        bytes.fromhex("d100400000000000"),
-        bytes.fromhex("0103400000000000"),
-        bytes.fromhex("b305400000000000"),
-        bytes.fromhex("ff08400000000000"),
-        bytes.fromhex("3b0a400000000000"),
-        bytes.fromhex("0e0d400000000000"),
-        bytes.fromhex("240f400000000000"),
-        bytes.fromhex("dd02400000000000"),
-        bytes.fromhex("7e04400000000000"),
-        bytes.fromhex("f207400000000000"),
-        bytes.fromhex("6f09400000000000"),
-        bytes.fromhex("b70c400000000000"),
-        bytes.fromhex("bf0e400000000000"),
-        bytes.fromhex("6a01400000000000"),
-        bytes.fromhex("0103400000000000"),
-        bytes.fromhex("ab06400000000000"),
-        bytes.fromhex("ff08400000000000"),
-        bytes.fromhex("7b0b400000000000"),
-        bytes.fromhex("0e0d400000000000"),
-        bytes.fromhex("d100400000000000"),
-        bytes.fromhex("dd02400000000000"),
-        bytes.fromhex("b305400000000000"),
-        bytes.fromhex("f207400000000000"),
-        bytes.fromhex("3b0a400000000000"),
-        bytes.fromhex("b70c400000000000"),
-        bytes.fromhex("240f400000000000"),
-        bytes.fromhex("6a01400000000000"),
-        bytes.fromhex("7e04400000000000"),
-        bytes.fromhex("ab06400000000000"),
-        bytes.fromhex("6f09400000000000"),
-        bytes.fromhex("7b0b400000000000"),
-        bytes.fromhex("bf0e400000000000"),
-        bytes.fromhex("d100400000000000"),
-        bytes.fromhex("0103400000000000"),
-        bytes.fromhex("b305400000000000"),
-        bytes.fromhex("ff08400000000000"),
-        bytes.fromhex("3b0a400000000000"),
-        bytes.fromhex("0e0d400000000000"),
-        bytes.fromhex("240f400000000000"),
-        bytes.fromhex("dd02400000000000"),
-        bytes.fromhex("7e04400000000000"),
-        bytes.fromhex("f207400000000000"),
-        bytes.fromhex("6f09400000000000"),
-        bytes.fromhex("b70c400000000000"),
-        bytes.fromhex("bf0e400000000000"),
-        bytes.fromhex("6a01400000000000"),
-    ]
-
-    _SEQ_30F = [
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-        bytes.fromhex("e404720000000100"),
-        bytes.fromhex("0a08720000000100"),
-        bytes.fromhex("b50c720000000100"),
-        bytes.fromhex("5b00720000000100"),
-    ]
-
     MESSAGES = [
         (0x181, "VZE_01",  200, pack_vze_01()),  # editable from UI; DBC cycle 200ms
         (0x29C, "VZE_02",  200, [0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00]),  # log: 200ms
-        (0x1F0, "EA_02",    50, [0xB7, 0x0C, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00]),
-        (0x30F, "SWA_01",  100, [0xB5, 0x0C, 0x72, 0x00, 0x00, 0x00, 0x01, 0x00]),
+        (0x1F0, "EA_02",    50, [_EA_02_CRC[0], 0, *_EA_02_PAYLOAD]),
+        (0x30F, "SWA_01",  100, [_SWA_01_CRC[0], 0, *_SWA_01_PAYLOAD]),
+        (0x397, "HC_01",    80, [0x00, 0x40, 0x00, 0x00, 0x50, 0xFA, 0x1F, 0x00]),  # byte 4 editable
     ]
 
     def __init__(self, log_cb=None):
         super().__init__(log_cb)
-        self._idx_1f0 = 0
-        self._idx_30f = 0
+        self._ctr_1f0 = 0
+        self._ctr_30f = 0
+        self._idx_hc = 0
+        self._hc_byte4 = 0x50
 
     def set_enabled(self, on: bool):
         self.enabled = on
 
+    def set_hc_byte4(self, val: int):
+        self._hc_byte4 = max(0, min(0xFF, int(val))) & 0xFF
+
+    def get_hc_byte4(self) -> int:
+        return self._hc_byte4
+
     def _next_frame(self, arb_id):
         if arb_id == 0x1F0:
-            d = self._SEQ_1F0[self._idx_1f0 % len(self._SEQ_1F0)]
-            self._idx_1f0 += 1
-            return d
+            ctr = self._ctr_1f0 % 16
+            self._ctr_1f0 += 1
+            return bytes([_EA_02_CRC[ctr], ctr, *_EA_02_PAYLOAD])
         if arb_id == 0x30F:
-            d = self._SEQ_30F[self._idx_30f % len(self._SEQ_30F)]
-            self._idx_30f += 1
-            return d
+            ctr_idx = self._ctr_30f % 4
+            ctr_val = ctr_idx * 4  # 0, 4, 8, 12
+            self._ctr_30f += 1
+            return bytes([_SWA_01_CRC[ctr_idx], ctr_val, *_SWA_01_PAYLOAD])
+        if arb_id == 0x397:
+            base = _HC_01_BASE[self._idx_hc % len(_HC_01_BASE)]
+            self._idx_hc += 1
+            frame = list(base)
+            frame[4] = self._hc_byte4
+            return bytes(frame)
         return None
 
     def _run(self):
@@ -410,8 +139,8 @@ class VzeECU(ECUModule):
                     frame = self._next_frame(s.arb_id)
                     if frame is not None:
                         with self._lock:
-                            s.data = frame
-                    self._enqueue(s.arb_id, s.data)
+                            s.data = list(frame)
+                    self._enqueue(s.arb_id, s.next_payload())
                     with self._lock:
                         s.tx_count += 1
                         s.last_tx   = now

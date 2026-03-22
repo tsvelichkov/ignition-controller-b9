@@ -187,6 +187,9 @@ DEFAULT_APP_CONFIG = {
     "hud_distance_graph": 0x64,
     "hud_distance_unit": "m",
     "hud_street_name": "Offroad",
+    "hud_turn_to": "",
+    "hud_signpost": "",
+    "hud_maneuver_sidestreets": [],
     "hud_lane_guidance_enabled": False,
     "hud_lane_num_lanes": 3,
     "hud_lane_recommended": 2,
@@ -1095,6 +1098,7 @@ class App(QMainWindow):
         nav_content_layout.addWidget(nav_scroll_part)
         nav_content_layout.addWidget(nav_hud_part)
         nav_content_layout.addStretch()
+        nav_content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         nav_scroll.setWidget(nav_content)
         tab_nav_layout.addWidget(nav_scroll, 1)
         nav_footer = QWidget()
@@ -1121,10 +1125,52 @@ class App(QMainWindow):
         vze_content_layout.setContentsMargins(0, 0, 0, 0)
         scroll_part, footer_part = self._build_vze_tab(tab_vze)
         vze_content_layout.addWidget(scroll_part)
+        vze_content_layout.addStretch()
+        vze_content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         vze_scroll.setWidget(vze_content)
         tab_vze_layout.addWidget(vze_scroll, 1)
         tab_vze_layout.addWidget(footer_part)
         self._left_notebook.addTab(tab_vze, "VZE")
+        # HC tab — 0x397 byte 5 bits (A5-gated)
+        tab_hc = QWidget()
+        tab_hc_layout = QVBoxLayout(tab_hc)
+        tab_hc_layout.setContentsMargins(4, 4, 4, 4)
+        hc_scroll = QScrollArea()
+        hc_scroll.setWidgetResizable(True)
+        hc_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        hc_scroll.setStyleSheet(f"QScrollArea {{ background: {C['bg']}; border: none; }}")
+        hc_content = QWidget()
+        hc_content.setStyleSheet(f"background: {C['bg']};")
+        hc_content_layout = QVBoxLayout(hc_content)
+        hc_content_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_part, footer_part = self._build_hc_tab(tab_hc)
+        hc_content_layout.addWidget(scroll_part)
+        hc_content_layout.addStretch()
+        hc_content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        hc_scroll.setWidget(hc_content)
+        tab_hc_layout.addWidget(hc_scroll, 1)
+        tab_hc_layout.addWidget(footer_part)
+        self._left_notebook.addTab(tab_hc, "HC")
+        # Fuel tab — 0x644 fuel level (BCM2)
+        tab_fuel = QWidget()
+        tab_fuel_layout = QVBoxLayout(tab_fuel)
+        tab_fuel_layout.setContentsMargins(4, 4, 4, 4)
+        fuel_scroll = QScrollArea()
+        fuel_scroll.setWidgetResizable(True)
+        fuel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        fuel_scroll.setStyleSheet(f"QScrollArea {{ background: {C['bg']}; border: none; }}")
+        fuel_content = QWidget()
+        fuel_content.setStyleSheet(f"background: {C['bg']};")
+        fuel_content_layout = QVBoxLayout(fuel_content)
+        fuel_content_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_part, footer_part = self._build_fuel_tab(tab_fuel)
+        fuel_content_layout.addWidget(scroll_part)
+        fuel_content_layout.addStretch()
+        fuel_content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        fuel_scroll.setWidget(fuel_content)
+        tab_fuel_layout.addWidget(fuel_scroll, 1)
+        tab_fuel_layout.addWidget(footer_part)
+        self._left_notebook.addTab(tab_fuel, "Fuel")
         left_layout.addWidget(self._left_notebook, 1)
         content_layout.addWidget(left)
 
@@ -1261,6 +1307,9 @@ class App(QMainWindow):
             "distance_graph": int(self._cfg.get("hud_distance_graph", 0x64)) & 0xFF,
             "distance_unit": self._cfg.get("hud_distance_unit", "m"),
             "street_name": self._cfg.get("hud_street_name", "Offroad"),
+            "turn_to": self._cfg.get("hud_turn_to", ""),
+            "signpost": self._cfg.get("hud_signpost", ""),
+            "maneuver_sidestreets": self._cfg.get("hud_maneuver_sidestreets", []),
             "arrow_main": self._cfg.get("hud_arrow_main"),
             "arrow_dir": self._cfg.get("hud_arrow_dir"),
             "lane_guidance_enabled": bool(self._cfg.get("hud_lane_guidance_enabled", False)),
@@ -1445,6 +1494,7 @@ class App(QMainWindow):
         self._nav_distance_graph_var.setValue(min(100, max(0, int(settings.get('distance_graph', 0x64)) & 0xFF)))
         graph_row_layout.addWidget(self._nav_distance_graph_var)
         dist_layout.addWidget(graph_row)
+        dist_grp.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
 
         maneuver_grp = _panel(pnl, "Next maneuver")
         maneuver_grp_layout = QVBoxLayout(maneuver_grp)
@@ -1484,11 +1534,32 @@ class App(QMainWindow):
         maneuver_row_layout.addWidget(self._nav_arrow_dir_var)
         maneuver_row_layout.addStretch()
         maneuver_grp_layout.addWidget(maneuver_row)
+        maneuver_grp_layout.addWidget(QLabel("Maneuver sidestreets:"))
+        maneuver_ss = settings.get("maneuver_sidestreets", [])
+        maneuver_ss_str = " ".join(f"{b:02X}" for b in maneuver_ss) if maneuver_ss else ""
+        self._nav_maneuver_sidestr_var = QLineEdit(maneuver_ss_str)
+        self._nav_maneuver_sidestr_var.setPlaceholderText("40 80  (hex bytes, max 17)")
+        self._nav_maneuver_sidestr_var.setMinimumHeight(INPUT_MIN_H)
+        self._nav_maneuver_sidestr_var.setStyleSheet(_input_style)
+        maneuver_grp_layout.addWidget(self._nav_maneuver_sidestr_var)
         maneuver_grp_layout.addWidget(QLabel("Street name:"))
         self._nav_street_var = QLineEdit(str(settings["street_name"]))
         self._nav_street_var.setMinimumHeight(INPUT_MIN_H)
         self._nav_street_var.setStyleSheet(_input_style)
         maneuver_grp_layout.addWidget(self._nav_street_var)
+        maneuver_grp_layout.addWidget(QLabel("TurnToInfo turn to:"))
+        self._nav_turn_to_var = QLineEdit(str(settings.get("turn_to", "")))
+        self._nav_turn_to_var.setPlaceholderText("Street to turn onto (e.g. Main St)")
+        self._nav_turn_to_var.setMinimumHeight(INPUT_MIN_H)
+        self._nav_turn_to_var.setStyleSheet(_input_style)
+        maneuver_grp_layout.addWidget(self._nav_turn_to_var)
+        maneuver_grp_layout.addWidget(QLabel("TurnToInfo signpost:"))
+        self._nav_signpost_var = QLineEdit(str(settings.get("signpost", "")))
+        self._nav_signpost_var.setPlaceholderText("Signpost (e.g. Exit 42, A1)")
+        self._nav_signpost_var.setMinimumHeight(INPUT_MIN_H)
+        self._nav_signpost_var.setStyleSheet(_input_style)
+        maneuver_grp_layout.addWidget(self._nav_signpost_var)
+        maneuver_grp.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
 
         dist_maneuver_row = QWidget()
         dist_maneuver_layout = QHBoxLayout(dist_maneuver_row)
@@ -1529,6 +1600,7 @@ class App(QMainWindow):
         self._nav_lane_rows_layout = QVBoxLayout(self._nav_lane_rows_frame)
         self._nav_lane_rows_layout.setContentsMargins(0, 0, 0, 0)
         lane_grp_layout.addWidget(self._nav_lane_rows_frame)
+        lane_grp.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
 
         self._nav_lane_vars = []
         initial_lanes = settings.get("lanes")
@@ -1571,10 +1643,11 @@ class App(QMainWindow):
             QComboBox {{ background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px; }}
         """)
         maneuver_state_layout.addWidget(self._nav_maneuver_state_combo)
+        maneuver_state_grp.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
 
         exitview_grp = _panel(pnl, "Exit view")
         exitview_layout = QVBoxLayout(exitview_grp)
-        exitview_layout.setContentsMargins(0, 4, 0, 4)
+        exitview_layout.setContentsMargins(10, 4, 4, 4)
         variant_row = QWidget()
         variant_row_layout = QHBoxLayout(variant_row)
         variant_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -1615,6 +1688,7 @@ class App(QMainWindow):
         id_row_layout.addWidget(exitview_plus_btn)
         id_row_layout.addStretch()
         exitview_layout.addWidget(id_row)
+        exitview_grp.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         idx = self._nav_exitview_variant_combo.findText(settings.get("exitview_variant", "EU"))
         if idx >= 0:
             self._nav_exitview_variant_combo.setCurrentIndex(idx)
@@ -1658,6 +1732,12 @@ class App(QMainWindow):
     def _find_a5_ecu(self):
         for e in self._mgr.get_ecus():
             if getattr(e, "ECU_ID", None) == "A5":
+                return e
+        return None
+
+    def _find_bcm2_ecu(self):
+        for e in self._mgr.get_ecus():
+            if getattr(e, "ECU_ID", None) == "46":
                 return e
         return None
 
@@ -1734,10 +1814,6 @@ class App(QMainWindow):
         pnl = QWidget(parent)
         layout = QVBoxLayout(pnl)
         layout.setContentsMargins(10, 12, 10, 10)
-        self._vze_a5_status_lbl = QLabel("Module A5: checking…")
-        self._vze_a5_status_lbl.setStyleSheet(f"color: {C['sub']};")
-        layout.addWidget(self._vze_a5_status_lbl)
-        QTimer.singleShot(100, self._update_vze_a5_status)
 
         a5_mod = sys.modules.get("a5_drvassist")
         if not a5_mod or not getattr(a5_mod, "pack_vze_01", None):
@@ -1820,15 +1896,239 @@ class App(QMainWindow):
         QTimer.singleShot(50, self._update_vze_bytes_display)
         return pnl, footer
 
-    def _update_vze_a5_status(self):
+    def _build_hc_tab(self, parent):
+        """HC tab: 0x397 byte 4 — heading control + left/right lane markings."""
+        pnl = QWidget(parent)
+        layout = QVBoxLayout(pnl)
+        layout.setContentsMargins(10, 12, 10, 10)
+
+        a5_mod = sys.modules.get("a5_drvassist")
+        if not a5_mod:
+            layout.addWidget(QLabel("a5_drvassist not loaded."))
+            return pnl, QWidget()
+
+        # (left, right) -> byte value. Pattern: upper nibble encodes left+right; green=0, gray=1, red=2.
+        self._HC_LEFT_RIGHT_TO_BYTE = {
+            ("green", "green"): 0x10,
+            ("green", "gray"): 0x90,
+            ("green", "red"): 0xb0,
+            ("gray", "green"): 0x60,
+            ("gray", "gray"): 0x50,
+            ("gray", "red"): 0x70,
+            ("red", "green"): 0xe0,
+            ("red", "gray"): 0xd0,  # left red, right gray
+            ("red", "red"): 0xf0,
+        }
+        self._HC_BYTE_TO_LEFT_RIGHT = {v: k for k, v in self._HC_LEFT_RIGHT_TO_BYTE.items()}
+
+        hc_gb = _panel(parent, "HC_01 (0x397) Byte 4 — lane markings")
+        hc_layout = QVBoxLayout(hc_gb)
+        hc_layout.setContentsMargins(10, 10, 10, 10)
+
+        self._hc_enabled_cb = QCheckBox("Heading control enabled")
+        self._hc_enabled_cb.setStyleSheet(f"color: {C['text']};")
+        self._hc_enabled_cb.setChecked(True)
+        self._hc_enabled_cb.stateChanged.connect(self._apply_hc_settings)
+        hc_layout.addWidget(self._hc_enabled_cb)
+
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 8, 0, 0)
+        row_layout.addWidget(QLabel("Left marking:"))
+        self._hc_left_combo = QComboBox()
+        self._hc_left_combo.setMinimumHeight(INPUT_MIN_H)
+        self._hc_left_combo.setStyleSheet(f"""
+            QComboBox {{ background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px; }}
+            QComboBox::drop-down {{ border: none; }}
+        """)
+        self._hc_left_combo.addItems(["green", "gray", "red"])
+        self._hc_left_combo.setCurrentIndex(1)  # gray default
+        self._hc_left_combo.currentIndexChanged.connect(self._hc_dropdowns_changed)
+        row_layout.addWidget(self._hc_left_combo)
+        row_layout.addSpacing(16)
+        row_layout.addWidget(QLabel("Right marking:"))
+        self._hc_right_combo = QComboBox()
+        self._hc_right_combo.setMinimumHeight(INPUT_MIN_H)
+        self._hc_right_combo.setStyleSheet(f"""
+            QComboBox {{ background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px; }}
+            QComboBox::drop-down {{ border: none; }}
+        """)
+        self._hc_right_combo.addItems(["green", "gray", "red"])
+        self._hc_right_combo.setCurrentIndex(1)  # gray default
+        self._hc_right_combo.currentIndexChanged.connect(self._hc_dropdowns_changed)
+        row_layout.addWidget(self._hc_right_combo)
+        row_layout.addStretch()
+        hc_layout.addWidget(row)
+        layout.addWidget(hc_gb)
+
+        footer = QWidget()
+        footer.setStyleSheet(f"background: {C['bg']};")
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 8, 0, 0)
+        btn_row = QWidget()
+        btn_layout = QHBoxLayout(btn_row)
+        apply_btn = QPushButton("Apply HC (0x397)")
+        apply_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 6px 12px; }}")
+        apply_btn.clicked.connect(self._apply_hc_settings)
+        load_btn = QPushButton("Load from A5")
+        load_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 6px 12px; }}")
+        load_btn.clicked.connect(self._load_hc_from_a5)
+        btn_layout.addWidget(apply_btn)
+        btn_layout.addWidget(load_btn)
+        footer_layout.addWidget(btn_row)
+        self._hc_byte4_lbl = QLabel("Byte 4: 0x50")
+        self._hc_byte4_lbl.setStyleSheet(f"color: {C['sub']}; font-family: Consolas; font-size: 11px;")
+        footer_layout.addWidget(self._hc_byte4_lbl)
+        QTimer.singleShot(50, self._update_hc_byte4_display)
+        return pnl, footer
+
+    def _build_fuel_tab(self, parent):
+        """Fuel tab: 0x644 fuel level (BCM2). Manual byte entry."""
+        pnl = QWidget(parent)
+        layout = QVBoxLayout(pnl)
+        layout.setContentsMargins(10, 12, 10, 10)
+
+        fuel_gb = _panel(parent, "0x644 Fuel level (BCM2)")
+        fuel_layout = QVBoxLayout(fuel_gb)
+        fuel_layout.setContentsMargins(10, 10, 10, 10)
+
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.addWidget(QLabel("Byte 0:"))
+        self._fuel_b0_spin = QSpinBox()
+        self._fuel_b0_spin.setMinimumHeight(INPUT_MIN_H)
+        self._fuel_b0_spin.setRange(0, 255)
+        self._fuel_b0_spin.setValue(0x3B)
+        self._fuel_b0_spin.setDisplayIntegerBase(16)
+        self._fuel_b0_spin.setPrefix("0x")
+        self._fuel_b0_spin.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
+        row_layout.addWidget(self._fuel_b0_spin)
+        row_layout.addWidget(QLabel("Byte 1:"))
+        self._fuel_b1_spin = QSpinBox()
+        self._fuel_b1_spin.setMinimumHeight(INPUT_MIN_H)
+        self._fuel_b1_spin.setRange(0, 255)
+        self._fuel_b1_spin.setValue(0x30)
+        self._fuel_b1_spin.setDisplayIntegerBase(16)
+        self._fuel_b1_spin.setPrefix("0x")
+        self._fuel_b1_spin.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
+        row_layout.addWidget(self._fuel_b1_spin)
+        row_layout.addWidget(QLabel("Byte 2:"))
+        self._fuel_b2_spin = QSpinBox()
+        self._fuel_b2_spin.setMinimumHeight(INPUT_MIN_H)
+        self._fuel_b2_spin.setRange(0, 255)
+        self._fuel_b2_spin.setValue(0x04)
+        self._fuel_b2_spin.setDisplayIntegerBase(16)
+        self._fuel_b2_spin.setPrefix("0x")
+        self._fuel_b2_spin.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
+        row_layout.addWidget(self._fuel_b2_spin)
+        row_layout.addWidget(QLabel("(S1: b0+b1lo*256, S2: b1hi*16+b2)"))
+        row_layout.addStretch()
+        fuel_layout.addWidget(row)
+        layout.addWidget(fuel_gb)
+
+        footer = QWidget()
+        footer.setStyleSheet(f"background: {C['bg']};")
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 8, 0, 0)
+        apply_btn = QPushButton("Apply Fuel (0x644)")
+        apply_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 6px 12px; }}")
+        apply_btn.clicked.connect(self._apply_fuel_settings)
+        footer_layout.addWidget(apply_btn)
+        self._fuel_byte_lbl = QLabel("Payload: 3b 30 04 00 00 00 aa dd")
+        self._fuel_byte_lbl.setStyleSheet(f"color: {C['sub']}; font-family: Consolas; font-size: 11px;")
+        footer_layout.addWidget(self._fuel_byte_lbl)
+        QTimer.singleShot(50, self._update_fuel_display)
+        return pnl, footer
+
+    def _apply_fuel_settings(self):
+        ecu = self._find_bcm2_ecu()
+        if ecu is None:
+            self._log("Apply Fuel: BCM2 (46) not loaded")
+            return
+        if not hasattr(ecu, "set_fuel_raw"):
+            self._log("Apply Fuel: set_fuel_raw not available")
+            return
+        b0 = getattr(self, "_fuel_b0_spin", None)
+        b1 = getattr(self, "_fuel_b1_spin", None)
+        b2 = getattr(self, "_fuel_b2_spin", None)
+        if b0 is None or b1 is None or b2 is None:
+            return
+        ecu.set_fuel_raw(b0.value(), b1.value(), b2.value())
+        self._update_fuel_display()
+        self._log(f"Apply Fuel: 0x644 = 0x{b0.value():02X} 0x{b1.value():02X} 0x{b2.value():02X}")
+
+    def _update_fuel_display(self):
+        if not hasattr(self, "_fuel_byte_lbl") or not self._fuel_byte_lbl:
+            return
+        b0_spin = getattr(self, "_fuel_b0_spin", None)
+        b1_spin = getattr(self, "_fuel_b1_spin", None)
+        b2_spin = getattr(self, "_fuel_b2_spin", None)
+        if not b0_spin or not b1_spin or not b2_spin:
+            return
+        b0, b1, b2 = b0_spin.value(), b1_spin.value(), b2_spin.value()
+        self._fuel_byte_lbl.setText(f"Payload: {b0:02x} {b1:02x} {b2:02x} 00 00 00 aa dd")
+
+    def _hc_form_to_byte4(self):
+        if not getattr(self, "_hc_enabled_cb", None) or not self._hc_enabled_cb.isChecked():
+            return 0x0
+        left = getattr(self, "_hc_left_combo", None)
+        right = getattr(self, "_hc_right_combo", None)
+        if not left or not right:
+            return 0x50
+        left_val = left.currentText()
+        right_val = right.currentText()
+        return self._HC_LEFT_RIGHT_TO_BYTE.get((left_val, right_val), 0x50)
+
+    def _hc_dropdowns_changed(self):
+        if getattr(self, "_hc_loading", False):
+            return
+        self._apply_hc_settings()
+
+    def _update_hc_byte4_display(self):
+        if not hasattr(self, "_hc_byte4_lbl") or not self._hc_byte4_lbl:
+            return
+        val = self._hc_form_to_byte4()
+        self._hc_byte4_lbl.setText(f"Byte 4: 0x{val:02X} ({val})")
+
+    def _load_hc_from_a5(self):
         ecu = self._find_a5_ecu()
-        if hasattr(self, "_vze_a5_status_lbl") and self._vze_a5_status_lbl:
-            if ecu is not None:
-                self._vze_a5_status_lbl.setText("Module A5: loaded")
-                self._vze_a5_status_lbl.setStyleSheet(f"color: {C['on']};")
-            else:
-                self._vze_a5_status_lbl.setText("Module A5: not loaded")
-                self._vze_a5_status_lbl.setStyleSheet(f"color: {C['off']};")
+        if ecu is None:
+            self._log("Load HC: module A5 not loaded")
+            return
+        if not hasattr(ecu, "get_hc_byte4"):
+            self._log("Load HC: get_hc_byte4 not available")
+            return
+        val = ecu.get_hc_byte4()
+        if not hasattr(self, "_hc_enabled_cb"):
+            return
+        self._hc_loading = True
+        try:
+            self._hc_enabled_cb.setChecked(val != 0x0)
+            if val != 0x0 and val in self._HC_BYTE_TO_LEFT_RIGHT:
+                left, right = self._HC_BYTE_TO_LEFT_RIGHT[val]
+                idx = ["green", "gray", "red"].index(left)
+                self._hc_left_combo.setCurrentIndex(idx)
+                idx = ["green", "gray", "red"].index(right)
+                self._hc_right_combo.setCurrentIndex(idx)
+        finally:
+            self._hc_loading = False
+        self._update_hc_byte4_display()
+        self._apply_hc_settings()
+        self._log("Load HC: form filled from current 0x397 byte 4")
+
+    def _apply_hc_settings(self):
+        if getattr(self, "_hc_loading", False):
+            return
+        ecu = self._find_a5_ecu()
+        if ecu is None:
+            return
+        if not hasattr(ecu, "set_hc_byte4"):
+            return
+        val = self._hc_form_to_byte4()
+        ecu.set_hc_byte4(val)
+        self._update_hc_byte4_display()
+        self._log(f"Apply HC: 0x397 byte 4 = 0x{val:02X}")
 
     def _vze_bits_to_bytes(self):
         """Build bytes 4–7 from First sign checkboxes (B4.3,4.6,4.7, B5.0) + other bits grid."""
@@ -2017,6 +2317,9 @@ class App(QMainWindow):
             return
 
         street_name = (self._nav_street_var.text() or "").strip() or "Offroad"
+        turn_to = (self._nav_turn_to_var.text() or "").strip()
+        signpost = (self._nav_signpost_var.text() or "").strip()
+        maneuver_sidestreets = self._parse_sidestreets(self._nav_maneuver_sidestr_var.text())
         enabled = self._nav_enabled_cb.isChecked()
         distance_valid = self._nav_distance_valid_cb.isChecked()
         distance_enabled = self._nav_distance_enabled_cb.isChecked()
@@ -2055,6 +2358,9 @@ class App(QMainWindow):
         self._cfg["hud_distance_graph"] = distance_graph
         self._cfg["hud_distance_unit"] = distance_unit
         self._cfg["hud_street_name"] = street_name
+        self._cfg["hud_turn_to"] = turn_to
+        self._cfg["hud_signpost"] = signpost
+        self._cfg["hud_maneuver_sidestreets"] = maneuver_sidestreets
         self._cfg["hud_arrow_main"] = arrow_main
         self._cfg["hud_arrow_dir"] = arrow_dir
         self._cfg["hud_lane_guidance_enabled"] = lane_guidance_enabled
@@ -2078,6 +2384,9 @@ class App(QMainWindow):
                 distance_graph=distance_graph,
                 distance_unit=distance_unit,
                 street_name=street_name,
+                turn_to=turn_to,
+                signpost=signpost,
+                maneuver_sidestreets=maneuver_sidestreets,
                 arrow_main=arrow_main,
                 arrow_dir=arrow_dir,
                 lane_guidance_enabled=lane_guidance_enabled,
@@ -2096,6 +2405,8 @@ class App(QMainWindow):
                 f" distance={distance_m}m"
                 f" graph=0x{distance_graph:02X}"
                 f" street={street_name}"
+                f" turn_to={turn_to!r}"
+                f" signpost={signpost!r}"
                 f" exitview={exitview_variant} id={exitview_id}"
                 f" maneuver_state={maneuver_state}"
             )

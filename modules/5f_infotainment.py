@@ -143,6 +143,39 @@ class InfotainmentECU(ECUModule):
         data = clean.encode("ascii", "replace")[:31]
         return [len(data)] + list(data)
 
+    def _has_turn_to_info(self):
+        """True if turn_to or signpost is non-empty (we have turn info to send)."""
+        turn_to = (self._cfg.get("hud_turn_to") or "").strip()
+        signpost = (self._cfg.get("hud_signpost") or "").strip()
+        return bool(turn_to or signpost)
+
+    def _maneuver_descriptor_payload(self):
+        """Build ManeuverDescriptor (0x17) payload: M1[main,dir,z_level,sidestreets_len,ss...] + M2 + M3. BAP-FC-NAV-SD p.53."""
+        arrow = self._configured_nav_arrow()
+        main = arrow["main"]
+        dir_byte = arrow["dir"]
+        ss = self._cfg.get("hud_maneuver_sidestreets", [])
+        if isinstance(ss, (str, bytes)):
+            ss = []
+        ss = [int(b) & 0xFF for b in ss[:17]]
+        m1 = [main, dir_byte, 0x00, len(ss)] + ss
+        m2 = [0x00, 0x00, 0x00, 0x00]
+        m3 = [0x00, 0x00, 0x00, 0x00]
+        return m1 + m2 + m3
+
+    def _turn_to_info_payload(self):
+        """Build TurnToInfo (0x14) payload: turn_to (len+UTF8) + signpost (len+UTF8). BAP-FC-NAV-SD p.41.
+        Returns [0x00, 0x00] when no turn info (turn_to and signpost empty)."""
+        turn_to = (self._cfg.get("hud_turn_to") or "").strip()
+        signpost = (self._cfg.get("hud_signpost") or "").strip()
+        if not turn_to and not signpost:
+            return [0x00, 0x00]
+        turn_bytes = turn_to.encode("ascii", "replace")[:31]
+        sign_bytes = signpost.encode("ascii", "replace")[:31]
+        payload = [len(turn_bytes)] + list(turn_bytes)
+        payload.extend([len(sign_bytes)] + list(sign_bytes))
+        return payload
+
     def __init__(self, log_cb=None, config=None):
         super().__init__(log_cb)
         self._cfg = config or {}
@@ -203,6 +236,9 @@ class InfotainmentECU(ECUModule):
             "exitview_variant": self._cfg.get("exitview_variant", "EU"),
             "exitview_id": max(0, min(65535, int(self._cfg.get("exitview_id", 0)))),
             "maneuver_state": self._cfg.get("maneuver_state", "CallForAction"),
+            "turn_to": self._cfg.get("hud_turn_to", ""),
+            "signpost": self._cfg.get("hud_signpost", ""),
+            "maneuver_sidestreets": self._cfg.get("hud_maneuver_sidestreets", []),
         }
 
     EXITVIEW_VARIANT_CODES = {"EU": 0x00, "NAR": 0x01, "ROW": 0x02, "ASIA": 0x03, "Unknown": 0xFF}
@@ -212,7 +248,8 @@ class InfotainmentECU(ECUModule):
                       arrow_main=None, arrow_dir=None,
                       distance_graph=None, distance_unit=None,
                       lane_guidance_enabled=None, lane_num_lanes=None, lane_recommended=None, lanes=None,
-                      exitview_variant=None, exitview_id=None, maneuver_state=None):
+                      exitview_variant=None, exitview_id=None, maneuver_state=None,
+                      turn_to=None, signpost=None, maneuver_sidestreets=None):
         was_enabled = bool(self._cfg.get("hud_nav_enabled", False))
         nav_toggled = False
         if enabled is not None:
@@ -265,6 +302,13 @@ class InfotainmentECU(ECUModule):
             self._cfg["exitview_id"] = max(0, min(65535, int(exitview_id)))
         if maneuver_state is not None:
             self._cfg["maneuver_state"] = str(maneuver_state)
+        if turn_to is not None:
+            self._cfg["hud_turn_to"] = str(turn_to).strip()
+        if signpost is not None:
+            self._cfg["hud_signpost"] = str(signpost).strip()
+        if maneuver_sidestreets is not None:
+            ss = maneuver_sidestreets if isinstance(maneuver_sidestreets, (list, tuple)) else []
+            self._cfg["hud_maneuver_sidestreets"] = [int(b) & 0xFF for b in ss[:17]]
         self._sync_nav_state()
         nav_enabled = bool(self._cfg.get("hud_nav_enabled", False))
         lane_enabled = bool(self._cfg.get("hud_lane_guidance_enabled", False))
@@ -362,8 +406,9 @@ class InfotainmentECU(ECUModule):
             state["12_DistanceToNextManeuver_m"] = max(int(arrow.get("dist_m", 0)), 0) if state["12_DistanceToNextManeuver_visible"] else None
             state["13_CurrentPositionInfo"] = self._encode_text_payload(self._cfg.get("hud_street_name", "Offroad"))
             state["14_TurnToInfo_session"] = [0x00, 0x00]
+            state["14_TurnToInfo_street"] = self._turn_to_info_payload()
             state["15_DistanceToDestination_m"] = max(int(arrow.get("dist_m", 0)), 0) if state["12_DistanceToNextManeuver_visible"] else None
-            state["17_ManeuverDescriptor"] = [main, arrow["dir"], 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+            state["17_ManeuverDescriptor"] = self._maneuver_descriptor_payload()
             state["_21_val"] = 0x5F if no_dist else arrow.get("dir", 0x00)
             state["25_FunctionSynchronisation"] = list(FUNC_SYNC_ACTIVE)
             state["26_InfoStates"] = 0xFF
@@ -382,10 +427,11 @@ class InfotainmentECU(ECUModule):
         state["12_DistanceToNextManeuver_m"] = None
         state["13_CurrentPositionInfo"] = self._encode_text_payload(self._cfg.get("hud_street_name", "Offroad"))
         state["14_TurnToInfo_session"] = [0x00, 0x01]
+        state["14_TurnToInfo_street"] = self._turn_to_info_payload()
         state["15_DistanceToDestination_m"] = None
         main = arrow["main"]
         no_dist = self._main_element_no_distance(main)
-        state["17_ManeuverDescriptor"] = [main, arrow["dir"], 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        state["17_ManeuverDescriptor"] = self._maneuver_descriptor_payload()
         state["_21_val"] = 0x5F if no_dist else arrow.get("dir", 0x00)
         state["25_FunctionSynchronisation"] = list(FUNC_SYNC_IDLE)
         state["26_InfoStates"] = 0x00
@@ -690,10 +736,16 @@ class InfotainmentECU(ECUModule):
     def _send_maneuver_descriptor(self):
         payload = list(self._nav_state["17_ManeuverDescriptor"])
         h17 = bap_st(0x17)
-        # BAP multi-frame: first frame 8 bytes max; 0x80/0x0C = first frame, 12-byte total; payload split across frames
-        frames = [[0x80, 0x0C] + h17 + payload[:4]]
-        frames.append([0xC0] + payload[4:11])
-        frames.append([0xC1] + payload[11:12])
+        # BAP multi-frame: first frame [0x80, len] + h17 + payload[:4]; continuation 0xC0+i + 7 bytes each
+        plen = len(payload)
+        frames = [[0x80, plen & 0xFF] + h17 + payload[:4]]
+        pos = 4
+        c = 0
+        while pos < plen:
+            chunk = payload[pos:pos + 7]
+            frames.append([0xC0 + c] + chunk)
+            pos += 7
+            c = (c + 1) & 0x0F
         self._tx_mf_atomic(HUD_S, frames)
 
     def _reply_known_hud_nav_function(self, fn, payload, source, opcode=None):
@@ -733,7 +785,8 @@ class InfotainmentECU(ECUModule):
             self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x13, self._current_position_info_payload(), atomic=True)
             return True
         if fn == 0x14:
-            self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x14, list(self._nav_state["14_TurnToInfo_session"]), atomic=True)
+            if self._has_turn_to_info():
+                self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x14, self._turn_to_info_payload(), atomic=True)
             return True
         if fn == 0x15:
             self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x15, self._destination_distance_payload(), atomic=True)
@@ -1038,7 +1091,8 @@ class InfotainmentECU(ECUModule):
         # MIB3 periodic extras
         self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x27, list(self._nav_state["27_ActiveRgType"]))
         self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x31, list(self._nav_state["31_Exitview"]))
-        self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x14, list(self._nav_state["14_TurnToInfo_street"]))
+        if self._has_turn_to_info():
+            self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x14, self._turn_to_info_payload())
         self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x16, list(self._nav_state["16_TimeToDestination"]))
         self._tx_bap(HUD_D, BAP_OP_STATUS, HUD_LSG, 0x2E, list(self._nav_state["2E_DestinationInfo"]), atomic=True)
         self._tx_bap(HUD_S, BAP_OP_STATUS, HUD_LSG, 0x2D, list(self._nav_state["2D_MapScale"]))

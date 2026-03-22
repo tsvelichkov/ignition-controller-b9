@@ -7,16 +7,6 @@ Always-on (ignition-independent):
   0x16A95414    NVEM_06        — 100ms  [16-frame replay]
   0x3E5         TSG_FT_02      — 100ms  [16-frame replay, BZ 0-15]
 
-  BCM-E BAP (29-bit, 0x17332A10 — node 0x2A, ~57ms cycle, ~4ms stagger):
-    fn=0x82  STATUS  node descriptor  (node=0x2A, 3 FGs, ver=01)
-    fn=0x78  SET MF  keepalive/heartbeat config
-    fn=0x84  STATUS  BAP protocol version 0x0A
-    fn=0x8F  STATUS  FG status
-    fn=0x90  SET MF  subscribe / cycle config
-    fn=0x91  STATUS  FG 0x11 value
-    fn=0x92  STATUS  FG 0x12 value
-    fn=0x93  STATUS  FG 0x13 value
-
   NM keepalives (29-bit, ~100ms in log):
     0x1B000010  NM_Gateway     — own node
     0x1B000014  NM_node_14     — Motor/ABS proxy
@@ -103,28 +93,6 @@ class GatewayECU(ECUModule):
             [0xD0, 0x1E, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ=14
             [0xE0, 0x1F, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ=15
         ]),
-
-        # ── BCM-E BAP (29-bit, 0x17332A10 — node 0x2A, ch 0x10, ~57ms cycle) ──
-        # 8 entries staggered ~4ms apart, sourced from 0000046.TXT / 0000050.TXT.
-        # Multi-frame messages send continuation back-to-back via replay list.
-        # fn=0x82  STATUS  node descriptor: node=0x2A, 3 FGs, proto ver=0x01
-        (0x17332A10,  "BCME_BAP_82",    57, [[0x3A, 0x82, 0x03, 0x00, 0x2A, 0x00, 0x03, 0x01]]),
-        # fn=0x78  SET MF  keepalive/heartbeat config  (header then cont back-to-back)
-        (0x17332A10,  "BCME_BAP_78",    57, [[0x80, 0x08, 0x3A, 0x83, 0x78, 0x01, 0xF0, 0x00],
-                                              [0xC0, 0x00, 0x00, 0x00, 0x00]]),
-        # fn=0x84  STATUS  BAP protocol version 0x0A
-        (0x17332A10,  "BCME_BAP_84",    57, [[0x3A, 0x84, 0x0A]]),
-        # fn=0x8F  STATUS  FG status
-        (0x17332A10,  "BCME_BAP_8F",    57, [[0x3A, 0x8F, 0x00, 0x00]]),
-        # fn=0x90  SET MF  subscribe / cycle config  (header then cont back-to-back)
-        (0x17332A10,  "BCME_BAP_90",    57, [[0x80, 0x05, 0x3A, 0x90, 0x00, 0x00, 0x00, 0x00],
-                                              [0xC0, 0x00]]),
-        # fn=0x91  STATUS
-        (0x17332A10,  "BCME_BAP_91",    57, [[0x3A, 0x91, 0x00, 0x00, 0x00]]),
-        # fn=0x92  STATUS
-        (0x17332A10,  "BCME_BAP_92",    57, [[0x3A, 0x92, 0x00, 0x00, 0x00, 0x00, 0x00]]),
-        # fn=0x93  STATUS
-        (0x17332A10,  "BCME_BAP_93",    57, [[0x3A, 0x93, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]]),
 
         # ── ICAN registration / function-status (29-bit, ~500ms) ─────────────
         # Byte 7 toggles between two alive states — replayed from log.
