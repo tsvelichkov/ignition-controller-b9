@@ -2,14 +2,15 @@
 modules/a5_drvassist.py — A5 Driver Assistance (Front Camera / VZE)
 
 Sends:
-  0x181  VZE_01  — Traffic sign display (speed limits etc),   100ms  [editable via UI]
-  0x29C  VZE_02  — Traffic sign display 2 (signs 4-5),        100ms  [static]
+  0x181  VZE_01  — Traffic sign display (speed limits etc),   200ms  [editable via UI]
+  0x29C  VZE_02  — Traffic sign display 2 (signs 4-5),        200ms  [static]
   0x1F0  EA_02   — Front Assist / object detection / eCall,    50ms  [replay]
   0x30F  SWA_01  — Lane keep / lane change assist (SWA/LKA),  100ms  [replay]
+  0x395  LWR_AFS_01 — AFS / headlight levelling (BO_ 917),     100ms  [DBC pack + rolling BZ]
   0x397  HC_01   — (placeholder),                              80ms  [replay]
 
 VZE_01 (0x181) layout from DBC MLBevo_Gen2: BO_ 385 VZE_01: 8 Gateway.
-Intel (@1+) bit layout: start_bit|length.
+LWR_AFS_01 (0x395): BO_ 917, ICAN V8.19.05F; Intel (@1+) — see pack_lwr_afs_01.
 """
 import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -61,6 +62,87 @@ def unpack_vze_01(data):
     }
 
 
+def _lwr_rd(data: bytes, start: int, length: int) -> int:
+    v = 0
+    for i in range(length):
+        b = start + i
+        if data[b // 8] & (1 << (b % 8)):
+            v |= 1 << i
+    return v
+
+
+def _lwr_wr(buf: bytearray, start: int, length: int, val: int) -> None:
+    val &= (1 << length) - 1
+    for i in range(length):
+        if (val >> i) & 1:
+            b = start + i
+            buf[b // 8] |= 1 << (b % 8)
+
+
+# BO_ 917 LWR_AFS_01 — (name, start_bit, bit_length); Intel @1+ (MLBevo ICAN DBC).
+_LWR_AFS_SPEC = (
+    ("afs_abbiegelicht_li_anf", 0, 1),
+    ("afs_abbiegelicht_re_anf", 1, 1),
+    ("afs_abbiegelicht_dimm_anf", 2, 1),
+    ("afs_verfuegbarkeit_glw", 3, 1),
+    ("afs_status_adaptive_lv", 4, 1),
+    ("afs_fernlicht_li_defekt", 5, 1),
+    ("afs_fernlicht_re_defekt", 6, 1),
+    ("afs_fernlicht_status", 7, 1),
+    ("lwr_afs_bz", 8, 4),
+    ("afs_lampe", 12, 1),
+    ("lwr_lampe", 13, 1),
+    ("afs_fehlertext", 14, 1),
+    ("afs_led_blinkmode", 15, 1),
+    ("lwr_touristenmodus_aktiv", 16, 1),
+    ("afs_charisma_fahrpr", 17, 4),
+    ("afs_charisma_status", 21, 2),
+    ("lwr_sicherheitsposition_re", 23, 1),
+    ("afs_allwetterlicht", 24, 1),
+    ("lwr_touristenmodus_verbaut", 25, 1),
+    ("afs_adaptive_lv_verbaut", 26, 1),
+    ("lwr_reisemodus_texte", 27, 2),
+    ("glw_sensor_blockiert", 29, 1),
+    ("afs_charisma_umschaltung", 30, 2),
+    ("lwr_pos_schrittmotor_raw", 32, 8),
+    ("lwr_hoehenwert_vl_raw", 40, 8),
+    ("lwr_hoehenwert_hl_raw", 48, 8),
+    ("afs_ersatzlicht_links", 56, 1),
+    ("afs_ersatzlicht_rechts", 57, 1),
+    ("lwr_afs_grundeinstellung", 58, 1),
+    ("lwr_afs_parametrisierung", 59, 1),
+    ("lwr_initialisierungslauf", 60, 1),
+    ("lwr_sicherheitsposition_li", 61, 1),
+    ("lwr_modus", 62, 1),
+)
+
+# Decoded from log template 14 04 20 04 FE 65 65 0C (nominal AFS/LWR idle).
+_LWR_AFS_DEFAULTS = {name: _lwr_rd(bytes.fromhex("14042004fe65650c"), s, ln) for name, s, ln in _LWR_AFS_SPEC}
+
+
+def pack_lwr_afs_01(**kwargs) -> list:
+    """
+    Build LWR_AFS_01 (0x395) payload. Pass any field from _LWR_AFS_SPEC by name;
+    ``lwr_afs_bz`` is the 4-bit rolling counter (0..15).
+    Raw heights: DBC LWR_Hoehenwert_* = (1,-127) → physical ≈ raw - 127.
+    LWR_Pos_Schrittmotor: DBC (0.4,0) → physical % ≈ raw * 0.4.
+    """
+    vals = dict(_LWR_AFS_DEFAULTS)
+    vals.update(kwargs)
+    buf = bytearray(8)
+    for name, start, ln in _LWR_AFS_SPEC:
+        _lwr_wr(buf, start, ln, int(vals[name]))
+    return list(buf)
+
+
+def unpack_lwr_afs_01(data) -> dict:
+    """Decode 0x395 / BO_ 917 to signal dict (raw integer per DBC)."""
+    if not data or len(data) < 8:
+        return {}
+    d = bytes(data[:8])
+    return {name: _lwr_rd(d, s, ln) for name, s, ln in _LWR_AFS_SPEC}
+
+
 # EA_02 (0x1F0): byte0=CRC, byte1=rolling counter 0–15, bytes 2–7=payload.
 # CRC LUT from log replay; MQB uses per-message CRC-8 with unknown padding.
 _EA_02_CRC = [0xD1, 0x6A, 0xDD, 0x01, 0x7E, 0xB3, 0xAB, 0xF2,
@@ -88,6 +170,7 @@ class VzeECU(ECUModule):
         (0x29C, "VZE_02",  200, [0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00]),  # log: 200ms
         (0x1F0, "EA_02",    50, [_EA_02_CRC[0], 0, *_EA_02_PAYLOAD]),
         (0x30F, "SWA_01",  100, [_SWA_01_CRC[0], 0, *_SWA_01_PAYLOAD]),
+        (0x395, "LWR_AFS_01", 100, pack_lwr_afs_01(lwr_afs_bz=0)),
         (0x397, "HC_01",    80, [0x00, 0x40, 0x00, 0x00, 0x50, 0xFA, 0x1F, 0x00]),  # byte 4 editable
     ]
 
@@ -95,6 +178,7 @@ class VzeECU(ECUModule):
         super().__init__(log_cb)
         self._ctr_1f0 = 0
         self._ctr_30f = 0
+        self._lwr_bz = 0
         self._idx_hc = 0
         self._hc_byte4 = 0x50
 
@@ -117,6 +201,10 @@ class VzeECU(ECUModule):
             ctr_val = ctr_idx * 4  # 0, 4, 8, 12
             self._ctr_30f += 1
             return bytes([_SWA_01_CRC[ctr_idx], ctr_val, *_SWA_01_PAYLOAD])
+        if arb_id == 0x395:
+            bz = self._lwr_bz % 16
+            self._lwr_bz += 1
+            return bytes(pack_lwr_afs_01(lwr_afs_bz=bz))
         if arb_id == 0x397:
             base = _HC_01_BASE[self._idx_hc % len(_HC_01_BASE)]
             self._idx_hc += 1

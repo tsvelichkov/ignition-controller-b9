@@ -570,7 +570,8 @@ class InfotainmentECU(ECUModule):
         return self._handoff_complete() and self._hud_fsg_setup_seen
 
     def _handle_hud_boot(self, data):
-        if len(data) != 2 or data[0] != 0x11:
+        # DLC is often 8 with trailing 00 padding — only first two bytes matter.
+        if len(data) < 2 or data[0] != 0x11:
             self._vlog(f"[HUD_BOOT] raw={' '.join(f'{b:02X}' for b in data)}")
             return
         state = data[1]
@@ -584,7 +585,7 @@ class InfotainmentECU(ECUModule):
             self._log("[HUD_BOOT] 11 01 -> bootstrap ready")
 
     def _handle_request(self, can_id, data):
-        if len(data) == 2 and data[0] == 0x1C and data[1] in (0x81, 0x82):
+        if len(data) >= 2 and data[0] == 0x1C and data[1] in (0x81, 0x82):
             self._handle_raw_handoff(can_id, data[1])
             return
         decoded = self._decode_request(data)

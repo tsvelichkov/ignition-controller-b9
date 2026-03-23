@@ -2,15 +2,21 @@
 modules/16_stalk.py — Steering column stalk module (Lenkstockschalter)
 
 Sends:
-  0x52B  LSS_01          — Wiper/blinker stalk input state,      50ms  [dynamic]
-  0x366  Blinkmodi_02    — Turn signal output / BCM input,      200ms  [dynamic]
+  0x52B  LSS_01          — Wiper/blinker stalk input state,      50ms  [replay, 8-frame cycle]
+  0x366  Blinkmodi_02    — Turn signal output / BCM input,      1000ms  [dynamic]
   0x3D4  Blink_Anf_01    — Blinker request acknowledge,          50ms  [replay]
 
-Stalk 0x52B byte layout (from 0000084.TXT phase analysis):
-  byte 0 = rolling counter
-  byte 2 = 0x80 neutral/left,  0x81 right blinker pressed
-  byte 3 = 0xD0 constant
-  byte 4 = 0x0C (active) / 0x00 (idle)
+LSS_01 (0x52B) byte layout — verified from 0000027.TXT:
+  byte 0 = CRC (unknown private key / scheme; constant per BZ value → use replay)
+  byte 1 = 0x20 | BZ  (upper nibble always 0x2; lower nibble = 4-bit rolling counter)
+  byte 2 = 0x81 (neutral/right stalk position in this log; 0x80 = left)
+  byte 3 = 0xD0 (constant)
+  byte 4 = 0x00 (idle/neutral; active stalk press may set other bits)
+
+  NOTE: byte 0 is NOT a simple rolling counter as previously documented.
+  It is deterministic per (BZ, body) and repeats every 8 frames. The counter
+  is in byte 1 (upper nibble = 0x2, lower = BZ). Since no DBC E2E table exists
+  for 0x52B (not in HCAN or ICAN KMatrix), frames are replayed verbatim from log.
 
 0x366 Blinkmodi_02 byte layout:
   byte 2 bit 7  (0x80) = left blinker active
@@ -28,6 +34,12 @@ Commands accepted via send_command():
   "tip_right"      — 3-flash lane change right (auto-cancel after ~750ms)
 
 Source: 0000084.TXT blinker stalk log, left/right phase payload analysis.
+        0000027.TXT verified LSS_01 byte layout and Blinkmodi_02 interval (1000ms).
+
+Fixes applied (0000027.TXT audit):
+  LSS_01: byte 0 is CRC not counter; byte 1 = 0x20|BZ not fixed 0x0F;
+          byte 4 = 0x00 idle (not 0x0C); replaced counter logic with 8-frame replay.
+  Blinkmodi_02: interval corrected in docstring (was 200ms; confirmed 1000ms in log).
 """
 import sys, os, time, threading
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,9 +54,26 @@ _BM_RIGHT  = bytes([0x00, 0x00, 0x00, 0x15, 0x24, 0x00, 0x00, 0xF0])  # right fu
 _BM_HAZARD = bytes([0x00, 0x00, 0x80, 0x15, 0x24, 0x00, 0x00, 0xF0])  # both sides
 
 # ── LSS_01 (0x52B) byte 2 direction bit ──────────────────────────────────────
-_LSS_B2_NEUTRAL = 0x80
-_LSS_B2_RIGHT   = 0x81
-_LSS_BASE       = [0x20, 0x0F, 0x80, 0xD0, 0x0C, 0x00, 0x00, 0x00]
+_LSS_B2_NEUTRAL = 0x81   # confirmed dominant in log (neutral / no stalk input)
+_LSS_B2_LEFT    = 0x80   # left stalk press
+_LSS_B2_RIGHT   = 0x81   # right blinker pressed (same as neutral in log; stalk HW bit)
+
+# ── LSS_01 (0x52B) 8-frame replay sequence — from 0000027.TXT ────────────────
+# All 1030 log frames collapse to 8 unique payloads, one per BZ nibble value.
+# BZ cycles through odd values only (1,3,5,7,9,B,D,F → 8 steps) in this log,
+# upper nibble of byte1 is always 0x2. Byte 0 is a CRC with an unknown private
+# key — replayed verbatim. Byte 4 = 0x00 throughout (stalk idle).
+# Sequence ordered by BZ ascending for clean rollover.
+_SEQ_52B = [bytes.fromhex(h) for h in [
+    "1f2181d000000000",   # BZ=1
+    "de2381d000000000",   # BZ=3
+    "cb2581d000000000",   # BZ=5
+    "3d2781d000000000",   # BZ=7
+    "052981d000000000",   # BZ=9
+    "262b81d000000000",   # BZ=B
+    "fb2d81d000000000",   # BZ=D
+    "ae2f81d000000000",   # BZ=F
+]]
 
 # ── Blink_Anf_01 (0x3D4) replay sequence — 15 frames at 50ms ─────────────────
 _SEQ_3D4 = [bytes.fromhex(h) for h in [
@@ -71,16 +100,16 @@ class StalkECU(ECUModule):
     # Map state → (Blinkmodi_02 payload, LSS byte2)
     _STATE_MAP = {
         BLINK_OFF:    (_BM_IDLE,    _LSS_B2_NEUTRAL),
-        BLINK_LEFT:   (_BM_LEFT5,   _LSS_B2_NEUTRAL),
+        BLINK_LEFT:   (_BM_LEFT5,   _LSS_B2_LEFT),
         BLINK_RIGHT:  (_BM_RIGHT,   _LSS_B2_RIGHT),
         BLINK_HAZARD: (_BM_HAZARD,  _LSS_B2_NEUTRAL),
-        BLINK_TIP_L:  (_BM_LEFT,    _LSS_B2_NEUTRAL),
+        BLINK_TIP_L:  (_BM_LEFT,    _LSS_B2_LEFT),
         BLINK_TIP_R:  (_BM_RIGHT1,  _LSS_B2_RIGHT),
     }
 
     MESSAGES = [
-        #(0x52B, "LSS_01",       50,  list(_LSS_BASE)),
-        (0x366, "Blinkmodi_02", 1000, list(_BM_IDLE)),  # log: 1000ms
+        #(0x52B, "LSS_01",       50,  list(_SEQ_52B[0])),
+        (0x366, "Blinkmodi_02", 1000, list(_BM_IDLE)),  # 1000ms confirmed in log
         #(0x3D4, "Blink_Anf_01", 50,  list(_SEQ_3D4[0])),
     ]
 
@@ -88,11 +117,11 @@ class StalkECU(ECUModule):
         super().__init__(log_cb)
         self._blink_state = self.BLINK_OFF
         self._tip_timer   = None
-        self._lss_ctr     = 0x20
+        self._idx_52b     = 0   # index into _SEQ_52B replay
         self._idx_3d4     = 0
         self._cmd_lock    = threading.Lock()
 
-    # ── Public command interface (called from nav_controller UI) ──────────────
+    # ── Public command interface ──────────────────────────────────────────────
 
     def send_command(self, cmd: str):
         """Accept blinker commands from the nav_controller panel."""
@@ -116,10 +145,13 @@ class StalkECU(ECUModule):
         bm_payload, lss_b2 = self._STATE_MAP.get(state, (_BM_IDLE, _LSS_B2_NEUTRAL))
         # Update 0x366 Blinkmodi_02
         self._write_state(0x366, bm_payload)
-        # Update 0x52B LSS_01 direction byte (keep current counter)
-        lss = bytearray(self._read_state(0x52B) or _LSS_BASE)
-        lss[2] = lss_b2
-        self._write_state(0x52B, bytes(lss))
+        # Patch the direction byte in the current LSS replay frame.
+        # The replay provides a valid CRC'd frame; we swap byte 2 (direction)
+        # while keeping CRC/BZ from the replay — this may invalidate CRC for
+        # non-neutral positions, but 0x52B is currently commented out of MESSAGES.
+        current_lss = bytearray(_SEQ_52B[self._idx_52b % len(_SEQ_52B)])
+        current_lss[2] = lss_b2
+        self._write_state(0x52B, bytes(current_lss))
 
     def _schedule_tip_off(self, flashes: int):
         # 200ms Blinkmodi cycle × flashes + 150ms margin
@@ -166,11 +198,12 @@ class StalkECU(ECUModule):
 
     def _next_frame(self, arb_id: int):
         if arb_id == 0x52B:
-            # Advance rolling counter in byte 0 each cycle
-            lss = bytearray(self._read_state(0x52B) or _LSS_BASE)
-            self._lss_ctr = (self._lss_ctr + 1) & 0xFF
-            lss[0] = self._lss_ctr
-            return bytes(lss)
+            # Advance through the 8-frame replay sequence.
+            # Byte 0 is an opaque CRC with unknown key — replayed verbatim.
+            # Byte 1 = 0x20 | BZ (upper nibble constant 0x2, lower nibble = counter).
+            frame = _SEQ_52B[self._idx_52b % len(_SEQ_52B)]
+            self._idx_52b += 1
+            return bytes(frame)
         if arb_id == 0x3D4:
             d = _SEQ_3D4[self._idx_3d4 % len(_SEQ_3D4)]
             self._idx_3d4 += 1

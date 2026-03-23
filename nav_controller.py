@@ -1171,6 +1171,46 @@ class App(QMainWindow):
         tab_fuel_layout.addWidget(fuel_scroll, 1)
         tab_fuel_layout.addWidget(footer_part)
         self._left_notebook.addTab(tab_fuel, "Fuel")
+        # BCM tab — Dimmung_01 / BCM1_04 lighting & dimming controls
+        tab_bcm = QWidget()
+        tab_bcm_layout = QVBoxLayout(tab_bcm)
+        tab_bcm_layout.setContentsMargins(4, 4, 4, 4)
+        bcm_scroll = QScrollArea()
+        bcm_scroll.setWidgetResizable(True)
+        bcm_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        bcm_scroll.setStyleSheet(f"QScrollArea {{ background: {C['bg']}; border: none; }}")
+        bcm_content = QWidget()
+        bcm_content.setStyleSheet(f"background: {C['bg']};")
+        bcm_content_layout = QVBoxLayout(bcm_content)
+        bcm_content_layout.setContentsMargins(0, 0, 0, 0)
+        bcm_scroll_part, bcm_footer_part = self._build_bcm_tab(tab_bcm)
+        bcm_content_layout.addWidget(bcm_scroll_part)
+        bcm_content_layout.addStretch()
+        bcm_content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        bcm_scroll.setWidget(bcm_content)
+        tab_bcm_layout.addWidget(bcm_scroll, 1)
+        tab_bcm_layout.addWidget(bcm_footer_part)
+        self._left_notebook.addTab(tab_bcm, "BCM")
+        # AT tab — WBA_03 shifter / gear control (Autotrans)
+        tab_at = QWidget()
+        tab_at_layout = QVBoxLayout(tab_at)
+        tab_at_layout.setContentsMargins(4, 4, 4, 4)
+        at_scroll = QScrollArea()
+        at_scroll.setWidgetResizable(True)
+        at_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        at_scroll.setStyleSheet(f"QScrollArea {{ background: {C['bg']}; border: none; }}")
+        at_content = QWidget()
+        at_content.setStyleSheet(f"background: {C['bg']};")
+        at_content_layout = QVBoxLayout(at_content)
+        at_content_layout.setContentsMargins(0, 0, 0, 0)
+        at_scroll_part, at_footer_part = self._build_autotrans_tab(tab_at)
+        at_content_layout.addWidget(at_scroll_part)
+        at_content_layout.addStretch()
+        at_content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        at_scroll.setWidget(at_content)
+        tab_at_layout.addWidget(at_scroll, 1)
+        tab_at_layout.addWidget(at_footer_part)
+        self._left_notebook.addTab(tab_at, "Gears")
         left_layout.addWidget(self._left_notebook, 1)
         content_layout.addWidget(left)
 
@@ -1741,6 +1781,18 @@ class App(QMainWindow):
                 return e
         return None
 
+    def _find_autotrans_ecu(self):
+        for e in self._mgr.get_ecus():
+            if getattr(e, "ECU_ID", None) == "02":
+                return e
+        return None
+
+    def _find_bcm_ecu(self):
+        for e in self._mgr.get_ecus():
+            if getattr(e, "ECU_ID", None) == "09":
+                return e
+        return None
+
     def _update_stalk_buttons(self):
         ecu = self._find_stalk_ecu()
         self._stalk_enabled = self._ign and (ecu is not None)
@@ -2068,6 +2120,196 @@ class App(QMainWindow):
             return
         b0, b1, b2 = b0_spin.value(), b1_spin.value(), b2_spin.value()
         self._fuel_byte_lbl.setText(f"Payload: {b0:02x} {b1:02x} {b2:02x} 00 00 00 aa dd")
+
+    def _build_bcm_tab(self, parent):
+        """BCM tab: Dimmung_01 (0x5F0) / BCM1_04 (0x64F) — outside light and display dimming."""
+        from PyQt6.QtWidgets import QSlider
+        pnl = QWidget(parent)
+        layout = QVBoxLayout(pnl)
+        layout.setContentsMargins(10, 12, 10, 10)
+
+        dim_gb = _panel(parent, "0x5F0 / 0x64F  Dimmung_01 / BCM1_04 — KL58 Dimming")
+        dim_layout = QVBoxLayout(dim_gb)
+        dim_layout.setContentsMargins(10, 10, 10, 10)
+        dim_layout.setSpacing(10)
+
+        _slider_style = (
+            f"QSlider::groove:horizontal {{ height: 4px; background: {C['border']}; border-radius: 2px; }}"
+            f"QSlider::handle:horizontal {{ background: {C['accent']}; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }}"
+            f"QSlider::sub-page:horizontal {{ background: {C['accent']}; border-radius: 2px; }}"
+        )
+
+        def _make_slider_row(label_text, lo, hi, default, unit=""):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            lbl = QLabel(label_text)
+            lbl.setFixedWidth(190)
+            row_layout.addWidget(lbl)
+            sl = QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(lo, hi)
+            sl.setValue(default)
+            sl.setStyleSheet(_slider_style)
+            val_lbl = QLabel(f"{default}{unit}")
+            val_lbl.setFixedWidth(42)
+            val_lbl.setStyleSheet(f"color: {C['text']}; font-family: Consolas;")
+            row_layout.addWidget(sl, 1)
+            row_layout.addWidget(val_lbl)
+            return row, sl, val_lbl
+
+        # Outside light — DI_KL_58xd  0–253
+        outer_row, self._dim_outer_slider, self._dim_outer_val_lbl = \
+            _make_slider_row("Outside light (KL58d):", 0, 253, 229)
+        self._dim_outer_slider.valueChanged.connect(
+            lambda v: (self._dim_outer_val_lbl.setText(str(v)), self._apply_dimming()))
+        dim_layout.addWidget(outer_row)
+
+        # Display brightness — DI_KL_58xt  0–100 %
+        disp_row, self._dim_disp_slider, self._dim_disp_val_lbl = \
+            _make_slider_row("Display brightness (KL58xt):", 0, 100, 93, " %")
+        self._dim_disp_slider.valueChanged.connect(
+            lambda v: (self._dim_disp_val_lbl.setText(f"{v} %"), self._apply_dimming()))
+        dim_layout.addWidget(disp_row)
+
+        # Ambient light sensor — LS_Helligkeit_FW in RLS_01 (0x5A0) + DI_Fotosensor in 5F0
+        # Logs: overcast=126 Lux, mild=480, bright=2226, full sun=3666.  DBC max=6126.
+        lux_row, self._dim_lux_slider, self._dim_lux_val_lbl = \
+            _make_slider_row("Ambient light (LS_FW):", 0, 4000, 3816, " Lux")
+        self._dim_lux_val_lbl.setFixedWidth(60)
+        self._dim_lux_slider.valueChanged.connect(
+            lambda v: (self._dim_lux_val_lbl.setText(f"{v} Lux"), self._apply_light_sensor()))
+        dim_layout.addWidget(lux_row)
+
+        self._dim_status_lbl = QLabel("KL58d: 229  disp: 93 %  LS_FW: 3816 Lux")
+        self._dim_status_lbl.setStyleSheet(f"color: {C['sub']}; font-family: Consolas; font-size: 11px;")
+        dim_layout.addWidget(self._dim_status_lbl)
+        layout.addWidget(dim_gb)
+
+        return pnl, QWidget()
+
+    def _build_autotrans_tab(self, parent):
+        """AT tab: WBA_03 (0x394) shifter position and gear display."""
+        from PyQt6.QtWidgets import QButtonGroup
+        pnl = QWidget(parent)
+        layout = QVBoxLayout(pnl)
+        layout.setContentsMargins(10, 12, 10, 10)
+
+        at_gb = _panel(parent, "0x394 WBA_03 — Shifter / Gear (Autotrans)")
+        at_layout = QVBoxLayout(at_gb)
+        at_layout.setContentsMargins(10, 10, 10, 10)
+        at_layout.setSpacing(8)
+
+        # Shifter position row
+        pos_row = QWidget()
+        pos_layout = QHBoxLayout(pos_row)
+        pos_layout.setContentsMargins(0, 0, 0, 0)
+        pos_layout.setSpacing(6)
+        pos_layout.addWidget(QLabel("Shifter:"))
+        self._at_shifter_grp = QButtonGroup(pos_row)
+        _btn_style = (
+            f"QPushButton {{ background: {C['panel']}; color: {C['text']}; "
+            f"border: 1px solid {C['border']}; border-radius: 4px; padding: 4px 10px; min-width: 36px; }}"
+            f"QPushButton:checked {{ background: {C['accent']}; color: #ffffff; border-color: {C['accent']}; }}"
+        )
+        for idx, label in enumerate(("P", "R", "N", "D", "S"), start=1):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setStyleSheet(_btn_style)
+            self._at_shifter_grp.addButton(btn, idx)
+            pos_layout.addWidget(btn)
+        self._at_shifter_grp.button(1).setChecked(True)  # default P
+        self._at_shifter_grp.idToggled.connect(lambda _id, checked: self._apply_autotrans_settings() if checked else None)
+        pos_layout.addStretch()
+        at_layout.addWidget(pos_row)
+
+        # Gear inputs row
+        gear_row = QWidget()
+        gear_layout = QHBoxLayout(gear_row)
+        gear_layout.setContentsMargins(0, 0, 0, 0)
+        gear_layout.setSpacing(8)
+        gear_layout.addWidget(QLabel("Eing Gang (displayed):"))
+        self._at_eing_spin = QSpinBox()
+        self._at_eing_spin.setMinimumHeight(INPUT_MIN_H)
+        self._at_eing_spin.setRange(0, 7)
+        self._at_eing_spin.setValue(0)
+        self._at_eing_spin.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
+        gear_layout.addWidget(self._at_eing_spin)
+        gear_layout.addWidget(QLabel("Soll Gang (recommended):"))
+        self._at_soll_spin = QSpinBox()
+        self._at_soll_spin.setMinimumHeight(INPUT_MIN_H)
+        self._at_soll_spin.setRange(0, 7)
+        self._at_soll_spin.setValue(0)
+        self._at_soll_spin.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
+        gear_layout.addWidget(self._at_soll_spin)
+        gear_layout.addStretch()
+        at_layout.addWidget(gear_row)
+        layout.addWidget(at_gb)
+
+        footer = QWidget()
+        footer.setStyleSheet(f"background: {C['bg']};")
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 8, 0, 0)
+        apply_btn = QPushButton("Apply Shifter (0x394)")
+        apply_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 6px 12px; }}")
+        apply_btn.clicked.connect(self._apply_autotrans_settings)
+        footer_layout.addWidget(apply_btn)
+        self._at_payload_lbl = QLabel("WBA_Fahrstufe: P  Eing: 0  Soll: 0")
+        self._at_payload_lbl.setStyleSheet(f"color: {C['sub']}; font-family: Consolas; font-size: 11px;")
+        footer_layout.addWidget(self._at_payload_lbl)
+        QTimer.singleShot(50, self._update_autotrans_display)
+        return pnl, footer
+
+    def _apply_autotrans_settings(self):
+        ecu = self._find_autotrans_ecu()
+        if ecu is None:
+            self._log("Apply AT: Autotrans (02) not loaded")
+            return
+        if not hasattr(ecu, "set_shifter_gear"):
+            self._log("Apply AT: set_shifter_gear not available")
+            return
+        fahr = self._at_shifter_grp.checkedId() if hasattr(self, "_at_shifter_grp") else 1
+        eing = self._at_eing_spin.value() if hasattr(self, "_at_eing_spin") else 0
+        soll = self._at_soll_spin.value() if hasattr(self, "_at_soll_spin") else 0
+        ecu.set_shifter_gear(fahr, eing, soll)
+        self._update_autotrans_display()
+        _names = {1: "P", 2: "R", 3: "N", 4: "D", 5: "S"}
+        self._log(f"Apply AT: Fahrstufe={_names.get(fahr, fahr)}  Eing={eing}  Soll={soll}")
+
+    def _update_autotrans_display(self):
+        if not hasattr(self, "_at_payload_lbl") or not self._at_payload_lbl:
+            return
+        fahr = self._at_shifter_grp.checkedId() if hasattr(self, "_at_shifter_grp") else 1
+        eing = self._at_eing_spin.value() if hasattr(self, "_at_eing_spin") else 0
+        soll = self._at_soll_spin.value() if hasattr(self, "_at_soll_spin") else 0
+        _names = {1: "P", 2: "R", 3: "N", 4: "D", 5: "S"}
+        self._at_payload_lbl.setText(
+            f"WBA_Fahrstufe: {_names.get(fahr, fahr)}  Eing: {eing}  Soll: {soll}"
+        )
+
+    def _apply_dimming(self):
+        ecu = self._find_bcm_ecu()
+        if ecu is None or not hasattr(ecu, "set_dimming"):
+            return
+        kl58d = self._dim_outer_slider.value() if hasattr(self, "_dim_outer_slider") else 229
+        pct   = self._dim_disp_slider.value()  if hasattr(self, "_dim_disp_slider")  else 93
+        ecu.set_dimming(kl58d, pct)
+        self._update_dim_status()
+
+    def _apply_light_sensor(self):
+        ecu = self._find_bcm_ecu()
+        if ecu is None or not hasattr(ecu, "set_light_sensor"):
+            return
+        lux = self._dim_lux_slider.value() if hasattr(self, "_dim_lux_slider") else 3816
+        ecu.set_light_sensor(lux)
+        self._update_dim_status()
+
+    def _update_dim_status(self):
+        if not hasattr(self, "_dim_status_lbl") or not self._dim_status_lbl:
+            return
+        kl58d = self._dim_outer_slider.value() if hasattr(self, "_dim_outer_slider") else 229
+        pct   = self._dim_disp_slider.value()  if hasattr(self, "_dim_disp_slider")  else 93
+        lux   = self._dim_lux_slider.value()   if hasattr(self, "_dim_lux_slider")   else 3816
+        self._dim_status_lbl.setText(f"KL58d: {kl58d}  disp: {pct} %  LS_FW: {lux} Lux")
 
     def _hc_form_to_byte4(self):
         if not getattr(self, "_hc_enabled_cb", None) or not self._hc_enabled_cb.isChecked():
