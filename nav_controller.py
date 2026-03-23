@@ -27,10 +27,14 @@ IFG_SECS = 0.00025  # 0.25ms min gap between sends (~4000 fps max at higher baud
 SERIAL_BAUDRATE = 921600  # 8× throughput; use 115200 if adapter unstable
 
 # ── CAN CONNECTION CONFIG ─────────────────────────────────────────────────────
-# Set CAN_INTERFACE to one of the options below. Config is detected at startup.
-#
-# Multi-interface auto-detect: try csscan_serial, slcan, lawicel (COM ports), virtual
-# Set CSS_SCAN_CHANNEL to force a specific port (e.g. "COM8"); None = auto-detect
+# Auto-detect order at startup:
+#   1) csscan_serial
+#   2) pcan (PEAK)
+#   3) slcan
+#   4) lawicel (serial ports)
+#   5) virtual
+# Set CSS_SCAN_CHANNEL to force a specific CSS serial port (e.g. "COM8");
+# None means csscan_serial auto-detect.
 CSS_SCAN_CHANNEL = None
 
 def _detect_can_configs():
@@ -80,40 +84,11 @@ def _detect_can_configs():
     return configs
 
 CAN_AVAILABLE_CONFIGS = _detect_can_configs()
-#
-# Option 2: SocketCAN (Linux) — native kernel CAN, vcan0 for virtual
-#   CAN_INTERFACE = "socketcan"
-#   CAN_AVAILABLE_CONFIGS = [{"interface": "socketcan", "channel": "vcan0"}]
-#   # or real device: channel="can0"
-#
-# Option 3: PCAN (Windows/Linux) — PEAK PCAN-USB, PCAN-PCI, etc.
-#   CAN_INTERFACE = "pcan"
-#   CAN_AVAILABLE_CONFIGS = can.detect_available_configs("pcan")
-#   # or manual: [{"interface": "pcan", "channel": "PCAN_USBBUS1"}]
-#
-# Option 4: Serial (generic) — CAN over serial, e.g. /dev/ttyUSB0 or COM3
-#   CAN_INTERFACE = "serial"
-#   CAN_AVAILABLE_CONFIGS = [{"interface": "serial", "channel": "COM3", "bitrate": 500000}]
-#
-# Option 5: SLCAN / Lawicel CAN-USB — 115200 serial, 500 kbps CAN (see README Lawicel section)
-#   CAN_INTERFACE = "slcan"
-#   CAN_AVAILABLE_CONFIGS = [{"interface": "slcan", "channel": "COM5", "bitrate": 500000, "tty_baudrate": 115200}]
-#
-# Option 5b: SLCAN auto-detect (any SLCAN adapter)
-#   CAN_INTERFACE = "slcan"
-#   CAN_AVAILABLE_CONFIGS = can.detect_available_configs("slcan")
-#
-# Option 5c: Custom Lawicel driver (use if slcan gives no traffic with SLGreen/Arduino)
-#   CAN_INTERFACE = "lawicel"
-#   CAN_AVAILABLE_CONFIGS = [{"interface": "lawicel", "channel": "COM10", "bitrate": 500000, "tty_baudrate": 115200}]
-#
-# Option 6: Virtual — no hardware, for testing
-#   CAN_INTERFACE = "virtual"
+# CAN_INTERFACE is intentionally not used anymore.
+# If needed, you can still hardcode CAN_AVAILABLE_CONFIGS manually, e.g.:
+#   CAN_AVAILABLE_CONFIGS = [{"interface": "pcan", "channel": "PCAN_USBBUS1", "bitrate": 500000}]
+#   CAN_AVAILABLE_CONFIGS = [{"interface": "csscan_serial", "channel": "COM8", "baudrate": SERIAL_BAUDRATE}]
 #   CAN_AVAILABLE_CONFIGS = [{"interface": "virtual", "channel": None}]
-#
-# Option 7: gs_usb — candleLight, Geschwister Schneider USB-CAN
-#   CAN_INTERFACE = "gs_usb"
-#   CAN_AVAILABLE_CONFIGS = can.detect_available_configs("gs_usb")
 
 from datetime import datetime
 

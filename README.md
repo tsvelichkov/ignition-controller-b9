@@ -1,13 +1,24 @@
 # CAN Nav Controller
 
-Audi MLB CAN bus emulator for testing navigation and infotainment systems. Emulates ignition, gateway, infotainment, and other ECUs to simulate a vehicle CAN network for development and bench testing.
+Audi MLB CAN bus emulator for navigation and infotainment bench testing. It emulates ignition, gateway, infotainment, and other ECUs to simulate a realistic vehicle CAN network.
+
+The current goal is to simulate a car on the infotainment bus (InfoCAN) so connected components receive correct, production-like traffic, especially for:
+
+- virtual cluster
+- HUD
+- MIB units
 
 ## What It Does
 
 - **Ignition simulation** — Sends `0x3C0` Klemmen_Status frames (KL15 on/off) to power up or shut down modules on the infotainment canbus
 - **MFL steering wheel** — Emulates Multi-Function Lever buttons (MENU, OK, LEFT, RIGHT, etc.) on `0x5BF`
-- **ECU emulation** — Modular ECU modules send periodic CAN frames (gateway, infotainment, motor, ESP, etc.)
-- **BAP navigation** — Infotainment module drives HUD and cluster with navigation arrows and route data (WIP)
+- **ECU emulation** — Modular ECU modules send periodic CAN frames (gateway, infotainment, motor, ESP, BCM, autotrans, etc.)
+- **NAV HUD tab** — Sends and inspects BAP navigation traffic for HUD/cluster behavior
+- **VZE tab** — Controls lane/sign-related bytes for driver-assist visualization
+- **HC tab** — Controls lane-marking / heading-control state
+- **Fuel tab** — Edits `0x644` fuel payload bytes
+- **BCM tab** — Controls dimming and ambient-light related signals (`0x5F0`, `0x64F`, `0x5A0`)
+- **Gears tab** — Controls autotrans shifter/gear signals (`0x394`)
 
 ## Requirements
 
@@ -59,7 +70,7 @@ Optional command-line options:
 Example:
 
 ```bash
-python nav_controller.py --ignition on --no-send-ignition-updates --auto-open-hud
+python nav_controller.py --ignition on
 ```
 
 ## Project Structure
@@ -84,7 +95,15 @@ ignition-controller-b9/
 
 ## CAN Connection
 
-The default interface is **csscan_serial** (CSS Electronics USB adapter). To use a different adapter, edit the config block at the top of `nav_controller.py`:
+The app auto-detects adapters in this order:
+
+1. `csscan_serial` (CSS Electronics)
+2. `pcan` (PEAK)
+3. `slcan`
+4. `lawicel` (serial ports)
+5. `virtual`
+
+The default preference is still **csscan_serial**. You can optionally set `CSS_SCAN_CHANNEL` in `nav_controller.py` to force a specific CSS port (for example `COM8`), otherwise CSS uses auto-detect.
 
 ### CSS Electronics (csscan_serial) — default
 
@@ -99,12 +118,10 @@ The adapter appears as a USB virtual-serial-port:
 | Interface       | Use case                          |
 |-----------------|-----------------------------------|
 | `csscan_serial` | CSS Electronics USB (default)     |
-| `socketcan`     | Linux kernel CAN (vcan0, can0)   |
 | `pcan`          | PEAK PCAN-USB, PCAN-PCI           |
-| `serial`        | Generic CAN over serial (COM3)    |
 | `slcan`         | SLCAN protocol (many USB adapters)|
+| `lawicel`       | Custom Lawicel serial backend     |
 | `virtual`       | No hardware — testing only        |
-| `gs_usb`        | candleLight, Geschwister Schneider|
 
 ### Arduino Nano + MCP2515 (8 MHz) with SavvyCAN — init commands S and O
 
@@ -112,30 +129,30 @@ With some SLCAN adapters (e.g. Arduino Nano + MCP2515 8 MHz), SavvyCAN does not 
 
 **Options:**
 
-1. **Init script before SavvyCAN**  
+1. **Init script before SavvyCAN**
    Run once (then connect SavvyCAN to the same port):
    ```bash
    python slcan_init.py COM10 50000
    ```
    Use your COM port; `50000` = 50 kbps (S2), use `500000` for 500 kbps (S6). This sends C, S, O and closes the port; many sketches keep the channel open so SavvyCAN can receive without typing S/O.
 
-2. **This app (nav_controller)**  
+2. **This app (nav_controller)**
    When using `interface: "lawicel"` or `interface: "slcan"`, the driver sends **C**, **S**, **O** on connect automatically — no manual step.
 
-3. **SavvyCAN**  
+3. **SavvyCAN**
    Check the connection type (e.g. “Lawicel” / “SLCAN”) and whether it has a “send init commands” or similar option so it sends S and O when opening the port.
 
-Example for SocketCAN on Linux:
+`CAN_INTERFACE` is no longer used by the app. If you need to force one backend for testing, override `CAN_AVAILABLE_CONFIGS` manually in `nav_controller.py`.
+
+Example to force PCAN:
 
 ```python
-CAN_INTERFACE = "socketcan"
-CAN_AVAILABLE_CONFIGS = [{"interface": "socketcan", "channel": "vcan0"}]
+CAN_AVAILABLE_CONFIGS = [{"interface": "pcan", "channel": "PCAN_USBBUS1", "bitrate": 500000}]
 ```
 
 Example for virtual (no hardware):
 
 ```python
-CAN_INTERFACE = "virtual"
 CAN_AVAILABLE_CONFIGS = [{"interface": "virtual", "channel": None}]
 ```
 
