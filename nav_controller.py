@@ -31,7 +31,7 @@ SERIAL_BAUDRATE = 921600  # 8× throughput; use 115200 if adapter unstable
 #
 # Multi-interface auto-detect: try csscan_serial, slcan, lawicel (COM ports), virtual
 # Set CSS_SCAN_CHANNEL to force a specific port (e.g. "COM8"); None = auto-detect
-CSS_SCAN_CHANNEL = "COM8"
+CSS_SCAN_CHANNEL = None
 
 def _detect_can_configs():
     configs = []
@@ -47,7 +47,17 @@ def _detect_can_configs():
         if key not in seen:
             seen.add(key)
             configs.append(c)
-    # 2. SLCAN (python-can built-in)
+    # 2. PCAN (PEAK)
+    try:
+        for c in can.detect_available_configs("pcan"):
+            c.setdefault("bitrate", 500000)
+            key = ("pcan", str(c.get("channel", "")))
+            if key not in seen:
+                seen.add(key)
+                configs.append(c)
+    except Exception:
+        pass
+    # 3. SLCAN (python-can built-in)
     for c in can.detect_available_configs("slcan"):
         c.setdefault("bitrate", 500000)
         c.setdefault("tty_baudrate", 115200)
@@ -55,7 +65,7 @@ def _detect_can_configs():
         if key not in seen:
             seen.add(key)
             configs.append(c)
-    # 3. Lawicel/SLCAN on serial ports (COM3+, /dev/ttyUSB*, /dev/ttyACM*)
+    # 4. Lawicel/SLCAN on serial ports (COM3+, /dev/ttyUSB*, /dev/ttyACM*)
     try:
         import serial.tools.list_ports
         for port in serial.tools.list_ports.comports():
@@ -65,7 +75,7 @@ def _detect_can_configs():
                 configs.append(cfg)
     except Exception:
         pass
-    # 4. Virtual (always available for testing)
+    # 5. Virtual (always available for testing)
     configs.append({"interface": "virtual", "channel": None})
     return configs
 
