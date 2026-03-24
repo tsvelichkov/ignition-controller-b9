@@ -1176,6 +1176,25 @@ class App(QMainWindow):
         tab_bcm_layout.addWidget(bcm_scroll, 1)
         tab_bcm_layout.addWidget(bcm_footer_part)
         self._left_notebook.addTab(tab_bcm, "BCM")
+        # GW tab — TSG_FT_02 (0x3E5) doors, hatch 0x3CF, hood via BCM_01
+        tab_gw = QWidget()
+        tab_gw_layout = QVBoxLayout(tab_gw)
+        tab_gw_layout.setContentsMargins(4, 4, 4, 4)
+        gw_scroll = QScrollArea()
+        gw_scroll.setWidgetResizable(True)
+        gw_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        gw_scroll.setStyleSheet(f"QScrollArea {{ background: {C['bg']}; border: none; }}")
+        gw_content = QWidget()
+        gw_content.setStyleSheet(f"background: {C['bg']};")
+        gw_content_layout = QVBoxLayout(gw_content)
+        gw_content_layout.setContentsMargins(0, 0, 0, 0)
+        gw_scroll_part = self._build_gw_tab(tab_gw)
+        gw_content_layout.addWidget(gw_scroll_part)
+        gw_content_layout.addStretch()
+        gw_content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        gw_scroll.setWidget(gw_content)
+        tab_gw_layout.addWidget(gw_scroll, 1)
+        self._left_notebook.addTab(tab_gw, "GW")
         # AT tab — WBA_03 shifter / gear control (Autotrans)
         tab_at = QWidget()
         tab_at_layout = QVBoxLayout(tab_at)
@@ -1778,6 +1797,12 @@ class App(QMainWindow):
                 return e
         return None
 
+    def _find_gateway_ecu(self):
+        for e in self._mgr.get_ecus():
+            if getattr(e, "ECU_ID", None) == "19":
+                return e
+        return None
+
     def _update_stalk_buttons(self):
         ecu = self._find_stalk_ecu()
         self._stalk_enabled = self._ign and (ecu is not None)
@@ -2144,14 +2169,14 @@ class App(QMainWindow):
 
         # Outside light — DI_KL_58xd  0–253
         outer_row, self._dim_outer_slider, self._dim_outer_val_lbl = \
-            _make_slider_row("Outside light (KL58d):", 0, 253, 229)
+            _make_slider_row("Outside light (KL58d):", 0, 253, 137)
         self._dim_outer_slider.valueChanged.connect(
             lambda v: (self._dim_outer_val_lbl.setText(str(v)), self._apply_dimming()))
         dim_layout.addWidget(outer_row)
 
         # Display brightness — DI_KL_58xt  0–100 %
         disp_row, self._dim_disp_slider, self._dim_disp_val_lbl = \
-            _make_slider_row("Display brightness (KL58xt):", 0, 100, 93, " %")
+            _make_slider_row("Display brightness (KL58xt):", 0, 100, 25, " %")
         self._dim_disp_slider.valueChanged.connect(
             lambda v: (self._dim_disp_val_lbl.setText(f"{v} %"), self._apply_dimming()))
         dim_layout.addWidget(disp_row)
@@ -2159,18 +2184,113 @@ class App(QMainWindow):
         # Ambient light sensor — LS_Helligkeit_FW in RLS_01 (0x5A0) + DI_Fotosensor in 5F0
         # Logs: overcast=126 Lux, mild=480, bright=2226, full sun=3666.  DBC max=6126.
         lux_row, self._dim_lux_slider, self._dim_lux_val_lbl = \
-            _make_slider_row("Ambient light (LS_FW):", 0, 4000, 3816, " Lux")
+            _make_slider_row("Ambient light (LS_FW):", 0, 4000, 620, " Lux")
         self._dim_lux_val_lbl.setFixedWidth(60)
         self._dim_lux_slider.valueChanged.connect(
             lambda v: (self._dim_lux_val_lbl.setText(f"{v} Lux"), self._apply_light_sensor()))
         dim_layout.addWidget(lux_row)
 
-        self._dim_status_lbl = QLabel("KL58d: 229  disp: 93 %  LS_FW: 3816 Lux")
+        self._dim_status_lbl = QLabel("KL58d: 137  disp: 25 %  LS_FW: 620 Lux")
         self._dim_status_lbl.setStyleSheet(f"color: {C['sub']}; font-family: Consolas; font-size: 11px;")
         dim_layout.addWidget(self._dim_status_lbl)
         layout.addWidget(dim_gb)
 
         return pnl, QWidget()
+
+    def _build_gw_tab(self, parent):
+        """GW tab: TSG_FT_02 (0x3E5) four doors, TSG_HBFS_01 hatch (0x3CF), hood on BCM_01 (0x65A)."""
+        if not hasattr(self, "_gw_door_open"):
+            self._gw_door_open = {"ft": False, "bfs": False, "hbfs": False, "hfs": False}
+        if not hasattr(self, "_gw_hatch_open"):
+            self._gw_hatch_open = False
+        if not hasattr(self, "_gw_hood_open"):
+            self._gw_hood_open = False
+
+        pnl = QWidget(parent)
+        layout = QVBoxLayout(pnl)
+        layout.setContentsMargins(10, 12, 10, 10)
+
+        door_gb = _panel(parent, "TSG_FT_02 (0x3E5) — doors (DBC: 1=closed, 2=open)")
+        door_layout = QVBoxLayout(door_gb)
+        door_layout.setContentsMargins(10, 10, 10, 10)
+        door_layout.setSpacing(8)
+
+        _btn_style = (
+            f"QPushButton {{ background: {C['btn']}; color: {C['text']}; "
+            f"border: 1px solid {C['border']}; border-radius: 4px; padding: 8px 12px; text-align: left; }}"
+        )
+
+        def _door_label(opened: bool) -> str:
+            return "Open" if opened else "Closed"
+
+        def _toggle_door(key: str, set_fn_name: str, btn: QPushButton):
+            self._gw_door_open[key] = not self._gw_door_open[key]
+            ecu = self._find_gateway_ecu()
+            if ecu is not None and hasattr(ecu, set_fn_name):
+                getattr(ecu, set_fn_name)(self._gw_door_open[key])
+            else:
+                self._log(f"GW: Gateway (19) not loaded — {key}")
+            btn.setText(f"{btn.property('gw_title')}: {_door_label(self._gw_door_open[key])}")
+
+        rows = [
+            ("Driver", "ft", "set_door_driver_open"),
+            ("Passenger", "bfs", "set_door_passenger_open"),
+            ("Rear left", "hbfs", "set_door_rear_left_open"),
+            ("Rear right", "hfs", "set_door_rear_right_open"),
+        ]
+        for title, key, fn in rows:
+            btn = QPushButton(f"{title}: {_door_label(self._gw_door_open[key])}")
+            btn.setStyleSheet(_btn_style)
+            btn.setProperty("gw_title", title)
+            btn.clicked.connect(lambda checked, k=key, f=fn, b=btn: _toggle_door(k, f, b))
+            door_layout.addWidget(btn)
+
+        layout.addWidget(door_gb)
+
+        misc_gb = _panel(parent, "Hatch (0x3CF) & hood (BCM 0x65A)")
+        misc_layout = QVBoxLayout(misc_gb)
+        misc_layout.setContentsMargins(10, 10, 10, 10)
+        misc_layout.setSpacing(8)
+
+        def _toggle_hatch(btn: QPushButton):
+            self._gw_hatch_open = not self._gw_hatch_open
+            ecu = self._find_gateway_ecu()
+            if ecu is not None and hasattr(ecu, "set_hatch_open"):
+                ecu.set_hatch_open(self._gw_hatch_open)
+            else:
+                self._log("GW: Gateway (19) not loaded — hatch")
+            btn.setText(f"Hatch (HBFS): {_door_label(self._gw_hatch_open)}")
+
+        def _toggle_hood(btn: QPushButton):
+            self._gw_hood_open = not self._gw_hood_open
+            bcm = self._find_bcm_ecu()
+            if bcm is not None and hasattr(bcm, "set_motorhaube_kontakt"):
+                bcm.set_motorhaube_kontakt(self._gw_hood_open)
+            else:
+                self._log("GW: BCM (09) not loaded — hood")
+            btn.setText(f"Hood (MH kontakt): {_door_label(self._gw_hood_open)}")
+
+        hb = QPushButton(f"Hatch (HBFS): {_door_label(self._gw_hatch_open)}")
+        hb.setStyleSheet(_btn_style)
+        hb.clicked.connect(lambda: _toggle_hatch(hb))
+        misc_layout.addWidget(hb)
+
+        ho = QPushButton(f"Hood (MH kontakt): {_door_label(self._gw_hood_open)}")
+        ho.setStyleSheet(_btn_style)
+        ho.clicked.connect(lambda: _toggle_hood(ho))
+        misc_layout.addWidget(ho)
+
+        hint = QLabel(
+            "0x3E5 does not carry hood/trunk; hatch uses TSG_HBFS_01 (0x3CF). "
+            "Hood uses BCM1_MH_Schalter on BCM_01 (0x65A) per ICAN DBC."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {C['sub']}; font-size: 11px;")
+        misc_layout.addWidget(hint)
+
+        layout.addWidget(misc_gb)
+        layout.addStretch()
+        return pnl
 
     def _build_autotrans_tab(self, parent):
         """AT tab: WBA_03 (0x394) shifter position and gear display."""
@@ -2275,8 +2395,8 @@ class App(QMainWindow):
         ecu = self._find_bcm_ecu()
         if ecu is None or not hasattr(ecu, "set_dimming"):
             return
-        kl58d = self._dim_outer_slider.value() if hasattr(self, "_dim_outer_slider") else 229
-        pct   = self._dim_disp_slider.value()  if hasattr(self, "_dim_disp_slider")  else 93
+        kl58d = self._dim_outer_slider.value() if hasattr(self, "_dim_outer_slider") else 137
+        pct   = self._dim_disp_slider.value()  if hasattr(self, "_dim_disp_slider")  else 25
         ecu.set_dimming(kl58d, pct)
         self._update_dim_status()
 
@@ -2284,16 +2404,16 @@ class App(QMainWindow):
         ecu = self._find_bcm_ecu()
         if ecu is None or not hasattr(ecu, "set_light_sensor"):
             return
-        lux = self._dim_lux_slider.value() if hasattr(self, "_dim_lux_slider") else 3816
+        lux = self._dim_lux_slider.value() if hasattr(self, "_dim_lux_slider") else 620
         ecu.set_light_sensor(lux)
         self._update_dim_status()
 
     def _update_dim_status(self):
         if not hasattr(self, "_dim_status_lbl") or not self._dim_status_lbl:
             return
-        kl58d = self._dim_outer_slider.value() if hasattr(self, "_dim_outer_slider") else 229
-        pct   = self._dim_disp_slider.value()  if hasattr(self, "_dim_disp_slider")  else 93
-        lux   = self._dim_lux_slider.value()   if hasattr(self, "_dim_lux_slider")   else 3816
+        kl58d = self._dim_outer_slider.value() if hasattr(self, "_dim_outer_slider") else 137
+        pct   = self._dim_disp_slider.value()  if hasattr(self, "_dim_disp_slider")  else 25
+        lux   = self._dim_lux_slider.value()   if hasattr(self, "_dim_lux_slider")   else 620
         self._dim_status_lbl.setText(f"KL58d: {kl58d}  disp: {pct} %  LS_FW: {lux} Lux")
 
     def _hc_form_to_byte4(self):

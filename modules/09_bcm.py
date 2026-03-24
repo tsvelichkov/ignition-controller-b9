@@ -146,6 +146,21 @@ class BcmECU(ECUModule):
                     d[4] = (raw_fw >> 8) & 0xFF
                     s.data = d
 
+    def set_motorhaube_kontakt(self, open_: bool) -> None:
+        """BCM_01 (0x65A) BCM1_MH_Schalter — Intel bit 31 (DBC BO_ 1626). 1 = hood open contact."""
+        with self._lock:
+            for s in self._states:
+                if s.arb_id == 0x65A:
+                    d = bytearray(s.data)
+                    if len(d) < 8:
+                        return
+                    if open_:
+                        d[3] |= 0x80
+                    else:
+                        d[3] &= ~0x80
+                    s.data = list(d)
+                    return
+
     def _next_frame(self, arb_id):
         if arb_id == 0x2A0:
             bz = self._idx_2a0 % 16
@@ -284,23 +299,22 @@ def _build_licht_vorne_01(bz: int) -> list:
     return payload
 
 
-# ── Static payloads — all verified from 0000027.TXT dominant frames ──────────
+# ── Static payloads — lighting/dimming defaults align with BCM tab (LS_FW/KL58d/disp).
 
 # RLS_01 (0x5A0, BO_ 1440): rain/light sensor.
-# b0/b1 vary with ambient light level (noise); dominant pattern used as base.
-# Physical: LS_Helligkeit nibbles in b0/b1 indicate daytime bright conditions.
-_RLS_01_PAYLOAD = [0x1E, 0x7C, 0x82, 0x2E, 0x78, 0x00, 0x00, 0x00]
+# Default matches BCM tab: LS_FW 620 Lux (raw_fw=103, IR est. 14) — see set_light_sensor().
+_RLS_01_PAYLOAD = [0x0E, 0x67, 0x80, 0x2E, 0x78, 0x00, 0x00, 0x00]
 
-# Dimmung_01 (0x5F0, BO_ 1520): KL58 interior dimming level.
-# b0/b3 vary slightly with dimmer position; dominant value used.
-_DIMMUNG_01_PAYLOAD = [0xE5, 0x00, 0x5D, 0xE8, 0x0E, 0x7E, 0x00, 0x00]
+# Dimmung_01 (0x5F0, BO_ 1520): KL58 / display dimming + DI_Fotosensor.
+# Default: KL58d=137, KL58xt=25%, DI_Fotosensor=raw_fw 103 — see set_dimming / set_light_sensor.
+_DIMMUNG_01_PAYLOAD = [0x89, 0x00, 0x19, 0x67, 0x00, 0x7E, 0x00, 0x00]
 
 # Licht_hinten_01 (0x3D6, BO_ 982): rear light status — single unique payload in log.
 _LICHT_HINTEN_01_PAYLOAD = [0x20, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 
 # BCM1_04 (0x64F, BO_ 1615): HUD eyebox / KL58 / light warnings.
-# FIX: was [0x00, 0x00, 0xC0, 0xA0, 0x00, 0x00, 0x00, 0x00] — bytes 2-4 were shifted/wrong.
-_BCM1_04_PAYLOAD = [0x00, 0x00, 0x00, 0xC6, 0x02, 0x00, 0x00, 0x00]
+# Default BCM1_Stellgroesse_Kl_58s = 25% (byte3 bits1-7) — matches set_dimming(25).
+_BCM1_04_PAYLOAD = [0x00, 0x00, 0x00, 0x32, 0x02, 0x00, 0x00, 0x00]
 
 # BCM_01 (0x65A, BO_ 1626): fluid sensors / KL15 status.
 # FIX: b3 0x38→0x10, b5 0x2E→0x20 (fuel level / brake fluid nibbles).

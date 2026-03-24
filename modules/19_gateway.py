@@ -6,7 +6,8 @@ Always-on (ignition-independent):
   0x37B         GNSS_05        — GNSS_UTC_Zeit + receiver flags (DBC BO_ 891), 1000ms; not cluster Uhrzeit_01 (0x6B6)
   0x663         NVEM_02        — 100ms
   0x16A95414    NVEM_06        — 100ms  [16-frame replay]
-  0x3E5         TSG_FT_02      — 100ms  [16-frame replay, BZ 0-15]
+  0x3E5         TSG_FT_02      — 100ms, four doors (DBC FT/BFS/HBFS/HFS), CRC+BZ
+  0x3CF         TSG_HBFS_01    — 100ms, hatch open bit (not on 0x3E5)
 
   NM keepalives (29-bit, ~100ms in log):
     0x1B000010  NM_Gateway     — own node
@@ -15,12 +16,6 @@ Always-on (ignition-independent):
     0x1B000053  NM_node_53     — Infotainment proxy  ← was missing
     0x1B000073  NM_node_73     — Kombi proxy         ← was missing
 
-  ICAN registration / function-status (29-bit, ~500ms in log):
-    0x17F00010  REG_Gateway    — node 0x10 status    ← was missing
-    0x17F00014  REG_node_14    — node 0x14 status    ← was missing
-    0x17F0001B  REG_node_1B    — node 0x1B status    ← was missing
-    0x17F00053  REG_node_53    — node 0x53 status    ← was missing
-    0x17F00073  REG_node_73    — node 0x73 status    ← was missing
 
 NOTE: 0x3C0 ignition is CORE — handled by BusManager, not here.
 
@@ -33,7 +28,7 @@ wrong and floods the bus.
 
 BCME (0x173323xx) on **0x17332310**:
   • **Handshake**: reply to MIB2.5 **18 C2** (Status BAP_Config) and **18 C1** (Status GetAll) on **0x17332300/01**.
-  • After **both** Status replies have been sent once → **handshake complete** (`bcme_handshake_complete`).
+  • After **both** Status replies have been sent once → handshake complete.
   • **Post-handshake**: **HeartbeatStatus** cycle on **17332310**, **~1 s** per step (same order/payload as capture):
       Fct 02 → 03 (long) → 04 → 0E → 0F → 11 → repeat.
   • **0x17332300** Get FCT **0x10** / **00 00 03** → short Status **48 D0 00 00 00 00** (anytime; does not gate HB).
@@ -78,6 +73,70 @@ _BCME_HB_STEPS = [
 ]
 
 _BASE = [0x00, 0x00, 0x00, 0x90, 0x89, 0xC0]  # verlern=0, km=0, 2025-01-01 12:00
+
+# ── TSG_FT_02 (0x3E5, ICAN BO_ 997) — CRC-8 AUTOSAR H2F + GenMsgPDUConstants per BZ ──
+# PDU Data-ID table recovered from hud-cmds/0000027.TXT (16 CRCs, body 20 2a 01 00 00 00 00).
+_TSG_FT02_PDU_DATA_IDS = bytes(
+    [0xC4, 0x6A, 0x69, 0x30, 0xCF, 0x61, 0x58, 0x51, 0x1B, 0x86, 0x99, 0xD3, 0xF6, 0x1D, 0x9A, 0x37]
+)
+# Idle body bytes 1–7 from same log (BZ nibble cycles 0–15); SP heating etc. preserved.
+_TSG_FT02_BODY_BASE = bytes.fromhex("202a0100000000")
+
+TSG_FT02_ARB_ID = 0x3E5
+TSG_HBFS01_ARB_ID = 0x3CF  # BO_ 975 TSG_HBFS_01 — hatch / rear closure controller
+
+
+def _crc8_autosar_h2f(data: bytes) -> int:
+    crc = 0xFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ 0x2F) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+    return crc ^ 0xFF
+
+
+def _intel_wr(buf: bytearray, start: int, length: int, val: int) -> None:
+    val &= (1 << length) - 1
+    for i in range(length):
+        b = start + i
+        if (val >> i) & 1:
+            buf[b // 8] |= 1 << (b % 8)
+        else:
+            buf[b // 8] &= ~(1 << (b % 8))
+
+
+def _build_tsg_ft_02_frame(bz: int, ft: int, bfs: int, hbfs: int, hfs: int) -> list[int]:
+    """
+    Pack TSG_FT_02 per MLBevo ICAN DBC (Intel @1+). Door status VAL: 1=closed, 2=open.
+    """
+    def _cl(v: int) -> int:
+        x = int(v)
+        return x if x in (1, 2) else 1
+
+    ft, bfs, hbfs, hfs = _cl(ft), _cl(bfs), _cl(hbfs), _cl(hfs)
+    bz &= 0x0F
+    buf = bytearray([0]) + bytearray(_TSG_FT02_BODY_BASE)
+    _intel_wr(buf, 8, 4, bz)
+    _intel_wr(buf, 12, 2, ft)
+    _intel_wr(buf, 14, 1, 0)
+    _intel_wr(buf, 15, 1, 0)
+    _intel_wr(buf, 16, 1, 0)
+    _intel_wr(buf, 17, 2, bfs)
+    _intel_wr(buf, 19, 2, hbfs)
+    _intel_wr(buf, 21, 2, hfs)
+    _intel_wr(buf, 23, 1, 0)
+    _intel_wr(buf, 24, 1, 1)
+    _intel_wr(buf, 25, 1, 0)
+    _intel_wr(buf, 26, 1, 0)
+    _intel_wr(buf, 27, 2, 0)
+    _intel_wr(buf, 29, 1, 0)
+    _intel_wr(buf, 36, 1, 0)
+    crc_in = bytes(buf[1:8]) + bytes([_TSG_FT02_PDU_DATA_IDS[bz]])
+    buf[0] = _crc8_autosar_h2f(crc_in)
+    return list(buf)
 
 # GNSS_05 — ICAN BO_ 891 / 0x37B, 8 byte, Gateway. GNSS_UTC_Zeit = UTC seconds (Unix epoch);
 # Uhrzeit_01 (0x6B6) is cluster display time — different message.
@@ -166,31 +225,21 @@ class GatewayECU(ECUModule):
         #    [0x73, 0x40, 0x08, 0x08, 0x00, 0x00, 0x02, 0x00],
         #]),
 
-        # ── TSG_FT_02 — driver door status, CRC+BZ replay (0000058-nav.TXT) ──
-        # 16-frame verbatim sequence, BZ counter 0-15, byte2=0x2A, 100ms.
-        (0x3E5,       "TSG_FT_02",     100, [
-            [0x0B, 0x10, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ= 0
-            [0x4A, 0x11, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ= 1
-            [0x97, 0x12, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ= 2
-            [0xC3, 0x13, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ= 3
-            [0x92, 0x14, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ= 4
-            [0xD3, 0x15, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ= 5
-            [0xDA, 0x16, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ= 6
-            [0xC6, 0x17, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ= 7
-            [0x6B, 0x18, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ= 8
-            [0x86, 0x19, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ= 9
-            [0x1E, 0x1A, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ=10
-            [0x95, 0x1B, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ=11
-            [0x66, 0x1C, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ=12
-            [0x52, 0x1D, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ=13
-            [0xD0, 0x1E, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ=14
-            [0xE0, 0x1F, 0x2A, 0x00, 0x00, 0x00, 0x00, 0x00],  # BZ=15
-        ]),
+        # ── TSG_FT_02 (0x3E5) — four door status + rolling BZ; CRC from 0000027.TXT
+        (TSG_FT02_ARB_ID,  "TSG_FT_02",     100,  _build_tsg_ft_02_frame(0, 1, 1, 1, 1)),
+        # ── TSG_HBFS_01 (0x3CF) — hatch open bit (HBFS_Tuer_geoeffnet); not in 0x3E5
+        (TSG_HBFS01_ARB_ID, "TSG_HBFS_01",  100,  [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
     ]
 
     def __init__(self, log_cb=None):
         super().__init__(log_cb)
         self._secs = 0
+        self._tsg_ft02_bz = 0
+        self._door_ft = 1
+        self._door_bfs = 1
+        self._door_hbfs = 1
+        self._door_hfs = 1
+        self._hbfs_hatch_open = False
         self._bcme_lock = threading.Lock()
         self._last_bcme_rx_at: dict[str, float] = {}
         self._bcme_replied_bap_config = False
@@ -199,10 +248,26 @@ class GatewayECU(ECUModule):
         self._bcme_hb_idx = 0
         self._bcme_hb_next_due = float("inf")
 
-    @property
-    def bcme_handshake_complete(self) -> bool:
-        with self._bcme_lock:
-            return self._bcme_hs_complete
+    def set_door_driver_open(self, open_: bool) -> None:
+        with self._lock:
+            self._door_ft = 2 if open_ else 1
+
+    def set_door_passenger_open(self, open_: bool) -> None:
+        with self._lock:
+            self._door_bfs = 2 if open_ else 1
+
+    def set_door_rear_left_open(self, open_: bool) -> None:
+        with self._lock:
+            self._door_hbfs = 2 if open_ else 1
+
+    def set_door_rear_right_open(self, open_: bool) -> None:
+        with self._lock:
+            self._door_hfs = 2 if open_ else 1
+
+    def set_hatch_open(self, open_: bool) -> None:
+        """TSG_HBFS_01 (0x3CF) bit 0 — HBFS_Tuer_geoeffnet (hatch/liftgate open)."""
+        with self._lock:
+            self._hbfs_hatch_open = bool(open_)
 
     def set_enabled(self, on: bool):
         """Respect UI toggle and ignition: when False, stop sending messages."""
@@ -330,6 +395,18 @@ class GatewayECU(ECUModule):
                     elif s.arb_id == 0x37B:
                         with self._lock:
                             s.data = _pack_gnss_05_from_utc_now()
+                    elif s.arb_id == TSG_FT02_ARB_ID:
+                        bz = self._tsg_ft02_bz
+                        self._tsg_ft02_bz = (self._tsg_ft02_bz + 1) & 0x0F
+                        with self._lock:
+                            fr = _build_tsg_ft_02_frame(
+                                bz, self._door_ft, self._door_bfs, self._door_hbfs, self._door_hfs
+                            )
+                            s.data = fr
+                    elif s.arb_id == TSG_HBFS01_ARB_ID:
+                        with self._lock:
+                            h = 1 if self._hbfs_hatch_open else 0
+                            s.data = [h, 0, 0, 0, 0, 0, 0, 0]
 
                     self._enqueue(s.arb_id, s.next_payload())
                     with self._lock:
