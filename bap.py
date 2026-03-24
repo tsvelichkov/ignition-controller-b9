@@ -3,8 +3,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 import re
 import time
+from bap_protocol_nav import (
+    BAP_LSG_CLUSTER_NAV,
+    BAP_LSG_HUD_NAV,
+    FUNCTION_NAMES,
+    GENERIC_FUNCTION_NAMES,
+    GENERIC_LSG_NAMES,
+    HUD_ASG,
+    HUD_D,
+    HUD_GET,
+    HUD_RX,
+    HUD_S,
+    HUD_TRACE_IDS,
+    LSG_NAMES,
+    MANEUVER_NAMES,
+    NAV_FUNCTION_NAMES,
+    NAV_LSG_NAMES,
+    NAV_SD_FUNCTIONLIST_BITS,
+)
 
 
 BAP_OP_GET = 1
@@ -25,86 +44,6 @@ BAP_OPCODE_NAMES = {
     BAP_OP_ACK: "Ack",
     BAP_OP_ERROR: "Error",
     BAP_OP_RESET: "Reset",
-}
-
-BAP_LSG_CLUSTER_NAV = 0x31
-BAP_LSG_HUD_NAV = 0x32
-
-HUD_S = 0x17333210
-HUD_D = 0x17333211
-HUD_ASG = 0x17333202
-HUD_RX = 0x17330410
-HUD_GET = 0x17333200
-HUD_TRACE_IDS = {HUD_S, HUD_D, HUD_ASG, HUD_RX, HUD_GET}
-
-LSG_NAMES = {
-    0x04: "HUD",
-    0x07: "TSK_07",
-    BAP_LSG_CLUSTER_NAV: "Navigation_Cluster",
-    BAP_LSG_HUD_NAV: "Navigation_SD",
-}
-
-FUNCTION_NAMES = {
-    0x01: "GetAll",
-    0x02: "BAP_Config",
-    0x03: "FunctionList",
-    0x04: "HeartbeatInterval",
-    0x0D: "Unknown0D",
-    0x0E: "FSG_Setup",
-    0x0F: "FSG_OperationState",
-    0x10: "CompassInfo",
-    0x11: "RG_Status",
-    0x12: "DistanceToNextManeuver",
-    0x13: "CurrentPositionInfo",
-    0x14: "TurnToInfo",
-    0x15: "DistanceToDestination",
-    0x16: "TimeToDestination",
-    0x17: "ManeuverDescriptor",
-    0x18: "LaneGuidance",
-    0x1C: "ASG_Capabilities",
-    0x1D: "ManeuverSupplement",
-    0x1E: "FavoriteDest_List",
-    0x20: "NavBook",
-    0x21: "Address_List",
-    0x25: "FunctionSynchronisation",
-    0x26: "InfoStates",
-    0x27: "ActiveRgType",
-    0x29: "GetNextListPos",
-    0x2B: "MapColorAndType",
-    0x2C: "MapViewAndOrientation",
-    0x2D: "MapScale",
-    0x2E: "DestinationInfo",
-    0x2F: "Altitude",
-    0x31: "Exitview",
-    0x32: "FeatureEnable",
-    0x35: "FSG_Setup",
-    0x36: "Map_Presentation",
-    0x37: "ManeuverState",
-    0x39: "MapContentSettings",
-    0x3C: "DistanceToDestinationExtended",
-}
-
-MANEUVER_NAMES = {
-    0x00: "NoSymbol",
-    0x01: "NoInfo",
-    0x02: "DirectionToDestination",
-    0x03: "Arrived",
-    0x04: "NearDestination",
-    0x05: "ArrivedDestinationOffmap",
-    0x06: "OffRoad",
-    0x07: "OffMap",
-    0x08: "NoRoute",
-    0x09: "CalcRoute",
-    0x0A: "RecalcRoute",
-    0x0B: "FollowStreet",
-    0x0C: "ChangeLane",
-    0x0D: "Turn",
-    0x0E: "TurnOnMainroad",
-    0x0F: "ExitRight",
-    0x10: "ExitLeft",
-    0x19: "Uturn",
-    0x1C: "PrepareTurn",
-    0x1D: "PrepareRoundabout",
 }
 
 BUSMASTER_LINE_RE = re.compile(
@@ -152,13 +91,23 @@ def opcode_label(opcode: int) -> str:
     return f"{opcode} {name}"
 
 
-def lsg_label(lsg_id: int) -> str:
-    name = LSG_NAMES.get(lsg_id)
+def _resolve_name(value: int, generic_map: dict[int, str], protocol_map: dict[int, str] | None = None) -> str | None:
+    if protocol_map:
+        name = protocol_map.get(value)
+        if name:
+            return name
+    return generic_map.get(value)
+
+
+def lsg_label(lsg_id: int, protocol_lsg_names: dict[int, str] | None = None) -> str:
+    resolved_map = protocol_lsg_names if protocol_lsg_names is not None else LSG_NAMES
+    name = _resolve_name(lsg_id, GENERIC_LSG_NAMES, resolved_map)
     return f"0x{lsg_id:02X} {name}" if name else f"0x{lsg_id:02X}"
 
 
-def function_label(fct_id: int) -> str:
-    name = FUNCTION_NAMES.get(fct_id)
+def function_label(fct_id: int, protocol_function_names: dict[int, str] | None = None) -> str:
+    resolved_map = protocol_function_names if protocol_function_names is not None else FUNCTION_NAMES
+    name = _resolve_name(fct_id, GENERIC_FUNCTION_NAMES, resolved_map)
     return f"0x{fct_id:02X} {name}" if name else f"0x{fct_id:02X}"
 
 
@@ -212,63 +161,6 @@ def _asciiish_text(data: list[int]) -> str:
     return _asciiish_text_core(data)
 
 
-# Navigation_SD FunctionList bit positions (bit N = available when set)
-NAV_SD_FUNCTIONLIST_BITS = {
-    1: "GetAll",
-    2: "BAP_Config",
-    3: "FunctionList",
-    4: "HeartBeat",
-    15: "FSG_OperationState",
-    16: "CompassInfo",
-    17: "RG_Status",
-    18: "DistanceToNextManeuver",
-    19: "CurrentPositionInfo",
-    20: "TurnToInfo",
-    21: "DistanceToDestination",
-    22: "TimeToDestination",
-    23: "ManeuverDescriptor",
-    24: "LaneGuidance",
-    25: "TMCinfo",
-    26: "MagnetFieldZone",
-    27: "Calibration",
-    28: "ASG_Capabilities",
-    29: "LastDest_List",
-    30: "FavoriteDest_List",
-    31: "PreferredDest_List",
-    32: "NavBook",
-    33: "Address_List",
-    34: "RG_ActDeact",
-    35: "RepeatLastNavAnnouncement",
-    36: "VoiceGuidance",
-    37: "FunctionSynchronisation",
-    38: "InfoStates",
-    39: "ActiveRgType",
-    40: "TrafficBlock_Indication",
-    41: "GetNextListPos",
-    42: "NbSpeller",
-    43: "MapColorAndType",
-    44: "MapViewAndOrientation",
-    45: "MapScale",
-    46: "DestinationInfo",
-    47: "Altitude",
-    48: "OnlineNavigationState",
-    49: "Exitview",
-    50: "SemidynamicRouteGuidance",
-    51: "POI_Search",
-    52: "POI_List",
-    53: "FSG_Setup",
-    54: "Map_Presentation",
-    55: "ManeuverState",
-    56: "ETC_Status",
-    57: "MapContentSettings",
-    58: "VideoStreams",
-    59: "RequestSync_Video",
-    60: "DistanceToDestinationExtended",
-    61: "LaneGuidance2",
-    62: "Picture",
-}
-
-
 def _decode_nav_sd_functionlist(payload: list[int]) -> str:
     """Decode Navigation_SD FunctionList bitmask; return available functions (single line for Treeview)."""
     if len(payload) < 8:
@@ -284,26 +176,32 @@ def _decode_nav_sd_functionlist(payload: list[int]) -> str:
     return "FunctionList=\n" + "\n".join(available)
 
 
-def describe_bap_message(can_id: int, opcode: int, lsg_id: int, fct_id: int, payload: list[int]) -> str:
-    ascii_text = _asciiish_text(payload)
+def _describe_generic_bap_message(can_id: int, opcode: int, lsg_id: int, fct_id: int, payload: list[int]) -> str | None:
     if fct_id == 0x01 and payload:
-        # GetAll StatusAll: concatenated property values (BAP-FC-NAV-SD p.15)
+        # GetAll StatusAll: concatenated property values.
         return f"GetAll StatusAll {len(payload)} bytes (bundled property values)"
     if fct_id == 0x02 and len(payload) >= 6:
-        # BAP_Config: BAP_Version_major, minor, LSG_Class, LSG_Sub_Class, LSG_Version_major, minor (BAP-FC-NAV-SD p.17)
+        # BAP_Config: BAP version and LSG metadata.
         bap_maj, bap_min = payload[0], payload[1]
-        lsg_class, lsg_sub = payload[2], payload[3]
+        lsg_class = payload[2]
         lsg_maj, lsg_min = payload[4], payload[5]
         return f"BAP_Config BAP={bap_maj}.{bap_min} LSG_Class={lsg_class} LSG_def={lsg_maj}.{lsg_min}"
-    if fct_id == 0x03 and payload:
-        if lsg_id == BAP_LSG_HUD_NAV:
-            return _decode_nav_sd_functionlist(payload)
-        return f"FunctionList={_hex(payload)}"
     if fct_id == 0x04 and payload:
-        # HeartbeatInterval: HeartBeatTime in 100ms units (BAP-FC-NAV-SD p.25)
         val = payload[0]
         ms = val * 100
         return f"HeartbeatInterval {ms}ms" if ms < 1000 else f"HeartbeatInterval {ms / 1000:.1f}s"
+    if fct_id == 0x03 and payload and lsg_id != BAP_LSG_HUD_NAV:
+        return f"FunctionList={_hex(payload)}"
+    return None
+
+
+def _describe_nav_bap_message(can_id: int, opcode: int, lsg_id: int, fct_id: int, payload: list[int]) -> str | None:
+    ascii_text = _asciiish_text(payload)
+
+    if fct_id == 0x03 and payload:
+        if lsg_id == BAP_LSG_HUD_NAV:
+            return _decode_nav_sd_functionlist(payload)
+        return None
     if fct_id == 0x0F and payload:
         states = {
             0x00: "normalOperation",
@@ -734,9 +632,41 @@ def describe_bap_message(can_id: int, opcode: int, lsg_id: int, fct_id: int, pay
         return f"HUD announce payload={_hex(payload)}"
     if ascii_text:
         return ascii_text
+    return None
+
+
+def describe_bap_message(can_id: int, opcode: int, lsg_id: int, fct_id: int, payload: list[int]) -> str:
+    generic = _describe_generic_bap_message(can_id, opcode, lsg_id, fct_id, payload)
+    if generic is not None:
+        return generic
+    nav = _describe_nav_bap_message(can_id, opcode, lsg_id, fct_id, payload)
+    if nav is not None:
+        return nav
     if payload:
         return _hex(payload)
     return ""
+
+
+@dataclass(slots=True, frozen=True)
+class BapProtocol:
+    name: str
+    lsg_names: dict[int, str]
+    function_names: dict[int, str]
+    describe_message: Callable[[int, int, int, int, list[int]], str]
+
+    def lsg_label(self, lsg_id: int) -> str:
+        return lsg_label(lsg_id, self.lsg_names)
+
+    def function_label(self, fct_id: int) -> str:
+        return function_label(fct_id, self.function_names)
+
+
+NAV_BAP_PROTOCOL = BapProtocol(
+    name="navigation",
+    lsg_names=NAV_LSG_NAMES,
+    function_names=NAV_FUNCTION_NAMES,
+    describe_message=describe_bap_message,
+)
 
 
 @dataclass(slots=True)
@@ -750,6 +680,7 @@ class BapMessage:
     fct_id: int
     payload: tuple[int, ...]
     text: str
+    protocol: BapProtocol = NAV_BAP_PROTOCOL
 
     @property
     def can_id_label(self) -> str:
@@ -761,11 +692,11 @@ class BapMessage:
 
     @property
     def lsg_text(self) -> str:
-        return lsg_label(self.lsg_id)
+        return self.protocol.lsg_label(self.lsg_id)
 
     @property
     def fct_text(self) -> str:
-        return function_label(self.fct_id)
+        return self.protocol.function_label(self.fct_id)
 
     @property
     def data_text(self) -> str:
@@ -784,7 +715,8 @@ class _PendingBap:
 
 
 class BapReassembler:
-    def __init__(self):
+    def __init__(self, protocol: BapProtocol = NAV_BAP_PROTOCOL):
+        self._protocol = protocol
         self._pending: dict[tuple[str, int, int], _PendingBap] = {}
 
     def feed(self, direction: str, timestamp: str, can_id: int, data: list[int]) -> BapMessage | None:
@@ -804,6 +736,7 @@ class BapReassembler:
                 fct_id=0x02,
                 payload=tuple(),
                 text=f"{channel} marker=1C{marker:02X} ({phase})",
+                protocol=self._protocol,
             )
 
         first_word = (data[0] << 8) | data[1]
@@ -843,7 +776,8 @@ class BapReassembler:
             lsg_id=lsg_id,
             fct_id=fct_id,
             payload=tuple(payload),
-            text=describe_bap_message(can_id, opcode, lsg_id, fct_id, payload),
+            text=self._protocol.describe_message(can_id, opcode, lsg_id, fct_id, payload),
+            protocol=self._protocol,
         )
 
     def _finalize_if_complete(self, key: tuple[str, int, int]) -> BapMessage | None:
@@ -861,7 +795,8 @@ class BapReassembler:
             lsg_id=lsg_id,
             fct_id=fct_id,
             payload=tuple(payload),
-            text=describe_bap_message(pending.can_id, opcode, lsg_id, fct_id, payload),
+            text=self._protocol.describe_message(pending.can_id, opcode, lsg_id, fct_id, payload),
+            protocol=self._protocol,
         )
         del self._pending[key]
         return message

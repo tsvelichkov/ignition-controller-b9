@@ -8,6 +8,7 @@ Always-on (ignition-independent):
   0x16A95414    NVEM_06        — 100ms  [16-frame replay]
   0x3E5         TSG_FT_02      — 100ms, four doors (DBC FT/BFS/HBFS/HFS), CRC+BZ
   0x3CF         TSG_HBFS_01    — 100ms, hatch open bit (not on 0x3E5)
+  0x583         ZV_02          — 200ms, BO_ 1411: ZV_*_offen bits (MIB/HUD door overview; DBC mirrors TSG)
 
   NM keepalives (29-bit, ~100ms in log):
     0x1B000010  NM_Gateway     — own node
@@ -84,6 +85,10 @@ _TSG_FT02_BODY_BASE = bytes.fromhex("202a0100000000")
 
 TSG_FT02_ARB_ID = 0x3E5
 TSG_HBFS01_ARB_ID = 0x3CF  # BO_ 975 TSG_HBFS_01 — hatch / rear closure controller
+# BO_ 1411 ZV_02 — GenMsgCycleTime 200ms in MLBevo ICAN DBC; door-open bits used by cluster/HUD.
+ZV_02_ARB_ID = 0x583
+# Idle payload from real car (0000150-doors.TXT) with ZV_FT/BT/HFS/HBFS/HD/HS_offen all clear.
+_ZV_02_BODY_BASE = bytes.fromhex("0050800000084000")
 
 
 def _crc8_autosar_h2f(data: bytes) -> int:
@@ -106,6 +111,25 @@ def _intel_wr(buf: bytearray, start: int, length: int, val: int) -> None:
             buf[b // 8] |= 1 << (b % 8)
         else:
             buf[b // 8] &= ~(1 << (b % 8))
+
+
+def _build_zv_02_frame(
+    ft_open: bool,
+    bt_open: bool,
+    hfs_open: bool,
+    hbfs_open: bool,
+    hd_open: bool,
+    hs_open: bool = False,
+) -> list[int]:
+    """ZV_02 Intel @1+: bits 24–29 = ZV_FT/BT/HFS/HBFS/HD/HS_offen (1 = open). HD = Heckdeckel (tailgate)."""
+    buf = bytearray(_ZV_02_BODY_BASE)
+    _intel_wr(buf, 24, 1, 1 if ft_open else 0)
+    _intel_wr(buf, 25, 1, 1 if bt_open else 0)
+    _intel_wr(buf, 26, 1, 1 if hfs_open else 0)
+    _intel_wr(buf, 27, 1, 1 if hbfs_open else 0)
+    _intel_wr(buf, 28, 1, 1 if hd_open else 0)
+    _intel_wr(buf, 29, 1, 1 if hs_open else 0)
+    return list(buf)
 
 
 def _build_tsg_ft_02_frame(bz: int, ft: int, bfs: int, hbfs: int, hfs: int) -> list[int]:
@@ -229,6 +253,8 @@ class GatewayECU(ECUModule):
         (TSG_FT02_ARB_ID,  "TSG_FT_02",     100,  _build_tsg_ft_02_frame(0, 1, 1, 1, 1)),
         # ── TSG_HBFS_01 (0x3CF) — hatch open bit (HBFS_Tuer_geoeffnet); not in 0x3E5
         (TSG_HBFS01_ARB_ID, "TSG_HBFS_01",  100,  [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+        # ── ZV_02 (0x583) — door/tailgate open flags for HUD/cluster (see DBC CM_ on ZV_*_offen)
+        (ZV_02_ARB_ID,     "ZV_02",         200,  _build_zv_02_frame(False, False, False, False, False)),
     ]
 
     def __init__(self, log_cb=None):
@@ -257,12 +283,14 @@ class GatewayECU(ECUModule):
             self._door_bfs = 2 if open_ else 1
 
     def set_door_rear_left_open(self, open_: bool) -> None:
-        with self._lock:
-            self._door_hbfs = 2 if open_ else 1
-
-    def set_door_rear_right_open(self, open_: bool) -> None:
+        # LHD: rear left = driver-side rear = HFS (Hinten Fahrerseite), not HBFS.
         with self._lock:
             self._door_hfs = 2 if open_ else 1
+
+    def set_door_rear_right_open(self, open_: bool) -> None:
+        # LHD: rear right = passenger-side rear = HBFS (Hinten Beifahrerseite).
+        with self._lock:
+            self._door_hbfs = 2 if open_ else 1
 
     def set_hatch_open(self, open_: bool) -> None:
         """TSG_HBFS_01 (0x3CF) bit 0 — HBFS_Tuer_geoeffnet (hatch/liftgate open)."""
@@ -407,6 +435,15 @@ class GatewayECU(ECUModule):
                         with self._lock:
                             h = 1 if self._hbfs_hatch_open else 0
                             s.data = [h, 0, 0, 0, 0, 0, 0, 0]
+                    elif s.arb_id == ZV_02_ARB_ID:
+                        with self._lock:
+                            s.data = _build_zv_02_frame(
+                                self._door_ft == 2,
+                                self._door_bfs == 2,
+                                self._door_hfs == 2,
+                                self._door_hbfs == 2,
+                                self._hbfs_hatch_open,
+                            )
 
                     self._enqueue(s.arb_id, s.next_payload())
                     with self._lock:

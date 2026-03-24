@@ -1176,7 +1176,7 @@ class App(QMainWindow):
         tab_bcm_layout.addWidget(bcm_scroll, 1)
         tab_bcm_layout.addWidget(bcm_footer_part)
         self._left_notebook.addTab(tab_bcm, "BCM")
-        # GW tab — TSG_FT_02 (0x3E5) doors, hatch 0x3CF, hood via BCM_01
+        # GW tab — TSG_FT_02 (0x3E5) + ZV_02 (0x583) doors, hatch 0x3CF, hood via BCM_01
         tab_gw = QWidget()
         tab_gw_layout = QVBoxLayout(tab_gw)
         tab_gw_layout.setContentsMargins(4, 4, 4, 4)
@@ -2198,9 +2198,10 @@ class App(QMainWindow):
         return pnl, QWidget()
 
     def _build_gw_tab(self, parent):
-        """GW tab: TSG_FT_02 (0x3E5) four doors, TSG_HBFS_01 hatch (0x3CF), hood on BCM_01 (0x65A)."""
+        """GW tab: TSG_FT_02 (0x3E5) + ZV_02 (0x583) door flags, TSG_HBFS_01 hatch (0x3CF), hood on BCM_01 (0x65A)."""
         if not hasattr(self, "_gw_door_open"):
-            self._gw_door_open = {"ft": False, "bfs": False, "hbfs": False, "hfs": False}
+            # hfs/hbfs keys = rear driver-side / rear passenger-side (LHD); matches DBC HFS/HBFS.
+            self._gw_door_open = {"ft": False, "bfs": False, "hfs": False, "hbfs": False}
         if not hasattr(self, "_gw_hatch_open"):
             self._gw_hatch_open = False
         if not hasattr(self, "_gw_hood_open"):
@@ -2209,19 +2210,52 @@ class App(QMainWindow):
         pnl = QWidget(parent)
         layout = QVBoxLayout(pnl)
         layout.setContentsMargins(10, 12, 10, 10)
-
-        door_gb = _panel(parent, "TSG_FT_02 (0x3E5) — doors (DBC: 1=closed, 2=open)")
-        door_layout = QVBoxLayout(door_gb)
-        door_layout.setContentsMargins(10, 10, 10, 10)
-        door_layout.setSpacing(8)
-
-        _btn_style = (
-            f"QPushButton {{ background: {C['btn']}; color: {C['text']}; "
-            f"border: 1px solid {C['border']}; border-radius: 4px; padding: 8px 12px; text-align: left; }}"
-        )
+        layout.setSpacing(10)
 
         def _door_label(opened: bool) -> str:
             return "Open" if opened else "Closed"
+
+        def _gw_btn_style(opened: bool) -> str:
+            if opened:
+                return (
+                    "QPushButton { background-color: #c62828; color: #ffffff; "
+                    "border: 1px solid #8e0000; border-radius: 6px; padding: 12px 14px; font-weight: 600; }"
+                    "QPushButton:hover { background-color: #d32f2f; }"
+                    "QPushButton:pressed { background-color: #b71c1c; }"
+                )
+            return (
+                "QPushButton { background-color: #2e7d32; color: #ffffff; "
+                "border: 1px solid #1b5e20; border-radius: 6px; padding: 12px 14px; font-weight: 600; }"
+                "QPushButton:hover { background-color: #388e3c; }"
+                "QPushButton:pressed { background-color: #27632a; }"
+            )
+
+        def _apply_gw_btn(btn: QPushButton, opened: bool) -> None:
+            btn.setStyleSheet(_gw_btn_style(opened))
+            title = btn.property("gw_title") or ""
+            btn.setText(f"{title}: {_door_label(opened)}")
+
+        # Hood on top (BCM 0x65A)
+        hood_btn = QPushButton()
+        hood_btn.setProperty("gw_title", "Hood")
+        hood_btn.setMinimumHeight(44)
+        _apply_gw_btn(hood_btn, self._gw_hood_open)
+
+        def _toggle_hood():
+            self._gw_hood_open = not self._gw_hood_open
+            bcm = self._find_bcm_ecu()
+            if bcm is not None and hasattr(bcm, "set_motorhaube_kontakt"):
+                bcm.set_motorhaube_kontakt(self._gw_hood_open)
+            else:
+                self._log("GW: BCM (09) not loaded — hood")
+            _apply_gw_btn(hood_btn, self._gw_hood_open)
+
+        hood_btn.clicked.connect(_toggle_hood)
+        layout.addWidget(hood_btn)
+
+        # Four doors: 2×2 — front row driver | passenger, rear row HFS | HBFS
+        grid = QGridLayout()
+        grid.setSpacing(8)
 
         def _toggle_door(key: str, set_fn_name: str, btn: QPushButton):
             self._gw_door_open[key] = not self._gw_door_open[key]
@@ -2230,65 +2264,42 @@ class App(QMainWindow):
                 getattr(ecu, set_fn_name)(self._gw_door_open[key])
             else:
                 self._log(f"GW: Gateway (19) not loaded — {key}")
-            btn.setText(f"{btn.property('gw_title')}: {_door_label(self._gw_door_open[key])}")
+            _apply_gw_btn(btn, self._gw_door_open[key])
 
-        rows = [
-            ("Driver", "ft", "set_door_driver_open"),
-            ("Passenger", "bfs", "set_door_passenger_open"),
-            ("Rear left", "hbfs", "set_door_rear_left_open"),
-            ("Rear right", "hfs", "set_door_rear_right_open"),
+        door_specs = [
+            (0, 0, "Driver", "ft", "set_door_driver_open"),
+            (0, 1, "Passenger", "bfs", "set_door_passenger_open"),
+            (1, 0, "Rear left", "hfs", "set_door_rear_left_open"),
+            (1, 1, "Rear right", "hbfs", "set_door_rear_right_open"),
         ]
-        for title, key, fn in rows:
-            btn = QPushButton(f"{title}: {_door_label(self._gw_door_open[key])}")
-            btn.setStyleSheet(_btn_style)
+        for row, col, title, key, fn in door_specs:
+            btn = QPushButton()
             btn.setProperty("gw_title", title)
+            btn.setMinimumHeight(44)
+            _apply_gw_btn(btn, self._gw_door_open[key])
             btn.clicked.connect(lambda checked, k=key, f=fn, b=btn: _toggle_door(k, f, b))
-            door_layout.addWidget(btn)
+            grid.addWidget(btn, row, col)
 
-        layout.addWidget(door_gb)
+        layout.addLayout(grid)
 
-        misc_gb = _panel(parent, "Hatch (0x3CF) & hood (BCM 0x65A)")
-        misc_layout = QVBoxLayout(misc_gb)
-        misc_layout.setContentsMargins(10, 10, 10, 10)
-        misc_layout.setSpacing(8)
+        # Trunk / hatch on bottom (0x3CF + ZV)
+        trunk_btn = QPushButton()
+        trunk_btn.setProperty("gw_title", "Trunk")
+        trunk_btn.setMinimumHeight(44)
+        _apply_gw_btn(trunk_btn, self._gw_hatch_open)
 
-        def _toggle_hatch(btn: QPushButton):
+        def _toggle_trunk():
             self._gw_hatch_open = not self._gw_hatch_open
             ecu = self._find_gateway_ecu()
             if ecu is not None and hasattr(ecu, "set_hatch_open"):
                 ecu.set_hatch_open(self._gw_hatch_open)
             else:
                 self._log("GW: Gateway (19) not loaded — hatch")
-            btn.setText(f"Hatch (HBFS): {_door_label(self._gw_hatch_open)}")
+            _apply_gw_btn(trunk_btn, self._gw_hatch_open)
 
-        def _toggle_hood(btn: QPushButton):
-            self._gw_hood_open = not self._gw_hood_open
-            bcm = self._find_bcm_ecu()
-            if bcm is not None and hasattr(bcm, "set_motorhaube_kontakt"):
-                bcm.set_motorhaube_kontakt(self._gw_hood_open)
-            else:
-                self._log("GW: BCM (09) not loaded — hood")
-            btn.setText(f"Hood (MH kontakt): {_door_label(self._gw_hood_open)}")
+        trunk_btn.clicked.connect(_toggle_trunk)
+        layout.addWidget(trunk_btn)
 
-        hb = QPushButton(f"Hatch (HBFS): {_door_label(self._gw_hatch_open)}")
-        hb.setStyleSheet(_btn_style)
-        hb.clicked.connect(lambda: _toggle_hatch(hb))
-        misc_layout.addWidget(hb)
-
-        ho = QPushButton(f"Hood (MH kontakt): {_door_label(self._gw_hood_open)}")
-        ho.setStyleSheet(_btn_style)
-        ho.clicked.connect(lambda: _toggle_hood(ho))
-        misc_layout.addWidget(ho)
-
-        hint = QLabel(
-            "0x3E5 does not carry hood/trunk; hatch uses TSG_HBFS_01 (0x3CF). "
-            "Hood uses BCM1_MH_Schalter on BCM_01 (0x65A) per ICAN DBC."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"color: {C['sub']}; font-size: 11px;")
-        misc_layout.addWidget(hint)
-
-        layout.addWidget(misc_gb)
         layout.addStretch()
         return pnl
 
