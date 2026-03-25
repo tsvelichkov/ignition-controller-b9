@@ -28,6 +28,7 @@ SERIAL_BAUDRATE = 921600  # 8× throughput; use 115200 if adapter unstable
 
 # ── CAN CONNECTION CONFIG ─────────────────────────────────────────────────────
 # Auto-detect order at startup:
+#   0) gvret (ESP32RET) when CAN_GVRET or GVRET_CHANNEL is set — see below
 #   1) csscan_serial
 #   2) pcan (PEAK)
 #   3) slcan
@@ -36,10 +37,23 @@ SERIAL_BAUDRATE = 921600  # 8× throughput; use 115200 if adapter unstable
 # Set CSS_SCAN_CHANNEL to force a specific CSS serial port (e.g. "COM8");
 # None means csscan_serial auto-detect.
 CSS_SCAN_CHANNEL = None
+# LilyGO T-CAN485 / ESP32RET: set port here or set env CAN_GVRET=COM12 (Windows) or /dev/ttyUSB0.
+GVRET_CHANNEL = "COM5"
 
 def _detect_can_configs():
     configs = []
     seen = set()
+    gv_ch = (GVRET_CHANNEL or os.environ.get("CAN_GVRET", "").strip() or None)
+    if gv_ch:
+        cfg = {
+            "interface": "gvret",
+            "channel": gv_ch,
+            "bitrate": 500_000,
+            # UART speed must match ESP32RET / USB bridge (usually 1M). Use 2_000_000 only if firmware is built for it.
+            "tty_baudrate": 1_000_000,
+        }
+        configs.append(cfg)
+        seen.add(("gvret", str(gv_ch)))
     # 1. CSS Electronics (csscan_serial)
     css_configs = can.detect_available_configs("csscan_serial")
     if CSS_SCAN_CHANNEL and not any(str(c.get("channel")) == str(CSS_SCAN_CHANNEL) for c in css_configs):
@@ -74,6 +88,8 @@ def _detect_can_configs():
         import serial.tools.list_ports
         for port in serial.tools.list_ports.comports():
             ch = port.device
+            if gv_ch and ch == gv_ch:
+                continue
             if ch not in [str(c.get("channel")) for c in configs]:
                 cfg = {"interface": "lawicel", "channel": ch, "bitrate": 500000, "tty_baudrate": 115200}
                 configs.append(cfg)
@@ -89,6 +105,7 @@ CAN_AVAILABLE_CONFIGS = _detect_can_configs()
 #   CAN_AVAILABLE_CONFIGS = [{"interface": "pcan", "channel": "PCAN_USBBUS1", "bitrate": 500000}]
 #   CAN_AVAILABLE_CONFIGS = [{"interface": "csscan_serial", "channel": "COM8", "baudrate": SERIAL_BAUDRATE}]
 #   CAN_AVAILABLE_CONFIGS = [{"interface": "virtual", "channel": None}]
+#   CAN_AVAILABLE_CONFIGS = [{"interface": "gvret", "channel": "COM12", "bitrate": 500000, "tty_baudrate": 1000000}]
 
 from datetime import datetime
 
@@ -349,6 +366,16 @@ class BusManager:
                     bitrate=cfg.get("bitrate", 500000),
                     tty_baudrate=cfg.get("tty_baudrate", 115200),
                     serial_timeout=cfg.get("serial_timeout", 0.05),
+                )
+            elif cfg.get("interface") == "gvret":
+                from gvret_serial import GVRETBusAdapter
+                self._bus = GVRETBusAdapter(
+                    channel=cfg["channel"],
+                    bitrate=cfg.get("bitrate", 500_000),
+                    tty_baudrate=cfg.get("tty_baudrate", 1_000_000),
+                    serial_timeout=cfg.get("serial_timeout", 0.0),
+                    esp_boot_delay=cfg.get("esp_boot_delay", 0.35),
+                    gvret_bus=cfg.get("gvret_bus", 0),
                 )
             else:
                 self._bus = can.Bus(**bus_kw)
