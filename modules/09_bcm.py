@@ -3,7 +3,7 @@ modules/09_bcm.py — BCM module 09 emulation
 
 Sends:
   0x2A0  BCM_02          — BCM crash/sunroof/door status,        160ms  [CRC+BZ, BO_ 672]
-  0x366  Blinkmodi_02    — Turn signal / alarm / DWA,           1000ms  [static]
+  0x366  Blinkmodi_02    — Turn signal / alarm / DWA,      100/1000ms  [dynamic; fast when blinker active]
   0x3C1  BCM_Taster_01   — Button states (PLA/ESP/HDC/AVH),       50ms  [replay]
   0x3D4  SMLS_01         — Stalk / MFA inputs (ICAN BO_ 980),    200ms  [CRC+BZ]
   0x3D5  Licht_Anf_01    — Lighting requests (dip/high/fog),     100ms  [CRC+BZ, BO_ 981]
@@ -13,6 +13,21 @@ Sends:
   0x64F  BCM1_04         — HUD eyebox / KL58s / light warnings, 1000ms  [static]
   0x658  Licht_vorne_01  — Front light status,                  1000ms  [CRC+BZ, BO_ 1624]
   0x65A  BCM_01          — Fluid sensors / KL15 status,         1000ms  [static]
+
+Blinker takt master (0x366 Blinkmodi_02 signal layout, Intel byte order):
+  bit 20  BM_Warnblinken        byte 2 bit 4   hazard intent
+  bit 23  BM_links              byte 2 bit 7   left intent
+  bit 24  BM_rechts             byte 3 bit 0   right intent
+  bit 25  Blinken_li_Fzg_Takt   byte 3 bit 1   left lamp clock (500ms)
+  bit 26  Blinken_re_Fzg_Takt   byte 3 bit 2   right lamp clock (500ms)
+  bit 27  Blinken_li_Kombi_Takt byte 3 bit 3   left cluster clock (500ms)
+  bit 28  Blinken_re_Kombi_Takt byte 3 bit 4   right cluster clock (500ms)
+
+  When any blinker active: interval = 100ms; takt bits toggle every 500ms.
+  When idle: interval = 1000ms.
+
+Licht_hinten_01 (0x3D6) brake light:
+  bit 11  LH_Bremslicht_H_aktiv  byte 1 bit 3   brake light physically on
 
 Source: 0000046.TXT + 0000050.TXT car logs. Verified against 0000027.TXT.
   SMLS_01: body 82 84 00 01 00 00 verified from 0000027.TXT
@@ -36,6 +51,20 @@ Fixes applied (0000027.TXT audit):
 import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ecu_base import ECUModule
+
+# ── Blinkmodi_02 (0x366) signal bit masks (Intel byte order) ─────────────────
+_BM_B2_WARNBLINKEN  = 0x10   # bit 20 → byte 2 bit 4
+_BM_B2_LINKS        = 0x80   # bit 23 → byte 2 bit 7
+_BM_B3_RECHTS       = 0x01   # bit 24 → byte 3 bit 0
+_BM_B3_TAKT_LI_FZG  = 0x02   # bit 25 → byte 3 bit 1
+_BM_B3_TAKT_RE_FZG  = 0x04   # bit 26 → byte 3 bit 2
+_BM_B3_TAKT_LI_KOM  = 0x08   # bit 27 → byte 3 bit 3
+_BM_B3_TAKT_RE_KOM  = 0x10   # bit 28 → byte 3 bit 4
+
+# ── Blinker timing ────────────────────────────────────────────────────────────
+_BLINK_FAST_S    = 0.100   # 0x366 TX interval when blinker active
+_BLINK_SLOW_S    = 1.000   # 0x366 TX interval when idle
+_TAKT_HALF_S     = 0.500   # takt half-period (500ms on, 500ms off)
 
 
 def _crc8_autosar_h2f(data: bytes) -> int:
@@ -84,9 +113,149 @@ class BcmECU(ECUModule):
         self._idx_3d4 = 0
         self._idx_3d5 = 0
         self._idx_658 = 0
+        # Blinker state (protected by _lock)
+        self._blink_state = "off"   # "off" | "left" | "right" | "hazard"
+        self._takt_phase  = 0       # 0 or 1; managed only within _run()
+        self._next_takt   = 0.0     # monotonic time for next takt flip
+        self._366_reset   = False   # flag: reset 0x366 next_tx on next _run() tick
+        # Licht_vorne_01 (0x658) front-light indicator bits (protected by _lock)
+        # byte 1 upper nibble: bits 12-15 (masked into upper nibble, BZ in lower)
+        # byte 2: bits 16-18
+        # byte 3: bit 27 only (→ byte 3 bit 3 = 0x08)
+        self._lv_b1_hi = 0x00   # bits 12-15 signals (merged with BZ at build time)
+        self._lv_b2    = 0x00   # bits 16-18 signals
+        self._lv_b3    = 0x00   # bit 27 signal
 
     def set_enabled(self, on: bool):
         self.enabled = on
+        if not on:
+            self._set_blink("off")
+
+    # ── Blinker command interface ─────────────────────────────────────────────
+
+    def send_command(self, cmd: str):
+        """Accept blinker commands: blink_left, blink_right, blink_off, blink_hazard."""
+        if   cmd == "blink_left":   self._set_blink("left")
+        elif cmd == "blink_right":  self._set_blink("right")
+        elif cmd == "blink_off":    self._set_blink("off")
+        elif cmd == "blink_hazard": self._set_blink("hazard")
+
+    def _set_blink(self, state: str):
+        prev = self._blink_state
+        with self._lock:
+            self._blink_state = state
+        if state != "off" and prev == "off":
+            self._takt_phase = 1
+            self._next_takt  = time.monotonic() + _TAKT_HALF_S
+        elif state == "off":
+            self._takt_phase = 0
+        self._apply_blinkmodi_02()
+        self._366_reset = True
+
+    def _apply_blinkmodi_02(self):
+        """Build and latch Blinkmodi_02 payload from current state + takt phase."""
+        with self._lock:
+            state = self._blink_state
+            takt  = self._takt_phase
+        b2 = 0x00
+        b3 = 0x00
+        if state in ("left", "hazard"):
+            b2 |= _BM_B2_LINKS
+        if state in ("right", "hazard"):
+            b3 |= _BM_B3_RECHTS
+        if state == "hazard":
+            b2 |= _BM_B2_WARNBLINKEN
+        if takt:
+            if state in ("left", "hazard"):
+                b3 |= _BM_B3_TAKT_LI_FZG | _BM_B3_TAKT_LI_KOM
+            if state in ("right", "hazard"):
+                b3 |= _BM_B3_TAKT_RE_FZG | _BM_B3_TAKT_RE_KOM
+        payload = [0x00, 0x00, b2, b3, 0x20, 0x00, 0x00, 0xF0]
+        with self._lock:
+            for s in self._states:
+                if s.arb_id == 0x366:
+                    s.data = payload
+                    break
+
+    # ── Brake light ───────────────────────────────────────────────────────────
+
+    def set_brake_light(self, on: bool) -> None:
+        """Set LH_Bremslicht_H_aktiv (bit 11 = byte 1 bit 3) in Licht_hinten_01 (0x3D6)."""
+        with self._lock:
+            for s in self._states:
+                if s.arb_id == 0x3D6:
+                    d = bytearray(s.data)
+                    if on:
+                        d[1] |= 0x08
+                    else:
+                        d[1] &= ~0x08
+                    s.data = list(d)
+                    return
+
+    def set_reverse_light(self, on: bool) -> None:
+        """Set LH_Rueckfahrlicht_aktiv (bit 13 = byte 1 bit 5) in Licht_hinten_01 (0x3D6)."""
+        with self._lock:
+            for s in self._states:
+                if s.arb_id == 0x3D6:
+                    d = bytearray(s.data)
+                    if on:
+                        d[1] |= 0x20
+                    else:
+                        d[1] &= ~0x20
+                    s.data = list(d)
+                    return
+
+    # ── Front light indicators (Licht_vorne_01 0x658) ────────────────────────
+
+    def set_front_light(self, bit: int, on: bool) -> None:
+        """Set/clear a Licht_vorne_01 indicator bit and sync rear sidelights.
+
+        Bit positions (Intel byte order, byte 0 = CRC, byte 1 lower nibble = BZ):
+          12-15 → byte 1 bits 4-7   (Side / Dipped / High / Fog-front)
+          16-18 → byte 2 bits 0-2   (Fog-rear / DRL / AFL)
+             27 → byte 3 bit 3      (High-beam assist)
+        """
+        with self._lock:
+            if 12 <= bit <= 15:
+                mask = 1 << (bit - 8)   # bit 12 → 0x10, 13 → 0x20, …
+                self._lv_b1_hi = (self._lv_b1_hi | mask) if on else (self._lv_b1_hi & ~mask)
+            elif 16 <= bit <= 18:
+                mask = 1 << (bit - 16)
+                self._lv_b2 = (self._lv_b2 | mask) if on else (self._lv_b2 & ~mask)
+            elif bit == 27:
+                self._lv_b3 = (self._lv_b3 | 0x08) if on else (self._lv_b3 & ~0x08)
+        self._sync_rear_sidelight()
+
+    def _sync_rear_sidelight(self) -> None:
+        """Set LH_Standlicht_H_aktiv (bit 8 = byte 1 bit 0) in Licht_hinten_01 (0x3D6)
+        whenever any non-DRL front light indicator is active."""
+        with self._lock:
+            b1_hi = self._lv_b1_hi
+            b2    = self._lv_b2
+            b3    = self._lv_b3
+        # DRL = bit 17 = b2 bit 1 (0x02); exclude it from the non-DRL check
+        non_drl = bool(b1_hi) or bool(b2 & 0xFD) or bool(b3 & 0x08)
+        with self._lock:
+            for s in self._states:
+                if s.arb_id == 0x3D6:
+                    d = bytearray(s.data)
+                    if non_drl:
+                        d[1] |= 0x01
+                    else:
+                        d[1] &= ~0x01
+                    s.data = list(d)
+                    break
+
+    def _make_licht_vorne_01(self, bz: int) -> list:
+        """Build Licht_vorne_01 payload merging BZ counter with current light signal bits."""
+        bz &= 0x0F
+        with self._lock:
+            b1 = bz | self._lv_b1_hi
+            b2 = self._lv_b2
+            b3 = self._lv_b3
+        payload = [0x00, b1, b2, b3, 0x00, 0x00, 0x00, 0x00]
+        payload[0] = _e2e_crc(payload, _LICHT_VORNE_PDU_DATA_IDS)
+        return payload
 
     def set_dimming(self, kl58d: int, display_pct: int) -> None:
         """
@@ -181,18 +350,35 @@ class BcmECU(ECUModule):
         if arb_id == 0x658:
             bz = self._idx_658 % 16
             self._idx_658 += 1
-            return _build_licht_vorne_01(bz)
+            return self._make_licht_vorne_01(bz)
         return None
 
     def _run(self):
         now = time.monotonic()
         next_tx = {s.arb_id: now + s.interval_ms / 1000.0 for s in self._states}
+        self._next_takt = now + _TAKT_HALF_S
 
         while not self._stop_evt.is_set():
             now = time.monotonic()
+
+            # Reset 0x366 next_tx immediately when blink state changed
+            if self._366_reset:
+                self._366_reset = False
+                next_tx[0x366] = now
+
+            # Advance takt every 500ms when a blinker is active
+            with self._lock:
+                blink_state = self._blink_state
+            if blink_state != "off" and now >= self._next_takt:
+                self._takt_phase ^= 1
+                self._next_takt  += _TAKT_HALF_S
+                self._apply_blinkmodi_02()
+
+            blink_interval = _BLINK_FAST_S if blink_state != "off" else _BLINK_SLOW_S
             soonest = 0.010
 
             for s in self._states:
+                interval = blink_interval if s.arb_id == 0x366 else s.interval_ms / 1000.0
                 due = next_tx[s.arb_id]
                 if now >= due:
                     frame = self._next_frame(s.arb_id)
@@ -203,11 +389,17 @@ class BcmECU(ECUModule):
                     with self._lock:
                         s.tx_count += 1
                         s.last_tx   = now
-                    next_tx[s.arb_id] = due + s.interval_ms / 1000.0
+                    next_tx[s.arb_id] = due + interval
 
                 wait = next_tx[s.arb_id] - now
                 if wait < soonest:
                     soonest = wait
+
+            # Wake in time for the next takt flip if blinker is active
+            if blink_state != "off":
+                takt_wait = self._next_takt - now
+                if takt_wait < soonest:
+                    soonest = takt_wait
 
             self._stop_evt.wait(timeout=max(0.001, soonest))
 
@@ -309,8 +501,9 @@ _RLS_01_PAYLOAD = [0x0E, 0x67, 0x80, 0x2E, 0x78, 0x00, 0x00, 0x00]
 # Default: KL58d=137, KL58xt=25%, DI_Fotosensor=raw_fw 103 — see set_dimming / set_light_sensor.
 _DIMMUNG_01_PAYLOAD = [0x89, 0x00, 0x19, 0x67, 0x00, 0x7E, 0x00, 0x00]
 
-# Licht_hinten_01 (0x3D6, BO_ 982): rear light status — single unique payload in log.
-_LICHT_HINTEN_01_PAYLOAD = [0x20, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+# Licht_hinten_01 (0x3D6, BO_ 982): rear light status.
+# Byte 1 bit 3 (LH_Bremslicht_H_aktiv) cleared — brake off by default.
+_LICHT_HINTEN_01_PAYLOAD = [0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
 
 # BCM1_04 (0x64F, BO_ 1615): HUD eyebox / KL58 / light warnings.
 # Default BCM1_Stellgroesse_Kl_58s = 25% (byte3 bits1-7) — matches set_dimming(25).

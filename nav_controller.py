@@ -1330,12 +1330,14 @@ class App(QMainWindow):
         return pnl
 
     def _build_stalk(self, parent):
-        pnl = _panel(parent, "STALK / BLINKERS  (16)")
+        pnl = _panel(parent, "LIGHTS  (09)")
         layout = QVBoxLayout(pnl)
+        # Row 1: blinker + hazard buttons
         BTNS = [
-            ("blink_left",  "blink_left",  "<",  "LEFT"),
-            ("blink_off",   "blink_off",   "X",  "OFF"),
-            ("blink_right", "blink_right", ">",  "RIGHT"),
+            ("blink_left",   "blink_left",   "<",  "LEFT"),
+            ("blink_off",    "blink_off",     "X",  "OFF"),
+            ("blink_right",  "blink_right",  ">",  "RIGHT"),
+            ("blink_hazard", "blink_hazard", "!!", "HAZARD"),
         ]
         g = QWidget()
         g_layout = QHBoxLayout(g)
@@ -1355,6 +1357,51 @@ class App(QMainWindow):
             g_layout.addWidget(btn)
             self._stalk_btns[key] = (btn, cmd)
         layout.addWidget(g)
+        # Row 2: brake light toggle
+        self._brake_btn = QPushButton("BRAKE")
+        self._brake_btn.setCheckable(True)
+        self._brake_btn.setChecked(False)
+        self._brake_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._brake_btn.setFixedHeight(32)
+        self._brake_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C['btn']}; color: {C['sub']}; border: 1px solid {C['border']};
+                border-radius: 6px; padding: 4px 8px; font-size: 11px; }}
+            QPushButton:checked {{ background: #8B0000; color: #FF4444; border-color: #FF4444; }}
+            QPushButton:hover {{ background: {C['btn_hov']}; }}
+            QPushButton:disabled {{ color: {C['border']}; }}
+        """)
+        self._brake_btn.toggled.connect(self._brake_toggled)
+        layout.addWidget(self._brake_btn)
+        # Rows 3-4: front light indicator toggles (Licht_vorne_01 0x658)
+        LV_ROWS = [
+            [(12, "SIDE"), (13, "DIPPED"), (14, "HIGH"),  (15, "FOG F")],
+            [(16, "FOG R"), (17, "DRL"),   (18, "AFL"),   (27, "HBA")],
+        ]
+        self._lv_btns = {}
+        for row_btns in LV_ROWS:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            for bit, lbl in row_btns:
+                btn = QPushButton(lbl)
+                btn.setCheckable(True)
+                btn.setChecked(False)
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.setFixedHeight(28)
+                hi_color = "#003080" if lbl == "HIGH" else "#806000"
+                hi_text  = "#66AAFF" if lbl == "HIGH" else "#FFD000"
+                btn.setStyleSheet(f"""
+                    QPushButton {{ background: {C['btn']}; color: {C['sub']}; border: 1px solid {C['border']};
+                        border-radius: 4px; font-size: 10px; }}
+                    QPushButton:checked {{ background: {hi_color}; color: {hi_text}; border-color: {hi_text}; }}
+                    QPushButton:hover {{ background: {C['btn_hov']}; }}
+                    QPushButton:disabled {{ color: {C['border']}; }}
+                """)
+                btn.toggled.connect(lambda checked, b=bit: self._lv_toggled(b, checked))
+                row_layout.addWidget(btn)
+                self._lv_btns[bit] = btn
+            layout.addWidget(row)
         self._stalk_enabled = False
         self._update_stalk_buttons()
         return pnl
@@ -1365,9 +1412,37 @@ class App(QMainWindow):
         ecu = self._find_stalk_ecu()
         if ecu:
             ecu.send_command(cmd)
-            self._log("Stalk -> " + cmd)
+            self._log("Lights -> " + cmd)
         else:
-            self._log("Stalk: module 16 not attached")
+            self._log("Lights: BCM (09) not attached")
+
+    def _brake_toggled(self, checked: bool):
+        if not self._stalk_enabled:
+            self._brake_btn.setChecked(False)
+            return
+        ecu = self._find_stalk_ecu()
+        if ecu:
+            ecu.set_brake_light(checked)
+            self._log(f"Lights -> brake {'ON' if checked else 'OFF'}")
+        else:
+            self._brake_btn.setChecked(False)
+            self._log("Lights: BCM (09) not attached")
+
+    def _lv_toggled(self, bit: int, checked: bool):
+        if not self._stalk_enabled:
+            if bit in self._lv_btns:
+                self._lv_btns[bit].setChecked(False)
+            return
+        ecu = self._find_stalk_ecu()
+        if ecu:
+            ecu.set_front_light(bit, checked)
+            names = {12: "side", 13: "dipped", 14: "high", 15: "fog_f",
+                     16: "fog_r", 17: "drl", 18: "afl", 27: "hba"}
+            self._log(f"Lights -> {names.get(bit, f'bit{bit}')} {'ON' if checked else 'OFF'}")
+        else:
+            if bit in self._lv_btns:
+                self._lv_btns[bit].setChecked(False)
+            self._log("Lights: BCM (09) not attached")
 
     def _nav_settings(self):
         settings = {
@@ -1791,7 +1866,7 @@ class App(QMainWindow):
 
     def _find_stalk_ecu(self):
         for e in self._mgr.get_ecus():
-            if getattr(e, "ECU_ID", None) == "16": return e
+            if getattr(e, "ECU_ID", None) == "09": return e
         return None
 
     def _find_infotainment_ecu(self):
@@ -1836,8 +1911,9 @@ class App(QMainWindow):
         for key, (btn, cmd) in self._stalk_btns.items():
             btn.setEnabled(self._stalk_enabled)
             if self._stalk_enabled:
+                off_key = key == "blink_off"
                 btn.setStyleSheet(f"""
-                    QPushButton {{ background: {C['btn']}; color: {C['accent'] if key != 'blink_off' else C['sub']};
+                    QPushButton {{ background: {C['btn']}; color: {C['accent'] if not off_key else C['sub']};
                         border: 1px solid {C['border']}; border-radius: 6px; padding: 8px; }}
                     QPushButton:hover {{ background: {C['btn_hov']}; }}
                     QPushButton:pressed {{ background: {C['btn_act']}; }}
@@ -1848,6 +1924,15 @@ class App(QMainWindow):
                         border-radius: 6px; padding: 8px; }}
                     QPushButton:disabled {{ color: {C['border']}; }}
                 """)
+        if hasattr(self, "_brake_btn"):
+            self._brake_btn.setEnabled(self._stalk_enabled)
+            if not self._stalk_enabled:
+                self._brake_btn.setChecked(False)
+        if hasattr(self, "_lv_btns"):
+            for btn in self._lv_btns.values():
+                btn.setEnabled(self._stalk_enabled)
+                if not self._stalk_enabled:
+                    btn.setChecked(False)
 
     def _build_log(self, parent):
         pnl = _panel(parent, "LOG")
@@ -2414,6 +2499,9 @@ class App(QMainWindow):
         eing = self._at_eing_spin.value() if hasattr(self, "_at_eing_spin") else 0
         soll = self._at_soll_spin.value() if hasattr(self, "_at_soll_spin") else 0
         ecu.set_shifter_gear(fahr, eing, soll)
+        bcm = self._find_bcm_ecu()
+        if bcm and hasattr(bcm, "set_reverse_light"):
+            bcm.set_reverse_light(fahr == 2)
         self._update_autotrans_display()
         _names = {1: "P", 2: "R", 3: "N", 4: "D", 5: "S"}
         self._log(f"Apply AT: Fahrstufe={_names.get(fahr, fahr)}  Eing={eing}  Soll={soll}")
