@@ -25,6 +25,17 @@ except ImportError:
 # Use baudrate=921600 (8×) for ~4000+ fps. IFG prevents adapter buffer overrun.
 IFG_SECS = 0.00025  # 0.25ms min gap between sends (~4000 fps max at higher baud)
 SERIAL_BAUDRATE = 921600  # 8× throughput; use 115200 if adapter unstable
+# IFG only makes sense for serial adapters. Native USB adapters (PCAN, Kvaser,
+# Vector, gs_usb) have a driver/hardware TX queue and send() returns in µs, so
+# a per-frame sleep just throttles them (Windows can't sleep 0.25ms — it sleeps
+# ~1ms, or ~15ms if the timer pin fails). Interfaces not listed use IFG_SECS.
+IFG_BY_INTERFACE = {
+    "pcan": 0.0,
+    "kvaser": 0.0,
+    "vector": 0.0,
+    "gs_usb": 0.0,
+    "virtual": 0.0,
+}
 # ECU threads use put_nowait; when full they drop frames (see ecu_base._enqueue).
 _TX_Q_MAXSIZE = 8192
 
@@ -322,6 +333,7 @@ class BusManager:
         self._klemmen_lock = threading.Lock()
         self._klemmen_latest = None  # tuple (arb_id, data) or None
         self._bus_lock = threading.Lock()  # guards bus.send() — shared with ECUs for atomic MF sequences
+        self._ifg = IFG_SECS  # set per interface on connect
 
         self._main_thread   = None   # connection thread
         self._writer_thread = None   # serial writer
@@ -458,9 +470,10 @@ class BusManager:
                 )
             else:
                 self._bus = can.Bus(**bus_kw)
+            self._ifg = IFG_BY_INTERFACE.get(cfg.get("interface"), IFG_SECS)
             self.connected = True
             self._status("ok", cfg["channel"])
-            self._log(f"Connected: {cfg['interface']} / {cfg['channel']}")
+            self._log(f"Connected: {cfg['interface']} / {cfg['channel']} (IFG {self._ifg * 1000:.2f} ms)")
         except Exception as e:
             self._status("error", str(e))
             self._log(f"Connection error: {e}")
@@ -591,21 +604,31 @@ class BusManager:
                     continue
 
             if self._bus and batch:
+                ifg = self._ifg
                 for arb_id, data in batch:
-                    now = time.monotonic()
-                    elapsed = now - last_send
-                    if elapsed < IFG_SECS:
-                        time.sleep(IFG_SECS - elapsed)
-                    try:
-                        with self._bus_lock:
-                            self._bus.send(can.Message(
-                                arbitration_id=arb_id,
-                                data=data,
-                                is_extended_id=arb_id > 0x7FF
-                            ))
-                        self._emit_frame("tx", arb_id, data)
-                    except (can.CanError, SerialException) as e:
-                        self._log(f"TX err {hex(arb_id)}: {e}")
+                    if ifg:
+                        elapsed = time.monotonic() - last_send
+                        if elapsed < ifg:
+                            time.sleep(ifg - elapsed)
+                    msg = can.Message(
+                        arbitration_id=arb_id,
+                        data=data,
+                        is_extended_id=arb_id > 0x7FF
+                    )
+                    for attempt in range(3):
+                        try:
+                            with self._bus_lock:
+                                self._bus.send(msg)
+                            self._emit_frame("tx", arb_id, data)
+                            break
+                        except (can.CanError, SerialException) as e:
+                            # Unpaced native adapters report a full driver TX
+                            # queue as an error instead of blocking — give the
+                            # bus ~1ms to drain and retry before dropping.
+                            if not ifg and attempt < 2:
+                                time.sleep(0.001)
+                                continue
+                            self._log(f"TX err {hex(arb_id)}: {e}")
                     last_send = time.monotonic()
 
     def _tick_loop(self):
