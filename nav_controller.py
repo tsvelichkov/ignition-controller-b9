@@ -211,6 +211,8 @@ MFL = {
     "VIEW":    {"code":0x23, "event":0x01, "label":"VIEW",    "icon":"⊞"},
     "WHEEL_U": {"code":0x06, "event":0x01, "label":"WHEEL ▲", "icon":"▲"},
     "WHEEL_D": {"code":0x06, "event":0x0F, "label":"WHEEL ▼", "icon":"▼"},
+    "SIDE_L":  {"code":0x0A, "event":0x01, "label":"SIDE L",  "icon":"["},
+    "SIDE_R":  {"code":0x0B, "event":0x01, "label":"SIDE R",  "icon":"]"},
 }
 MFL_CLEAR = [0x00, 0x00, 0x00, 0x21]
 
@@ -223,6 +225,8 @@ MFL_LAYOUT = [
     ("VIEW",    2, 0),
     ("RETURN",  2, 1),
     ("WHEEL_D", 2, 2),
+    ("SIDE_L",  3, 0),
+    ("SIDE_R",  3, 2),
 ]
 
 # ── Palette (dark theme) ─────────────────────────────────────────────────────
