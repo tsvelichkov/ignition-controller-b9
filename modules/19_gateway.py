@@ -6,6 +6,7 @@ Always-on (ignition-independent):
   0x37B         GNSS_05        — GNSS_UTC_Zeit + receiver flags (DBC BO_ 891), 1000ms; not cluster Uhrzeit_01 (0x6B6)
   0x663         NVEM_02        — 100ms
   0x16A95414    NVEM_06        — 100ms  [16-frame replay]
+  0x16A955B7    ada_02         — static payload, 1000ms
   0x3E5         TSG_FT_02      — 100ms, four doors (DBC FT/BFS/HBFS/HFS), CRC+BZ
   0x3CF         TSG_HBFS_01    — 100ms, hatch open bit (not on 0x3E5)
   0x583         ZV_02          — 200ms, BO_ 1411: ZV_*_offen bits (MIB/HUD door overview; DBC mirrors TSG)
@@ -236,6 +237,7 @@ class GatewayECU(ECUModule):
             [0xB0, 0x6F, 0x52, 0x48, 0x0A, 0x00, 0x53, 0x00],
         ]),
         # NVEM_07 (0x16A95415) removed — not present in any log capture
+        (0x16A955B7,  "ada_02",       1000, [0x00, 0x60, 0x00, 0x7E, 0x7E, 0x7E, 0x00, 0x00]),
 
         # ── NM keepalives (29-bit, ~100ms) ────────────────────────────────────
         #(0x1B000010,  "NM_Gateway",    100, [0x10, 0x50, 0x44, 0x0B, 0x00, 0xFF, 0x01, 0x00]),

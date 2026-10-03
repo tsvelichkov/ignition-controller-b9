@@ -25,35 +25,91 @@ except ImportError:
 # Use baudrate=921600 (8×) for ~4000+ fps. IFG prevents adapter buffer overrun.
 IFG_SECS = 0.00025  # 0.25ms min gap between sends (~4000 fps max at higher baud)
 SERIAL_BAUDRATE = 921600  # 8× throughput; use 115200 if adapter unstable
+# ECU threads use put_nowait; when full they drop frames (see ecu_base._enqueue).
+_TX_Q_MAXSIZE = 8192
+
+# True after _pin_background_timer_resolution() succeeds. Startup log reads this.
+_TIMER_PIN_OK = False
+
+
+def _pin_background_timer_resolution():
+    """Keep 1ms timer resolution when the window is alt-tabbed away.
+
+    Windows 11 ignores a windowed process's timer-resolution request once the
+    window is covered, and may also throttle its CPU. time.sleep and
+    Event.wait then fall back to the 15.6ms tick, the CAN writer slows to
+    ~60 frames/s, and _tx_q fills. Opting out here is per-process; no Windows
+    setting controls it.
+    """
+    global _TIMER_PIN_OK
+    if sys.platform != "win32":
+        _TIMER_PIN_OK = True
+        return
+    import atexit
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    winmm = ctypes.WinDLL("winmm", use_last_error=True)
+
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.SetProcessInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    kernel32.SetProcessInformation.restype = wintypes.BOOL
+    winmm.timeBeginPeriod.argtypes = [ctypes.c_uint]
+    winmm.timeBeginPeriod.restype = ctypes.c_uint
+    winmm.timeEndPeriod.argtypes = [ctypes.c_uint]
+    winmm.timeEndPeriod.restype = ctypes.c_uint
+
+    class _PowerThrottlingState(ctypes.Structure):
+        _fields_ = [
+            ("Version", wintypes.ULONG),
+            ("ControlMask", wintypes.ULONG),
+            ("StateMask", wintypes.ULONG),
+        ]
+
+    # ProcessPowerThrottling = 4. StateMask 0 turns both behaviors off:
+    #   0x1 execution-speed throttle, 0x4 ignore-timer-resolution (Win11).
+    state = _PowerThrottlingState(1, 0x1 | 0x4, 0)
+    throttling_off = bool(kernel32.SetProcessInformation(
+        kernel32.GetCurrentProcess(),
+        4,
+        ctypes.byref(state),
+        ctypes.sizeof(state),
+    ))
+    # Hold 1ms for process lifetime so a later timeEndPeriod (Qt, on blur)
+    # cannot drop us back to 15.6ms. Matched in atexit.
+    begin_ok = winmm.timeBeginPeriod(1) == 0
+    if begin_ok:
+        atexit.register(winmm.timeEndPeriod, 1)
+    _TIMER_PIN_OK = throttling_off and begin_ok
 
 # ── CAN CONNECTION CONFIG ─────────────────────────────────────────────────────
 # Auto-detect order at startup:
-#   0) gvret (ESP32RET) when CAN_GVRET or GVRET_CHANNEL is set — see below
 #   1) csscan_serial
 #   2) pcan (PEAK)
-#   3) slcan
-#   4) lawicel (serial ports)
+#   3) slcan (python-can)
+#   4) each remaining serial port offered as both gvret and lawicel
+#      (we cannot tell ESP32RET/GVRET from Lawicel/SLCAN by port alone)
 #   5) virtual
 # Set CSS_SCAN_CHANNEL to force a specific CSS serial port (e.g. "COM8");
 # None means csscan_serial auto-detect.
 CSS_SCAN_CHANNEL = None
-# LilyGO T-CAN485 / ESP32RET: set port here or set env CAN_GVRET=COM12 (Windows) or /dev/ttyUSB0.
-GVRET_CHANNEL = "COM5"
+
+def _serial_ports_present():
+    try:
+        import serial.tools.list_ports
+        return {p.device for p in serial.tools.list_ports.comports()}
+    except Exception:
+        return set()
 
 def _detect_can_configs():
     configs = []
-    seen = set()
-    gv_ch = (GVRET_CHANNEL or os.environ.get("CAN_GVRET", "").strip() or None)
-    if gv_ch:
-        cfg = {
-            "interface": "gvret",
-            "channel": gv_ch,
-            "bitrate": 500_000,
-            # UART speed must match ESP32RET / USB bridge (usually 1M). Use 2_000_000 only if firmware is built for it.
-            "tty_baudrate": 1_000_000,
-        }
-        configs.append(cfg)
-        seen.add(("gvret", str(gv_ch)))
+    seen = set()  # (interface, channel)
+    # Channels claimed by a known dedicated adapter — do not dual-list as gvret/lawicel.
+    dedicated_channels = set()
+
     # 1. CSS Electronics (csscan_serial)
     css_configs = can.detect_available_configs("csscan_serial")
     if CSS_SCAN_CHANNEL and not any(str(c.get("channel")) == str(CSS_SCAN_CHANNEL) for c in css_configs):
@@ -61,17 +117,21 @@ def _detect_can_configs():
     for c in css_configs:
         if c.get("interface") == "csscan_serial" and "baudrate" not in c:
             c["baudrate"] = SERIAL_BAUDRATE
-        key = (c.get("interface"), str(c.get("channel", "")))
+        ch = str(c.get("channel", ""))
+        key = (c.get("interface"), ch)
         if key not in seen:
             seen.add(key)
+            dedicated_channels.add(ch)
             configs.append(c)
     # 2. PCAN (PEAK)
     try:
         for c in can.detect_available_configs("pcan"):
             c.setdefault("bitrate", 500000)
-            key = ("pcan", str(c.get("channel", "")))
+            ch = str(c.get("channel", ""))
+            key = ("pcan", ch)
             if key not in seen:
                 seen.add(key)
+                dedicated_channels.add(ch)
                 configs.append(c)
     except Exception:
         pass
@@ -79,22 +139,29 @@ def _detect_can_configs():
     for c in can.detect_available_configs("slcan"):
         c.setdefault("bitrate", 500000)
         c.setdefault("tty_baudrate", 115200)
-        key = ("slcan", str(c.get("channel", "")))
+        ch = str(c.get("channel", ""))
+        key = ("slcan", ch)
         if key not in seen:
             seen.add(key)
             configs.append(c)
-    # 4. Lawicel/SLCAN on serial ports (COM3+, /dev/ttyUSB*, /dev/ttyACM*)
-    try:
-        import serial.tools.list_ports
-        for port in serial.tools.list_ports.comports():
-            ch = port.device
-            if gv_ch and ch == gv_ch:
+    # 4. Ambiguous serial ports: list both protocols — user picks in the UI.
+    for ch in sorted(_serial_ports_present()):
+        if ch in dedicated_channels:
+            continue
+        for iface, tty_baud in (
+            ("gvret", 1_000_000),   # ESP32RET / SavvyCAN — usually 1 Mbaud UART
+            ("lawicel", 115200),    # Lawicel CAN-USB / SLCAN
+        ):
+            key = (iface, ch)
+            if key in seen:
                 continue
-            if ch not in [str(c.get("channel")) for c in configs]:
-                cfg = {"interface": "lawicel", "channel": ch, "bitrate": 500000, "tty_baudrate": 115200}
-                configs.append(cfg)
-    except Exception:
-        pass
+            seen.add(key)
+            configs.append({
+                "interface": iface,
+                "channel": ch,
+                "bitrate": 500000,
+                "tty_baudrate": tty_baud,
+            })
     # 5. Virtual (always available for testing)
     configs.append({"interface": "virtual", "channel": None})
     return configs
@@ -243,10 +310,13 @@ class BusManager:
         self.send_ignition_updates = True  # when False, do not send periodic 0x3C0 (another device may send it)
 
         # Shared send queues.
-        # _prio_q: urgent frames (MFL button presses) — checked first by writer
-        # _tx_q:   normal periodic ECU frames
+        # _prio_q: urgent frames (MFL button presses, ignition shutdown burst) — writer checks first
+        # _tx_q:   normal periodic ECU frames (bounded — slow writer drops via put_nowait in modules)
         self._prio_q = queue.Queue()
-        self._tx_q   = queue.Queue()  # unbounded
+        self._tx_q   = queue.Queue(maxsize=_TX_Q_MAXSIZE)
+        # Latest periodic 0x3C0 only — tick overwrites; writer drains so a slow link never stacks Klemmen.
+        self._klemmen_lock = threading.Lock()
+        self._klemmen_latest = None  # tuple (arb_id, data) or None
         self._bus_lock = threading.Lock()  # guards bus.send() — shared with ECUs for atomic MF sequences
 
         self._main_thread   = None   # connection thread
@@ -262,6 +332,8 @@ class BusManager:
         self.connected = False
         self._ig_ctr   = 0
         self._ign_on = False
+        self.tx_frame_count = 0   # total TX frames sent; read by UI for FPS display
+        self.tx_bit_count   = 0   # total TX bits (with stuffing estimate); read by UI for bus load
         self._tick     = 0
 
     # ── ECU management ────────────────────────────────────────────────────────
@@ -315,6 +387,8 @@ class BusManager:
         self.ignition = on
         self._ign_on = on
         if not on and self.connected:
+            with self._klemmen_lock:
+                self._klemmen_latest = None
             # Drain the queue so stale ECU frames don't delay the shutdown burst.
             try:
                 while True:
@@ -325,8 +399,9 @@ class BusManager:
             # followed by one 0x00 frame (~1ms apart as seen in mib2_5 log).
             ctr_21 = (self._ig_ctr + 1) & 0x0F
             ctr_00 = (self._ig_ctr + 2) & 0x0F
-            self._tx_q.put((0x3C0, [IGN_CRC_KL15[ctr_21], ctr_21, 0x21, 0x00]))
-            self._tx_q.put((0x3C0, [IGN_CRC_OFF[ctr_00],  ctr_00, 0x00, 0x00]))
+            # Prio queue so these are not stuck behind thousands of buffered ECU frames.
+            self._prio_q.put((0x3C0, [IGN_CRC_KL15[ctr_21], ctr_21, 0x21, 0x00]))
+            self._prio_q.put((0x3C0, [IGN_CRC_OFF[ctr_00],  ctr_00, 0x00, 0x00]))
             self._ig_ctr = ctr_00   # tick loop continues counting from here
         for e in self._ecus:
             if hasattr(e, 'set_enabled'):
@@ -412,9 +487,18 @@ class BusManager:
                 e.detach()
             self._bus.shutdown()
             self.connected = False
+            with self._klemmen_lock:
+                self._klemmen_latest = None
             self._status("off", "")
 
     def _emit_frame(self, direction: str, arb_id: int, data):
+        if direction == "tx":
+            self.tx_frame_count += 1
+            # CAN frame bit count with ~20% stuffing estimate:
+            #   standard (11-bit ID): 44 overhead + DLC*8 data
+            #   extended (29-bit ID): 64 overhead + DLC*8 data
+            overhead = 64 if arb_id > 0x7FF else 44
+            self.tx_bit_count += int((overhead + len(data) * 8) * 1.2)
         try:
             self._frame(direction, arb_id, list(data))
         except Exception:
@@ -470,6 +554,8 @@ class BusManager:
         Single thread that drains the TX queues and writes to the serial port.
         _prio_q is checked first so MFL button presses are never delayed by
         a backlog of periodic ECU frames.
+        Coalesced periodic 0x3C0 (Klemmen) is merged to a single slot so a slow
+        serial link cannot accumulate unbounded identical heartbeats.
         Enforces IFG_SECS between consecutive sends to prevent adapter overrun.
         Batches up to 8 frames per iteration to reduce loop overhead when backlogged.
         """
@@ -477,23 +563,28 @@ class BusManager:
         batch = []
         batch_size = 8
         while not self._stop.is_set():
-            # Priority queue first (non-blocking)
+            batch.clear()
             try:
                 arb_id, data = self._prio_q.get_nowait()
                 batch.append((arb_id, data))
             except queue.Empty:
-                # Drain normal queue into batch (non-blocking up to batch_size)
-                for _ in range(batch_size - len(batch)):
-                    try:
-                        batch.append(self._tx_q.get_nowait())
-                    except queue.Empty:
-                        break
-                if not batch:
-                    try:
-                        arb_id, data = self._tx_q.get(timeout=0.05)
-                        batch.append((arb_id, data))
-                    except queue.Empty:
-                        continue
+                pass
+            with self._klemmen_lock:
+                km = self._klemmen_latest
+                self._klemmen_latest = None
+            if km is not None and len(batch) < batch_size:
+                batch.append(km)
+            for _ in range(batch_size - len(batch)):
+                try:
+                    batch.append(self._tx_q.get_nowait())
+                except queue.Empty:
+                    break
+            if not batch:
+                try:
+                    arb_id, data = self._tx_q.get(timeout=0.05)
+                    batch.append((arb_id, data))
+                except queue.Empty:
+                    continue
 
             if self._bus and batch:
                 for arb_id, data in batch:
@@ -512,9 +603,6 @@ class BusManager:
                     except (can.CanError, SerialException) as e:
                         self._log(f"TX err {hex(arb_id)}: {e}")
                     last_send = time.monotonic()
-                batch.clear()
-
-
 
     def _tick_loop(self):
         """Ignition heartbeat + MFL dispatch — 100ms tick."""
@@ -538,7 +626,9 @@ class BusManager:
                         crc, kl15 = IGN_CRC[self._ig_ctr], 0x23
                     else:
                         crc, kl15 = IGN_CRC_OFF[self._ig_ctr], 0x00
-                    self._tx_q.put((0x3C0, [crc, self._ig_ctr, kl15, 0x00]))
+                    payload = (0x3C0, [crc, self._ig_ctr, kl15, 0x00])
+                    with self._klemmen_lock:
+                        self._klemmen_latest = payload
                 self._tick += 1
 
             time.sleep(0.005)
@@ -1001,6 +1091,7 @@ class App(QMainWindow):
             f" send_ignition_updates={'on' if self._cfg.get('send_ignition_updates') else 'off'}"
             f" hud_mode={self._cfg.get('hud_mode')}"
             f" verbose_bap={'on' if self._cfg.get('verbose_bap') else 'off'}"
+            f" timer_pin={'on' if _TIMER_PIN_OK else 'off'}"
         ))
         if self._cfg.get("auto_open_hud"):
             QTimer.singleShot(200, self._open_hud_bap_window)
@@ -1039,6 +1130,9 @@ class App(QMainWindow):
         title = QLabel("  CAN NAV CONTROLLER")
         title.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {C['accent']};")
         bar_layout.addWidget(title)
+        self._fps_lbl = QLabel("0 f/s")
+        self._fps_lbl.setStyleSheet(f"color: {C['sub']}; font-family: Consolas; font-size: 11px; margin-left: 10px;")
+        bar_layout.addWidget(self._fps_lbl)
         bar_layout.addStretch()
         self._can_combo = QComboBox()
         self._can_combo.setMinimumWidth(180)
@@ -2993,7 +3087,12 @@ class App(QMainWindow):
         self._slbl.setText(lbl)
         self._slbl.setStyleSheet(f"color: {col};")
 
+    _CAN_BUS_SPEED = 500_000   # bits/sec
+
     def _start_refresh(self):
+        _last_frames = [0]
+        _last_bits   = [0]
+        _last_t      = [time.monotonic()]
         def _r():
             for card in self._cards:
                 try: card.refresh()
@@ -3004,6 +3103,23 @@ class App(QMainWindow):
                 txt = f"Q:{q}" if pq == 0 else f"Q:{q}  P:{pq}"
                 self._qlbl.setText(txt)
                 self._qlbl.setStyleSheet(f"color: {C['off'] if q > 50 else C['sub']};")
+            except Exception:
+                pass
+            try:
+                now        = time.monotonic()
+                dt         = max(now - _last_t[0], 1e-6)
+                frames     = self._mgr.tx_frame_count
+                bits       = self._mgr.tx_bit_count
+                fps        = int((frames - _last_frames[0]) / dt)
+                bps        = (bits   - _last_bits[0])   / dt
+                load_pct   = bps / self._CAN_BUS_SPEED * 100.0
+                _last_frames[0] = frames
+                _last_bits[0]   = bits
+                _last_t[0]      = now
+                self._fps_lbl.setText(f"{fps} f/s  {load_pct:.1f}%")
+                self._fps_lbl.setStyleSheet(
+                    f"color: {C['on'] if fps > 0 else C['sub']}; font-family: Consolas; font-size: 11px; margin-left: 10px;"
+                )
             except Exception:
                 pass
             QTimer.singleShot(self.REFRESH, _r)
@@ -3025,6 +3141,7 @@ class App(QMainWindow):
 
 
 if __name__ == "__main__":
+    _pin_background_timer_resolution()
     args = parse_args()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
