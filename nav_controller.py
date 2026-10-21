@@ -224,10 +224,19 @@ MFL = {
     "WHEEL_D": {"code":0x06, "event":0x0F, "label":"WHEEL ▼", "icon":"▼"},
     "SIDE_L":  {"code":0x0A, "event":0x01, "label":"SIDE L",  "icon":"["},
     "SIDE_R":  {"code":0x0B, "event":0x01, "label":"SIDE R",  "icon":"]"},
+    # Media side — event 0x01 = 1 tick up / pressed, 0x0F = 1 tick down
+    "PREV":    {"code":0x05, "event":0x01, "label":"PREV",    "icon":"⏮"},
+    "NEXT":    {"code":0x04, "event":0x01, "label":"NEXT",    "icon":"⏭"},
+    "VOL_U":   {"code":0x12, "event":0x01, "label":"VOL ▲",   "icon":"+"},
+    "VOL_D":   {"code":0x12, "event":0x0F, "label":"VOL ▼",   "icon":"−"},
+    "VOL_CLK": {"code":0x13, "event":0x01, "label":"VOL CLICK","icon":"●"},
+    "NAV":     {"code":0x1B, "event":0x01, "label":"NAV",     "icon":"➤"},
+    "PHONE":   {"code":0x1C, "event":0x01, "label":"PHONE",   "icon":"☎"},
+    "JOKER1":  {"code":0x21, "event":0x01, "label":"JOKER 1", "icon":"★"},
 }
 MFL_CLEAR = [0x00, 0x00, 0x00, 0x21]
 
-MFL_LAYOUT = [
+MFL_LAYOUT_DASH = [
     ("MENU",    0, 1),
     ("WHEEL_U", 0, 2),
     ("LEFT",    1, 0),
@@ -238,6 +247,17 @@ MFL_LAYOUT = [
     ("WHEEL_D", 2, 2),
     ("SIDE_L",  3, 0),
     ("SIDE_R",  3, 2),
+]
+
+MFL_LAYOUT_MEDIA = [
+    ("VOL_U",   0, 1),
+    ("PREV",    1, 0),
+    ("VOL_CLK", 1, 1),
+    ("NEXT",    1, 2),
+    ("VOL_D",   2, 1),
+    ("NAV",     3, 0),
+    ("PHONE",   3, 1),
+    ("JOKER1",  3, 2),
 ]
 
 # ── Palette (dark theme) ─────────────────────────────────────────────────────
@@ -1439,15 +1459,18 @@ class App(QMainWindow):
     def _build_mfl(self, parent):
         pnl = _panel(parent, "MFL  (0x5BF)")
         layout = QVBoxLayout(pnl)
-        g = QWidget()
-        g_layout = QGridLayout(g)
-        g_layout.setSpacing(6)
+        tabs = QTabWidget()
         self._btns = {}
-        for key, row, col in MFL_LAYOUT:
-            b = MFLBtn(g, key, cmd=lambda k=key: self._mfl(k))
-            g_layout.addWidget(b, row, col)
-            self._btns[key] = b
-        layout.addWidget(g)
+        for title, grid in (("DASH", MFL_LAYOUT_DASH), ("MEDIA", MFL_LAYOUT_MEDIA)):
+            g = QWidget()
+            g_layout = QGridLayout(g)
+            g_layout.setSpacing(6)
+            for key, row, col in grid:
+                b = MFLBtn(g, key, cmd=lambda k=key: self._mfl(k))
+                g_layout.addWidget(b, row, col)
+                self._btns[key] = b
+            tabs.addTab(g, title)
+        layout.addWidget(tabs)
         return pnl
 
     def _build_stalk(self, parent):
