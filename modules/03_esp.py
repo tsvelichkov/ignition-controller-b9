@@ -13,6 +13,25 @@ Ignition-gated — stops when KL15 off.
 from ecu_base import ECUModule
 
 
+def _crc8_autosar_h2f(data: bytes) -> int:
+    """CRC-8 / AUTOSAR H2F (poly 0x2F, init 0xFF, xorout 0xFF)."""
+    crc = 0xFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ 0x2F) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+    return crc ^ 0xFF
+
+
+# ESP_21 (0x0FD) E2E Data-IDs per BZ — recovered from logs (9352/9352 frames match)
+_ESP_21_DATA_IDS = bytes(
+    [0xB4, 0xEF, 0xF8, 0x49, 0x1E, 0xE5, 0xC2, 0xC0, 0x97, 0x19, 0x3C, 0xC9, 0xF1, 0x98, 0xD6, 0x61]
+)
+
+
 class ESPECU(ECUModule):
     ECU_ID   = "03"
     ECU_NAME = "ESP"
@@ -1154,3 +1173,15 @@ class ESPECU(ECUModule):
 
     def set_enabled(self, on: bool):
         self.enabled = on
+
+    def set_speed(self, kmh: float):
+        """ESP_21 (0x0FD) ESP_v_Signal, bits 32-47, 0.01 km/h/bit; CRC re-computed per frame."""
+        raw = max(0, min(65532, int(round(float(kmh) / 0.01))))
+        template = next(d for a, _n, _i, d in self.MESSAGES if a == 0x0FD)
+        frames = []
+        for f in template:
+            f = list(f)
+            f[4], f[5] = raw & 0xFF, raw >> 8
+            f[0] = _crc8_autosar_h2f(bytes(f[1:8]) + bytes([_ESP_21_DATA_IDS[f[1] & 0x0F]]))
+            frames.append(f)
+        self.update_data(0x0FD, frames)

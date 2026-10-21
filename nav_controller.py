@@ -1304,26 +1304,24 @@ class App(QMainWindow):
         tab_hc_layout.addWidget(hc_scroll, 1)
         tab_hc_layout.addWidget(footer_part)
         self._left_notebook.addTab(tab_hc, "HC")
-        # Fuel tab — 0x644 fuel level (BCM2)
-        tab_fuel = QWidget()
-        tab_fuel_layout = QVBoxLayout(tab_fuel)
-        tab_fuel_layout.setContentsMargins(4, 4, 4, 4)
-        fuel_scroll = QScrollArea()
-        fuel_scroll.setWidgetResizable(True)
-        fuel_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        fuel_scroll.setStyleSheet(f"QScrollArea {{ background: {C['bg']}; border: none; }}")
-        fuel_content = QWidget()
-        fuel_content.setStyleSheet(f"background: {C['bg']};")
-        fuel_content_layout = QVBoxLayout(fuel_content)
-        fuel_content_layout.setContentsMargins(0, 0, 0, 0)
-        scroll_part, footer_part = self._build_fuel_tab(tab_fuel)
-        fuel_content_layout.addWidget(scroll_part)
-        fuel_content_layout.addStretch()
-        fuel_content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
-        fuel_scroll.setWidget(fuel_content)
-        tab_fuel_layout.addWidget(fuel_scroll, 1)
-        tab_fuel_layout.addWidget(footer_part)
-        self._left_notebook.addTab(tab_fuel, "Fuel")
+        # Engine tab — speed (ESP_21), RPM (Motor_04/28), fuel (0x644), coolant/oil (Motor_07)
+        tab_engine = QWidget()
+        tab_engine_layout = QVBoxLayout(tab_engine)
+        tab_engine_layout.setContentsMargins(4, 4, 4, 4)
+        engine_scroll = QScrollArea()
+        engine_scroll.setWidgetResizable(True)
+        engine_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        engine_scroll.setStyleSheet(f"QScrollArea {{ background: {C['bg']}; border: none; }}")
+        engine_content = QWidget()
+        engine_content.setStyleSheet(f"background: {C['bg']};")
+        engine_content_layout = QVBoxLayout(engine_content)
+        engine_content_layout.setContentsMargins(0, 0, 0, 0)
+        engine_content_layout.addWidget(self._build_engine_tab(tab_engine))
+        engine_content_layout.addStretch()
+        engine_content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        engine_scroll.setWidget(engine_content)
+        tab_engine_layout.addWidget(engine_scroll, 1)
+        self._left_notebook.addTab(tab_engine, "Engine")
         # BCM tab — Dimmung_01 / BCM1_04 lighting & dimming controls
         tab_bcm = QWidget()
         tab_bcm_layout = QVBoxLayout(tab_bcm)
@@ -2300,92 +2298,101 @@ class App(QMainWindow):
         QTimer.singleShot(50, self._update_hc_byte4_display)
         return pnl, footer
 
-    def _build_fuel_tab(self, parent):
-        """Fuel tab: 0x644 fuel level (BCM2). Manual byte entry."""
+    def _find_ecu(self, ecu_id: str):
+        for e in self._mgr.get_ecus():
+            if getattr(e, "ECU_ID", None) == ecu_id:
+                return e
+        return None
+
+    def _build_engine_tab(self, parent):
+        """Engine tab: speed, RPM, fuel, coolant and oil temperature sliders."""
         pnl = QWidget(parent)
         layout = QVBoxLayout(pnl)
         layout.setContentsMargins(10, 12, 10, 10)
 
-        fuel_gb = _panel(parent, "0x644 Fuel level (BCM2)")
-        fuel_layout = QVBoxLayout(fuel_gb)
-        fuel_layout.setContentsMargins(10, 10, 10, 10)
+        gb = _panel(parent, "Engine / Cluster gauges")
+        gb_layout = QVBoxLayout(gb)
+        gb_layout.setContentsMargins(10, 10, 10, 10)
+        gb_layout.setSpacing(10)
 
-        row = QWidget()
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        row_layout.addWidget(QLabel("Byte 0:"))
-        self._fuel_b0_spin = QSpinBox()
-        self._fuel_b0_spin.setMinimumHeight(INPUT_MIN_H)
-        self._fuel_b0_spin.setRange(0, 255)
-        self._fuel_b0_spin.setValue(0x3B)
-        self._fuel_b0_spin.setDisplayIntegerBase(16)
-        self._fuel_b0_spin.setPrefix("0x")
-        self._fuel_b0_spin.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
-        row_layout.addWidget(self._fuel_b0_spin)
-        row_layout.addWidget(QLabel("Byte 1:"))
-        self._fuel_b1_spin = QSpinBox()
-        self._fuel_b1_spin.setMinimumHeight(INPUT_MIN_H)
-        self._fuel_b1_spin.setRange(0, 255)
-        self._fuel_b1_spin.setValue(0x30)
-        self._fuel_b1_spin.setDisplayIntegerBase(16)
-        self._fuel_b1_spin.setPrefix("0x")
-        self._fuel_b1_spin.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
-        row_layout.addWidget(self._fuel_b1_spin)
-        row_layout.addWidget(QLabel("Byte 2:"))
-        self._fuel_b2_spin = QSpinBox()
-        self._fuel_b2_spin.setMinimumHeight(INPUT_MIN_H)
-        self._fuel_b2_spin.setRange(0, 255)
-        self._fuel_b2_spin.setValue(0x04)
-        self._fuel_b2_spin.setDisplayIntegerBase(16)
-        self._fuel_b2_spin.setPrefix("0x")
-        self._fuel_b2_spin.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
-        row_layout.addWidget(self._fuel_b2_spin)
-        row_layout.addWidget(QLabel("(S1: b0+b1lo*256, S2: b1hi*16+b2)"))
-        row_layout.addStretch()
-        fuel_layout.addWidget(row)
-        layout.addWidget(fuel_gb)
+        slider_style = (
+            f"QSlider::groove:horizontal {{ height: 4px; background: {C['border']}; border-radius: 2px; }}"
+            f"QSlider::handle:horizontal {{ background: {C['accent']}; width: 14px; height: 14px; margin: -5px 0; border-radius: 7px; }}"
+            f"QSlider::sub-page:horizontal {{ background: {C['accent']}; border-radius: 2px; }}"
+        )
+        # Defaults match what the replay frames already send, so nothing changes until a slider moves.
+        rows = [
+            # key,     label,                                    lo,   hi,  default, unit
+            ("speed",  "Speed  (ESP_21 0x0FD)",                   0,  300,     0, " km/h"),
+            ("rpm",    "RPM  (Motor_04 0x107 / Motor_28 0x154)",  0, 9000,  1090, " rpm"),
+            ("fuel",   "Fuel  (BCM2 0x644)",                      0,  100,   100, " %"),
+            ("cool",   "Coolant  (Motor_07 0x640)",               0,  140,     9, " °C"),
+            ("oil",    "Oil  (Motor_07 0x640)",                   0,  150,     7, " °C"),
+        ]
+        apply = {
+            "speed": self._apply_speed,
+            "rpm":   self._apply_rpm,
+            "fuel":  self._apply_fuel,
+            "cool":  self._apply_engine_temps,
+            "oil":   self._apply_engine_temps,
+        }
+        self._eng_sliders = {}
+        for key, text, lo, hi, default, unit in rows:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            lbl = QLabel(text)
+            lbl.setFixedWidth(260)
+            row_layout.addWidget(lbl)
+            sl = QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(lo, hi)
+            sl.setValue(default)
+            sl.setStyleSheet(slider_style)
+            val_lbl = QLabel(f"{default}{unit}")
+            val_lbl.setFixedWidth(80)
+            val_lbl.setStyleSheet(f"color: {C['text']}; font-family: Consolas;")
+            sl.valueChanged.connect(
+                lambda v, l=val_lbl, u=unit, k=key: (l.setText(f"{v}{u}"), apply[k]()))
+            row_layout.addWidget(sl, 1)
+            row_layout.addWidget(val_lbl)
+            gb_layout.addWidget(row)
+            self._eng_sliders[key] = sl
 
-        footer = QWidget()
-        footer.setStyleSheet(f"background: {C['bg']};")
-        footer_layout = QVBoxLayout(footer)
-        footer_layout.setContentsMargins(0, 8, 0, 0)
-        apply_btn = QPushButton("Apply Fuel (0x644)")
-        apply_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 6px 12px; }}")
-        apply_btn.clicked.connect(self._apply_fuel_settings)
-        footer_layout.addWidget(apply_btn)
-        self._fuel_byte_lbl = QLabel("Payload: 3b 30 04 00 00 00 aa dd")
+        note = QLabel("Fuel % → sender ohms is a linear fit from logs; below ~60 % it is extrapolated.")
+        note.setStyleSheet(f"color: {C['sub']}; font-size: 10px;")
+        gb_layout.addWidget(note)
+        self._fuel_byte_lbl = QLabel("0x644: 3b 30 04 00 00 00 aa dd")
         self._fuel_byte_lbl.setStyleSheet(f"color: {C['sub']}; font-family: Consolas; font-size: 11px;")
-        footer_layout.addWidget(self._fuel_byte_lbl)
-        QTimer.singleShot(50, self._update_fuel_display)
-        return pnl, footer
+        gb_layout.addWidget(self._fuel_byte_lbl)
+        layout.addWidget(gb)
+        return pnl
 
-    def _apply_fuel_settings(self):
+    def _apply_speed(self):
+        ecu = self._find_ecu("03")
+        if ecu is None or not hasattr(ecu, "set_speed"):
+            return
+        ecu.set_speed(self._eng_sliders["speed"].value())
+
+    def _apply_rpm(self):
+        ecu = self._find_ecu("01")
+        if ecu is None or not hasattr(ecu, "set_rpm"):
+            return
+        ecu.set_rpm(self._eng_sliders["rpm"].value())
+
+    def _apply_engine_temps(self):
+        ecu = self._find_ecu("01")
+        if ecu is None or not hasattr(ecu, "set_temps"):
+            return
+        ecu.set_temps(self._eng_sliders["cool"].value(), self._eng_sliders["oil"].value())
+
+    def _apply_fuel(self):
         ecu = self._find_bcm2_ecu()
-        if ecu is None:
-            self._log("Apply Fuel: BCM2 (46) not loaded")
+        if ecu is None or not hasattr(ecu, "set_fuel_percent"):
             return
-        if not hasattr(ecu, "set_fuel_raw"):
-            self._log("Apply Fuel: set_fuel_raw not available")
-            return
-        b0 = getattr(self, "_fuel_b0_spin", None)
-        b1 = getattr(self, "_fuel_b1_spin", None)
-        b2 = getattr(self, "_fuel_b2_spin", None)
-        if b0 is None or b1 is None or b2 is None:
-            return
-        ecu.set_fuel_raw(b0.value(), b1.value(), b2.value())
-        self._update_fuel_display()
-        self._log(f"Apply Fuel: 0x644 = 0x{b0.value():02X} 0x{b1.value():02X} 0x{b2.value():02X}")
-
-    def _update_fuel_display(self):
-        if not hasattr(self, "_fuel_byte_lbl") or not self._fuel_byte_lbl:
-            return
-        b0_spin = getattr(self, "_fuel_b0_spin", None)
-        b1_spin = getattr(self, "_fuel_b1_spin", None)
-        b2_spin = getattr(self, "_fuel_b2_spin", None)
-        if not b0_spin or not b1_spin or not b2_spin:
-            return
-        b0, b1, b2 = b0_spin.value(), b1_spin.value(), b2_spin.value()
-        self._fuel_byte_lbl.setText(f"Payload: {b0:02x} {b1:02x} {b2:02x} 00 00 00 aa dd")
+        ecu.set_fuel_percent(self._eng_sliders["fuel"].value())
+        for s in ecu.get_states():
+            if s.arb_id == 0x644:
+                self._fuel_byte_lbl.setText("0x644: " + " ".join(f"{b:02x}" for b in s.data))
 
     def _build_bcm_tab(self, parent):
         """BCM tab: Dimmung_01 (0x5F0) / BCM1_04 (0x64F) — outside light and display dimming."""

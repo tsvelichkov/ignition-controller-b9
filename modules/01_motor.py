@@ -6,6 +6,34 @@ Intervals derived from log (timestamp unit ~0.623ms).
 """
 from ecu_base import ECUModule
 
+
+def _crc8_autosar_h2f(data: bytes) -> int:
+    """CRC-8 / AUTOSAR H2F (poly 0x2F, init 0xFF, xorout 0xFF)."""
+    crc = 0xFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ 0x2F) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+    return crc ^ 0xFF
+
+
+# Motor_28 (0x154) E2E Data-IDs per BZ — recovered from logs (1110/1110 frames match)
+_MOTOR_28_DATA_IDS = bytes(
+    [0x21, 0x93, 0x4A, 0x04, 0x5C, 0x18, 0xE0, 0x69, 0x14, 0xCE, 0x26, 0x8F, 0x5E, 0xB1, 0xDF, 0x53]
+)
+
+
+def _set_bits(frame: list, start: int, length: int, raw: int) -> list:
+    """Write an Intel (little-endian) signal into an 8-byte frame."""
+    v = int.from_bytes(bytes(frame), "little")
+    mask = ((1 << length) - 1) << start
+    v = (v & ~mask) | ((raw << start) & mask)
+    return list(v.to_bytes(8, "little"))
+
+
 class MotorECU(ECUModule):
     ECU_ID   = "01"
     ECU_NAME = "Motor"
@@ -13,6 +41,30 @@ class MotorECU(ECUModule):
     def set_enabled(self, on: bool):
         """Gated by ignition — motor messages only sent with KL15 active."""
         self.enabled = on
+
+    def _template(self, arb_id: int):
+        return next(d for a, _n, _i, d in self.MESSAGES if a == arb_id)
+
+    def set_rpm(self, rpm: float):
+        """Engine speed into Motor_04 MO_Anzeigedrehz (cluster tacho, 3 rpm/bit, no CRC)
+        and Motor_28 MO_Drehzahl_VM (0.25 rpm/bit, E2E CRC re-computed per frame)."""
+        rpm = max(0.0, min(12282.0, float(rpm)))
+        m04 = [_set_bits(f, 24, 12, int(round(rpm / 3))) for f in self._template(0x107)]
+        self.update_data(0x107, m04)
+        m28 = []
+        for f in self._template(0x154):
+            f = _set_bits(f, 48, 16, int(round(rpm / 0.25)))
+            f[0] = _crc8_autosar_h2f(bytes(f[1:8]) + bytes([_MOTOR_28_DATA_IDS[f[1] & 0x0F]]))
+            m28.append(f)
+        self.update_data(0x154, m28)
+
+    def set_temps(self, coolant_c: float, oil_c: float):
+        """Motor_07 (0x640): MO_Kuehlmittel_Temp byte3 (0.75 °C/bit, -48), MO_Oel_Temp byte2 (1 °C/bit, -60).
+        Coolant raw 254/255 = Init/Fault, so it is capped at 141.75 °C."""
+        f = list(self._template(0x640))
+        f[3] = max(0, min(253, int(round((coolant_c + 48) / 0.75))))
+        f[2] = max(0, min(252, int(round(oil_c + 60))))
+        self.update_data(0x640, f)
     #          arb_id   dbc_name          ms    data (most-common from log)
     MESSAGES = [
                 (0x107, "Motor_04",   10, [
