@@ -2364,8 +2364,63 @@ class App(QMainWindow):
         self._fuel_byte_lbl = QLabel("0x644: 3b 30 04 00 00 00 aa dd")
         self._fuel_byte_lbl.setStyleSheet(f"color: {C['sub']}; font-family: Consolas; font-size: 11px;")
         gb_layout.addWidget(self._fuel_byte_lbl)
+
+        # Raw sender values — for probing a cluster whose curve differs from the A4 fit
+        raw_row = QWidget()
+        raw_layout = QHBoxLayout(raw_row)
+        raw_layout.setContentsMargins(0, 0, 0, 0)
+        self._fuel_s_spins = []
+        for name in ("Sender 1:", "Sender 2:"):
+            raw_layout.addWidget(QLabel(name))
+            sp = QSpinBox()
+            sp.setRange(0, 4095)
+            sp.setMinimumHeight(INPUT_MIN_H)
+            sp.setStyleSheet(f"background: {C['panel']}; color: {C['text']}; border: 1px solid {C['border']}; padding: 4px 6px; min-height: {INPUT_MIN_H}px;")
+            raw_layout.addWidget(sp)
+            self._fuel_s_spins.append(sp)
+        raw_btn = QPushButton("Send raw")
+        raw_btn.setStyleSheet(f"QPushButton {{ background: {C['btn']}; color: {C['text']}; border: 1px solid {C['border']}; border-radius: 4px; padding: 6px 12px; }}")
+        raw_btn.clicked.connect(self._apply_fuel_raw)
+        raw_layout.addWidget(raw_btn)
+        raw_layout.addStretch()
+        gb_layout.addWidget(raw_row)
+
+        self._kbi_fuel_lbl = QLabel("Cluster (Kombi_03 0x6B8): no data")
+        self._kbi_fuel_lbl.setStyleSheet(f"color: {C['accent']}; font-family: Consolas; font-size: 11px;")
+        gb_layout.addWidget(self._kbi_fuel_lbl)
+        self._kbi_fuel_timer = QTimer(self)
+        self._kbi_fuel_timer.timeout.connect(self._update_kbi_fuel)
+        self._kbi_fuel_timer.start(500)
         layout.addWidget(gb)
         return pnl
+
+    def _update_kbi_fuel(self):
+        ecu = self._find_bcm2_ecu()
+        k = getattr(ecu, "kbi_fuel", None) if ecu else None
+        if not k:
+            return
+        pct = "init" if k["pct"] == 126 else "fault" if k["pct"] == 127 else f"{k['pct']} %"
+        self._kbi_fuel_lbl.setText(
+            f"Cluster (Kombi_03 0x6B8): {pct}  {k['liters']:.2f} L / {k['max_l']:.1f} L  refuel={k['refuel']}")
+
+    def _show_fuel_payload(self, ecu):
+        for s in ecu.get_states():
+            if s.arb_id == 0x644:
+                self._fuel_byte_lbl.setText("0x644: " + " ".join(f"{b:02x}" for b in s.data))
+                s1, s2 = ecu.fuel_sensor1_raw(s.data[0], s.data[1]), ecu.fuel_sensor2_raw(s.data[1], s.data[2])
+                for sp, v in zip(self._fuel_s_spins, (s1, s2)):
+                    sp.blockSignals(True)
+                    sp.setValue(v)
+                    sp.blockSignals(False)
+
+    def _apply_fuel_raw(self):
+        ecu = self._find_bcm2_ecu()
+        if ecu is None or not hasattr(ecu, "set_fuel_ohms"):
+            return
+        s1, s2 = (sp.value() for sp in self._fuel_s_spins)
+        ecu.set_fuel_ohms(s1, s2)
+        self._show_fuel_payload(ecu)
+        self._log(f"Fuel raw: S1={s1} S2={s2}")
 
     def _apply_speed(self):
         ecu = self._find_ecu("03")
@@ -2390,9 +2445,7 @@ class App(QMainWindow):
         if ecu is None or not hasattr(ecu, "set_fuel_percent"):
             return
         ecu.set_fuel_percent(self._eng_sliders["fuel"].value())
-        for s in ecu.get_states():
-            if s.arb_id == 0x644:
-                self._fuel_byte_lbl.setText("0x644: " + " ".join(f"{b:02x}" for b in s.data))
+        self._show_fuel_payload(ecu)
 
     def _build_bcm_tab(self, parent):
         """BCM tab: Dimmung_01 (0x5F0) / BCM1_04 (0x64F) — outside light and display dimming."""
