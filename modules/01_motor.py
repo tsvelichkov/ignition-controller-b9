@@ -59,12 +59,17 @@ class MotorECU(ECUModule):
         self.update_data(0x154, m28)
 
     def set_temps(self, coolant_c: float, oil_c: float):
-        """Motor_07 (0x640): MO_Kuehlmittel_Temp byte3 (0.75 °C/bit, -48), MO_Oel_Temp byte2 (1 °C/bit, -60).
+        """Motor_07 (0x640) + Motor_09 (0x647) coolant, Motor_07 oil.
+        Motor_07: MO_Kuehlmittel_Temp byte3 (0.75 °C/bit, -48), MO_Oel_Temp byte2 (1 °C/bit, -60).
         Coolant raw 254/255 = Init/Fault, so it is capped at 141.75 °C."""
         f = list(self._template(0x640))
-        f[3] = max(0, min(253, int(round((coolant_c + 48) / 0.75))))
+        cool_raw = max(0, min(253, int(round((coolant_c + 48) / 0.75))))
+        f[3] = cool_raw
         f[2] = max(0, min(252, int(round(oil_c + 60))))
         self.update_data(0x640, f)
+        # Motor_09 (0x647) byte0 MO_ITM_Kuehlmittel_Temp — the gauge value (pinned at 90.0 °C in
+        # every warm-engine log while Motor_07 read 91–99 °C), same 0.75/-48 scaling.
+        self.update_data(0x647, [[cool_raw] + list(fr[1:]) for fr in self._template(0x647)])
     #          arb_id   dbc_name          ms    data (most-common from log)
     MESSAGES = [
                 (0x107, "Motor_04",   10, [

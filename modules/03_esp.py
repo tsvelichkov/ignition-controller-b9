@@ -10,6 +10,8 @@ CRC+counter progression for unknown or highly-dynamic IDs.
 
 Ignition-gated — stops when KL15 off.
 """
+import time
+
 from ecu_base import ECUModule
 
 
@@ -30,6 +32,23 @@ def _crc8_autosar_h2f(data: bytes) -> int:
 _ESP_21_DATA_IDS = bytes(
     [0xB4, 0xEF, 0xF8, 0x49, 0x1E, 0xE5, 0xC2, 0xC0, 0x97, 0x19, 0x3C, 0xC9, 0xF1, 0x98, 0xD6, 0x61]
 )
+
+
+# ESP_10 (0x116) E2E Data-ID — same for every BZ (9688/9688 log frames match)
+_ESP_10_DATA_ID = 0xAC
+
+# ESP_24 (0x31B) E2E Data-IDs per BZ — recovered from logs, unambiguous for every BZ
+_ESP_24_DATA_IDS = bytes(
+    [0x67, 0x8A, 0xAE, 0x22, 0x4D, 0xD0, 0x51, 0x80, 0x5C, 0xB9, 0xCE, 0x1E, 0xDF, 0x02, 0x2D, 0xD4]
+)
+
+# Wheel model fitted to hud-cmds/0000030.TXT (A4 manoeuvring up to 6 km/h):
+#   ESP_24 ESP_m_Raddrehz = km/h / 7.255  -> 2.015 m rolling circumference
+#   ESP_10 Wegimpuls ~48.9 pulses/m (10-bit, rolls 1000 -> 0), ESP_24 Wegimp_VA ~50.3 pulses/m (11-bit)
+_WHEEL_CIRC_M   = 2.015
+_PULSES_PER_M   = 48.9
+_WEGIMPULS_MOD  = 1001
+_WEGIMP_VA_MOD  = 2048
 
 
 class ESPECU(ECUModule):
@@ -1175,8 +1194,10 @@ class ESPECU(ECUModule):
         self.enabled = on
 
     def set_speed(self, kmh: float):
-        """ESP_21 (0x0FD) ESP_v_Signal, bits 32-47, 0.01 km/h/bit; CRC re-computed per frame."""
-        raw = max(0, min(65532, int(round(float(kmh) / 0.01))))
+        """ESP_21 (0x0FD) ESP_v_Signal, bits 32-47, 0.01 km/h/bit; CRC re-computed per frame.
+        Also drives ESP_10 / ESP_24 wheel pulses and wheel frequency (see _next_esp_10/_next_esp_24)."""
+        self._speed_kmh = max(0.0, float(kmh))
+        raw = max(0, min(65532, int(round(self._speed_kmh / 0.01))))
         template = next(d for a, _n, _i, d in self.MESSAGES if a == 0x0FD)
         frames = []
         for f in template:
@@ -1185,3 +1206,68 @@ class ESPECU(ECUModule):
             f[0] = _crc8_autosar_h2f(bytes(f[1:8]) + bytes([_ESP_21_DATA_IDS[f[1] & 0x0F]]))
             frames.append(f)
         self.update_data(0x0FD, frames)
+
+    def __init__(self, log_cb=None):
+        super().__init__(log_cb)
+        self._speed_kmh = 0.0
+        self._pulses = 0.0
+        self._pulses_last = None
+        self._esp10_bz = 0
+        self._esp24_bz = 0
+        self._live = {0x116: self._next_esp_10, 0x31B: self._next_esp_24}
+
+    def _advance_pulses(self):
+        """Integrate distance travelled into the shared wheel pulse accumulator."""
+        now = time.monotonic()
+        if self._pulses_last is not None and self._speed_kmh > 0:
+            self._pulses += self._speed_kmh / 3.6 * (now - self._pulses_last) * _PULSES_PER_M
+        self._pulses_last = now
+
+    def _next_esp_10(self) -> list:
+        """ESP_10 wheel pulse counters advance with the set speed; CRC per frame.
+        BZ steps by 5 per 100 ms frame, as the gateway-routed log does."""
+        self._advance_pulses()
+        cnt = int(self._pulses) % _WEGIMPULS_MOD
+        moving = self._speed_kmh > 0
+        v = cnt << 16 | cnt << 26 | cnt << 36 | cnt << 46      # QBits (12-15) = 0 → valid
+        v |= (0x00 if moving else 0xFF) << 56                  # Fahrtrichtung: forward / invalid
+        f = list(v.to_bytes(8, "little"))
+        f[1] |= self._esp10_bz
+        self._esp10_bz = (self._esp10_bz + 5) & 0x0F
+        f[0] = _crc8_autosar_h2f(bytes(f[1:8]) + bytes([_ESP_10_DATA_ID]))
+        return f
+
+    def _next_esp_24(self) -> list:
+        """ESP_24: ESP_m_Raddrehz (bits 17-31, 0.002 Hz) mean wheel frequency and
+        ESP_Wegimp_VA (bits 40-50) front-axle pulse counter; lamps/flags all 0 as in the logs."""
+        self._advance_pulses()
+        hz_raw = min(0x7FFF, int(round(self._speed_kmh / 3.6 / _WHEEL_CIRC_M / 0.002)))
+        cnt = int(self._pulses) % _WEGIMP_VA_MOD
+        v = self._esp24_bz << 8 | hz_raw << 17 | cnt << 40
+        f = list(v.to_bytes(8, "little"))
+        self._esp24_bz = (self._esp24_bz + 1) & 0x0F
+        f[0] = _crc8_autosar_h2f(bytes(f[1:8]) + bytes([_ESP_24_DATA_IDS[f[1] & 0x0F]]))
+        return f
+
+    def _run(self):
+        now = time.monotonic()
+        next_tx = {s.arb_id: now + s.interval_ms / 1000.0 for s in self._states}
+
+        while not self._stop_evt.is_set():
+            now = time.monotonic()
+            soonest = 0.010
+
+            for s in self._states:
+                due = next_tx[s.arb_id]
+                if now >= due:
+                    live = self._live.get(s.arb_id)
+                    self._enqueue(s.arb_id, live() if live else s.next_payload())
+                    with self._lock:
+                        s.tx_count += 1
+                        s.last_tx   = now
+                    next_tx[s.arb_id] = due + s.interval_ms / 1000.0
+                wait = next_tx[s.arb_id] - now
+                if wait < soonest:
+                    soonest = wait
+
+            self._stop_evt.wait(timeout=max(0.001, soonest))
